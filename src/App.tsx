@@ -4,14 +4,8 @@ import InferencePage from './pages/InferencePage'
 import AgentPage from './pages/AgentPage'
 import InterviewPage from './pages/InterviewPage'
 import SettingsPage from './pages/SettingsPage'
-
-const NAV = [
-  { to: '/architecture', label: '架构演进' },
-  { to: '/inference', label: '推理链路' },
-  { to: '/agent', label: 'Agent 架构' },
-  { to: '/interview', label: '面试陪练' },
-  { to: '/settings', label: '设置' },
-]
+import SelectionAsk from './components/ask/SelectionAsk'
+import { NAV } from './nav'
 
 export default function App() {
   return (
@@ -49,6 +43,7 @@ export default function App() {
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>
+      <SelectionAsk />
     </div>
   )
 }
