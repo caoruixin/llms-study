@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import SegmentedTabs from '../components/ui/SegmentedTabs'
 import TransformerDiagram from '../components/TransformerDiagram'
 import ModelEvolution from '../components/ModelEvolution'
 import { ATTENTION_EVOLUTION, ATTENTION_SUMMARY } from '../data/attention'
@@ -18,19 +19,7 @@ export default function ArchitecturePage() {
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap gap-2">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
-              tab === t.id ? 'bg-accent text-white' : 'bg-panel text-dim hover:bg-panel-2 hover:text-white'
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
 
       {tab === 'transformer' && <TransformerDiagram />}
       {tab === 'evolution' && <ModelEvolution />}
@@ -40,7 +29,7 @@ export default function ArchitecturePage() {
           <div className="rounded-xl border border-accent/40 bg-accent/10 p-4 text-sm leading-relaxed">
             {ATTENTION_SUMMARY}
           </div>
-          <div className="overflow-x-auto rounded-xl border border-line">
+          <div className="overflow-x-auto rounded-xl border border-line bg-panel shadow-sm">
             <table className="w-full min-w-[900px] text-sm">
               <thead className="bg-panel-2 text-left text-xs text-dim">
                 <tr>
@@ -52,7 +41,7 @@ export default function ArchitecturePage() {
               </thead>
               <tbody>
                 {ATTENTION_EVOLUTION.map((a, i) => (
-                  <tr key={a.id} className={i % 2 ? 'bg-panel' : 'bg-panel/50'}>
+                  <tr key={a.id} className={i % 2 ? '' : 'bg-panel-2/60'}>
                     <td className="px-4 py-3 font-semibold whitespace-nowrap text-accent">{a.name}</td>
                     <td className="px-4 py-3 leading-relaxed">{a.mechanism}</td>
                     <td className="px-4 py-3 leading-relaxed text-dim">{a.kvCost}</td>
@@ -67,7 +56,7 @@ export default function ArchitecturePage() {
 
       {tab === 'pricing' && (
         <div className="space-y-4">
-          <div className="overflow-x-auto rounded-xl border border-line">
+          <div className="overflow-x-auto rounded-xl border border-line bg-panel shadow-sm">
             <table className="w-full min-w-[1100px] text-sm">
               <thead className="bg-panel-2 text-left text-xs text-dim">
                 <tr>
@@ -87,7 +76,7 @@ export default function ArchitecturePage() {
                   const cur = p.currency === 'USD' ? '$' : '¥'
                   const fmt = (v: number | null) => (v === null ? 'N/A' : `${cur}${v}`)
                   return (
-                    <tr key={`${p.provider}-${p.modelId}-${i}`} className={i % 2 ? 'bg-panel' : 'bg-panel/50'}>
+                    <tr key={`${p.provider}-${p.modelId}-${i}`} className={i % 2 ? '' : 'bg-panel-2/60'}>
                       <td className="px-3 py-3 whitespace-nowrap">
                         <div className="text-xs text-dim">{p.provider}</div>
                         <a href={p.sourceUrl} target="_blank" rel="noreferrer" className="font-mono font-semibold text-accent hover:underline">
@@ -110,7 +99,7 @@ export default function ArchitecturePage() {
               </tbody>
             </table>
           </div>
-          <div className="rounded-xl border border-line bg-panel p-5">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
             <h3 className="mb-2 text-sm font-semibold text-warn">售前速记（长上下文 / Batch / 缓存）</h3>
             <ul className="list-inside list-disc space-y-1.5 text-sm leading-relaxed text-dim">
               {PRICING_NOTES.map((n, i) => (

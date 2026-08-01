@@ -35,19 +35,19 @@ export default function MasteryDashboard() {
   if (stats.attempts === 0) return null
 
   return (
-    <div className="mb-5 rounded-xl border border-line bg-panel p-5">
+    <div className="mb-5 rounded-xl border border-line bg-panel shadow-sm p-5">
       <div className="mb-4 flex flex-wrap items-center gap-x-8 gap-y-2">
         <h3 className="text-sm font-semibold text-accent">掌握度仪表盘</h3>
         <span className="text-sm text-dim">
-          已练 <b className="font-mono text-white">{stats.practiced}</b>/{stats.total} 题 · 共{' '}
-          <b className="font-mono text-white">{stats.attempts}</b> 次作答
+          已练 <b className="font-mono text-fg">{stats.practiced}</b>/{stats.total} 题 · 共{' '}
+          <b className="font-mono text-fg">{stats.attempts}</b> 次作答
         </span>
         <div className="flex items-center gap-3 text-sm">
           {(Object.keys(stats.gradeDist) as Grade[]).map((g) => (
             <span key={g} className="flex items-center gap-1.5">
               <span className={`inline-block h-2.5 w-2.5 rounded-sm ${GRADE_COLOR[g]}`} />
               <span className="text-dim">
-                {g} <span className="font-mono text-white">{stats.gradeDist[g]}</span>
+                {g} <span className="font-mono text-fg">{stats.gradeDist[g]}</span>
               </span>
             </span>
           ))}
@@ -62,7 +62,7 @@ export default function MasteryDashboard() {
                 {c.practiced}/{c.total} 题 · 掌握 {Math.round(c.mastery * 100)}%
               </span>
             </div>
-            <div className="h-1.5 rounded bg-panel-2">
+            <div className="h-1.5 rounded bg-line">
               <div className="h-1.5 rounded bg-accent transition-all" style={{ width: `${c.mastery * 100}%` }} />
             </div>
           </div>

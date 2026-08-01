@@ -231,7 +231,7 @@ export default function SelectionAsk() {
           onPointerDown={(e) => e.preventDefault()} // 防选区塌陷 / 抢焦点
           onClick={onAsk}
           style={{ left: btn.x, top: btn.y }}
-          className="fixed z-50 rounded-md border border-line bg-panel-2 px-2.5 py-1 text-xs text-accent shadow-lg"
+          className="fixed z-50 rounded-md border border-line bg-panel px-2.5 py-1 text-xs text-accent shadow-md"
         >
           Ask LLM
         </button>

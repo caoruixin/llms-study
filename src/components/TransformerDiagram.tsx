@@ -1,9 +1,15 @@
 import { useState } from 'react'
 import { ENCDEC_COMPONENTS, TF_COMPONENTS } from '../data/transformer'
 import QKVFlow from './QKVFlow'
+import SegmentedTabs from './ui/SegmentedTabs'
 
 const blockOrder = ['norm', 'attention', 'residual', 'ffn'] as const
 const ALL = [...TF_COMPONENTS, ...ENCDEC_COMPONENTS]
+
+const VIEW_TABS = [
+  { id: 'decoder', label: 'Decoder-only（现代 LLM）' },
+  { id: 'encdec', label: 'Encoder-Decoder（2017 原始）' },
+] as const
 
 export default function TransformerDiagram() {
   const [selectedId, setSelectedId] = useState('attention')
@@ -17,7 +23,7 @@ export default function TransformerDiagram() {
         onClick={() => setSelectedId(id)}
         className={`w-full rounded-lg border px-3 py-2 text-sm transition-all ${
           selectedId === id
-            ? 'border-accent bg-accent/20 shadow-[0_0_12px_rgba(91,141,239,0.35)]'
+            ? 'border-accent bg-accent/10 shadow-sm'
             : 'border-line bg-panel-2 hover:border-accent/50'
         }`}
       >
@@ -33,23 +39,12 @@ export default function TransformerDiagram() {
     <div className="flex flex-col gap-6 lg:flex-row">
       {/* 左：结构图 */}
       <div className={`w-full shrink-0 ${view === 'encdec' ? 'lg:w-[560px]' : 'lg:w-80'}`}>
-        <div className="mb-2 flex gap-2">
-          <button
-            onClick={() => setView('decoder')}
-            className={`rounded-md px-3 py-1.5 text-xs font-medium ${view === 'decoder' ? 'bg-accent text-white' : 'bg-panel text-dim hover:bg-panel-2'}`}
-          >
-            Decoder-only（现代 LLM）
-          </button>
-          <button
-            onClick={() => setView('encdec')}
-            className={`rounded-md px-3 py-1.5 text-xs font-medium ${view === 'encdec' ? 'bg-accent text-white' : 'bg-panel text-dim hover:bg-panel-2'}`}
-          >
-            Encoder-Decoder（2017 原始）
-          </button>
+        <div className="mb-2">
+          <SegmentedTabs tabs={VIEW_TABS} value={view} onChange={setView} />
         </div>
 
         {view === 'decoder' ? (
-          <div className="rounded-xl border border-line bg-panel p-4">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
             <div className="mb-2 rounded-lg bg-panel-2 px-4 py-2 text-center text-sm text-dim">
               输入文本 “解释 KV cache”
             </div>
@@ -76,7 +71,7 @@ export default function TransformerDiagram() {
             </div>
           </div>
         ) : (
-          <div className="rounded-xl border border-line bg-panel p-4">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
             <div className="grid grid-cols-2 gap-4">
               {/* 编码器 */}
               <div>
@@ -128,7 +123,7 @@ export default function TransformerDiagram() {
 
       {/* 右：讲解面板 */}
       <div className="min-w-0 flex-1">
-        <div className="sticky top-20 rounded-xl border border-line bg-panel p-6">
+        <div className="sticky top-20 rounded-xl border border-line bg-panel shadow-sm p-6">
           <h3 className="text-xl font-bold">
             {selected.name} <span className="ml-2 text-sm font-normal text-dim">{selected.enName}</span>
           </h3>

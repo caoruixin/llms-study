@@ -12,8 +12,11 @@ export default function App() {
     <div className="min-h-screen">
       <header className="sticky top-0 z-40 border-b border-line bg-ink/90 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center gap-6 px-4 py-3">
-          <div className="flex items-baseline gap-2">
-            <span className="text-lg font-bold text-accent">LLM Infra Studio</span>
+          <div className="flex items-center gap-2">
+            <span className="flex h-6 w-6 items-center justify-center rounded-md bg-accent text-xs font-bold text-white">
+              L
+            </span>
+            <span className="text-lg font-bold text-fg">LLM Infra Studio</span>
             <span className="text-xs text-dim">面试备战台 · Token & 算力售前</span>
           </div>
           <nav className="flex gap-1">
@@ -22,8 +25,10 @@ export default function App() {
                 key={n.to}
                 to={n.to}
                 className={({ isActive }) =>
-                  `rounded-md px-3 py-1.5 text-sm transition-colors ${
-                    isActive ? 'bg-accent/20 text-accent' : 'text-dim hover:bg-panel-2 hover:text-white'
+                  `border-b-2 px-3 py-2 text-sm transition-colors ${
+                    isActive
+                      ? 'border-accent font-medium text-accent'
+                      : 'border-transparent text-dim hover:text-fg'
                   }`
                 }
               >

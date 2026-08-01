@@ -123,10 +123,10 @@ export default function LifecycleSim() {
       </div>
 
       {/* 参数控制 */}
-      <div className="grid gap-3 rounded-xl border border-line bg-panel p-4 md:grid-cols-3 lg:grid-cols-6">
+      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 md:grid-cols-3 lg:grid-cols-6">
         <label className="block text-xs text-dim">
           模型
-          <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {SIM_MODELS.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}
@@ -136,7 +136,7 @@ export default function LifecycleSim() {
         </label>
         <label className="block text-xs text-dim">
           GPU
-          <select value={gpuId} onChange={(e) => setGpuId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={gpuId} onChange={(e) => setGpuId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {GPUS.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}
@@ -146,7 +146,7 @@ export default function LifecycleSim() {
         </label>
         <label className="block text-xs text-dim">
           量化
-          <select value={quantId} onChange={(e) => setQuantId(e.target.value as typeof quantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={quantId} onChange={(e) => setQuantId(e.target.value as typeof quantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {QUANTS.map((q) => (
               <option key={q.id} value={q.id}>
                 {q.label}
@@ -164,7 +164,7 @@ export default function LifecycleSim() {
         </label>
         <label className="block text-xs text-dim">
           计费价目
-          <select value={priceKey} onChange={(e) => setPriceKey(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={priceKey} onChange={(e) => setPriceKey(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {PRICING.filter((p) => p.inputPerMTok !== null).map((p) => (
               <option key={`${p.provider}|${p.modelId}`} value={`${p.provider}|${p.modelId}`}>
                 {p.modelId}（{p.provider}）
@@ -175,11 +175,11 @@ export default function LifecycleSim() {
       </div>
 
       {/* prompt 输入 */}
-      <div className="rounded-xl border border-line bg-panel p-4">
+      <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
         <div className="flex flex-wrap items-end gap-3">
           <label className="block min-w-64 flex-1 text-xs text-dim">
             用户 Prompt（模拟，不调真实模型）
-            <textarea value={prompt} onChange={(e) => { setPrompt(e.target.value); setTokenOverride(null) }} rows={2} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-3 py-2 text-sm text-white" />
+            <textarea value={prompt} onChange={(e) => { setPrompt(e.target.value); setTokenOverride(null) }} rows={2} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-3 py-2 text-sm text-fg" />
           </label>
           <label className="block text-xs text-dim">
             输入 token（估算，可改）
@@ -187,13 +187,13 @@ export default function LifecycleSim() {
               type="number"
               value={inputTokens}
               onChange={(e) => setTokenOverride(Math.max(1, +e.target.value))}
-              className="mt-1 w-28 rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white"
+              className="mt-1 w-28 rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg"
             />
           </label>
           <button
             onClick={run}
             disabled={running}
-            className="rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-white hover:bg-accent/80 disabled:opacity-40"
+            className="rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40"
           >
             {running ? '模拟中…' : '▶ 发起请求'}
           </button>
@@ -213,7 +213,7 @@ export default function LifecycleSim() {
                 transition={{ type: 'spring', stiffness: 300, damping: 24 }}
                 className={`relative rounded-lg border px-4 py-2.5 transition-colors ${
                   active
-                    ? 'border-accent bg-accent/15 shadow-[0_0_14px_rgba(91,141,239,0.3)]'
+                    ? 'border-accent bg-accent/10 shadow-sm'
                     : done
                       ? 'border-ok/40 bg-ok/5'
                       : 'border-line bg-panel opacity-60'
@@ -223,9 +223,9 @@ export default function LifecycleSim() {
                   <motion.span
                     layoutId="request-pulse"
                     transition={{ type: 'spring', stiffness: 350, damping: 28 }}
-                    className="absolute top-1/2 -left-2.5 h-4 w-4 -translate-y-1/2 rounded-full bg-accent shadow-[0_0_10px_rgba(91,141,239,0.9)]"
+                    className="absolute top-1/2 -left-2.5 h-4 w-4 -translate-y-1/2 rounded-full bg-accent"
                   >
-                    <span className="absolute inset-0 animate-ping rounded-full bg-accent/60" />
+                    <span className="absolute inset-0 animate-ping rounded-full bg-accent/40" />
                   </motion.span>
                 )}
                 <div className="flex items-center gap-2 text-sm">
@@ -263,7 +263,7 @@ export default function LifecycleSim() {
 
         {/* 指标面板 */}
         <div className="w-full shrink-0 space-y-3 lg:w-80">
-          <div className="rounded-xl border border-line bg-panel p-4">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
             <h4 className="mb-3 text-sm font-semibold text-accent">性能估算（{calc.gpus}× {gpu.name}）</h4>
             <dl className="space-y-2 text-sm">
               <div className="flex justify-between"><dt className="text-dim">TTFT（首 token）</dt><dd className="font-mono">{fmtMs(calc.ttft)}</dd></div>
@@ -275,7 +275,7 @@ export default function LifecycleSim() {
               缓存命中率 ↑ → prefill 量 ↓ → TTFT ↓；batch ↑ → 吞吐 ↑（权重读取被摊薄）、TPOT 略 ↑
             </p>
           </div>
-          <div className="rounded-xl border border-line bg-panel p-4">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
             <h4 className="mb-3 text-sm font-semibold text-ok">本次请求计费（{price.modelId}）</h4>
             <dl className="space-y-2 text-sm">
               <div className="flex justify-between"><dt className="text-dim">输入 {inputTokens - cacheHitTokens} tok（未命中）</dt><dd className="font-mono">{cur}{(((inputTokens - cacheHitTokens) * (price.inputPerMTok ?? 0)) / 1e6).toFixed(6)}</dd></div>

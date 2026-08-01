@@ -18,24 +18,24 @@ export default function QKVFlow() {
         {/* 历史 token 及其 K/V */}
         {TOKENS.map((t, i) => (
           <g key={i}>
-            <rect x={tokenX(i) - 28} y={18} width={56} height={24} rx={6} fill="#1a2340" stroke="#2a3558" />
-            <text x={tokenX(i)} y={34} textAnchor="middle" fontSize="11" fill="#e6eaf5">
+            <rect x={tokenX(i) - 28} y={18} width={56} height={24} rx={6} fill="var(--color-panel)" stroke="var(--color-line)" />
+            <text x={tokenX(i)} y={34} textAnchor="middle" fontSize="11" fill="var(--color-fg)">
               {t}
             </text>
-            <text x={tokenX(i) - 14} y={58} textAnchor="middle" fontSize="9" fill="#8b96b5">
+            <text x={tokenX(i) - 14} y={58} textAnchor="middle" fontSize="9" fill="var(--color-dim)">
               K
             </text>
-            <circle cx={tokenX(i) - 14} cy={68} r={5} fill="#5b8def" opacity={0.8} />
-            <text x={tokenX(i) + 14} y={58} textAnchor="middle" fontSize="9" fill="#8b96b5">
+            <circle cx={tokenX(i) - 14} cy={68} r={5} fill="var(--color-accent)" opacity={0.8} />
+            <text x={tokenX(i) + 14} y={58} textAnchor="middle" fontSize="9" fill="var(--color-dim)">
               V
             </text>
-            <circle cx={tokenX(i) + 14} cy={68} r={5} fill="#8b5cf6" opacity={0.8} />
+            <circle cx={tokenX(i) + 14} cy={68} r={5} fill="var(--color-accent-2)" opacity={0.8} />
           </g>
         ))}
 
         {/* 当前 token 的 Q */}
-        <rect x={352} y={18} width={56} height={24} rx={6} fill="#5b8def33" stroke="#5b8def" />
-        <text x={380} y={34} textAnchor="middle" fontSize="11" fill="#e6eaf5">
+        <rect x={352} y={18} width={56} height={24} rx={6} fill="var(--color-accent)" fillOpacity={0.12} stroke="var(--color-accent)" />
+        <text x={380} y={34} textAnchor="middle" fontSize="11" fill="var(--color-fg)">
           作用 ←Q
         </text>
 
@@ -47,7 +47,7 @@ export default function QKVFlow() {
             y1={44}
             x2={tokenX(i) - 14}
             y2={64}
-            stroke="#5b8def"
+            stroke="var(--color-accent)"
             strokeWidth={1.5}
             strokeDasharray="4 4"
             initial={{ opacity: 0 }}
@@ -59,22 +59,26 @@ export default function QKVFlow() {
         {/* 第二幕：注意力权重条 */}
         {WEIGHTS.map((w, i) => (
           <g key={`w-${i}`}>
+            {/* y 必须走 attrY：motion 把 y 当 transform（translateY 会叠加在 y 属性上，条被顶出 viewBox）；
+                times 必须从 0 到 1 铺满，否则这条 JS 驱动的关键帧动画根本不会启动 */}
             <motion.rect
               x={tokenX(i) - 12}
-              y={112 - 0}
               width={24}
               rx={3}
-              fill="#d97706"
-              initial={{ height: 0, y: 112 }}
-              animate={{ height: [0, w * 80, w * 80, 0], y: [112, 112 - w * 80, 112 - w * 80, 112] }}
-              transition={{ duration: CYCLE, times: [0.3, 0.42, 0.72, 0.8], repeat: Infinity }}
+              fill="var(--color-amber)"
+              initial={{ height: 0, attrY: 112 }}
+              animate={{
+                height: [0, 0, w * 80, w * 80, 0, 0],
+                attrY: [112, 112, 112 - w * 80, 112 - w * 80, 112, 112],
+              }}
+              transition={{ duration: CYCLE, times: [0, 0.3, 0.42, 0.72, 0.8, 1], repeat: Infinity }}
             />
             <motion.text
               x={tokenX(i)}
               y={126}
               textAnchor="middle"
               fontSize="9"
-              fill="#8b96b5"
+              fill="var(--color-dim)"
               initial={{ opacity: 0 }}
               animate={{ opacity: [0, 1, 1, 0] }}
               transition={{ duration: CYCLE, times: [0.36, 0.44, 0.72, 0.8], repeat: Infinity }}
@@ -88,7 +92,7 @@ export default function QKVFlow() {
           y={100}
           textAnchor="middle"
           fontSize="10"
-          fill="#8b96b5"
+          fill="var(--color-dim)"
           initial={{ opacity: 0 }}
           animate={{ opacity: [0, 1, 1, 0] }}
           transition={{ duration: CYCLE, times: [0.32, 0.4, 0.68, 0.76], repeat: Infinity }}
@@ -104,7 +108,7 @@ export default function QKVFlow() {
             y1={74}
             x2={210}
             y2={162}
-            stroke="#8b5cf6"
+            stroke="var(--color-accent-2)"
             strokeWidth={Math.max(1, w * 7)}
             initial={{ opacity: 0 }}
             animate={{ opacity: [0, 0.9, 0.9, 0] }}
@@ -115,16 +119,16 @@ export default function QKVFlow() {
           cx={210}
           cy={165}
           r={9}
-          fill="#8b5cf6"
+          fill="var(--color-accent-2)"
           initial={{ scale: 0 }}
-          animate={{ scale: [0, 1.15, 1, 0] }}
-          transition={{ duration: CYCLE, times: [0.6, 0.75, 0.92, 1], repeat: Infinity }}
+          animate={{ scale: [0, 0, 1.15, 1, 0] }}
+          transition={{ duration: CYCLE, times: [0, 0.6, 0.75, 0.92, 1], repeat: Infinity }}
         />
         <motion.text
           x={252}
           y={169}
           fontSize="10"
-          fill="#e6eaf5"
+          fill="var(--color-fg)"
           initial={{ opacity: 0 }}
           animate={{ opacity: [0, 1, 1, 0] }}
           transition={{ duration: CYCLE, times: [0.62, 0.75, 0.92, 1], repeat: Infinity }}
@@ -133,7 +137,7 @@ export default function QKVFlow() {
         </motion.text>
       </svg>
       <p className="mt-1 text-[11px] leading-relaxed text-dim">
-        推理时历史 K/V（蓝/紫点）就是被缓存的 KV cache；每个新 token 只需算自己的 Q 再与缓存交互——这就是「KV cache 避免重算」的含义。
+        推理时历史 K/V（红/紫点）就是被缓存的 KV cache；每个新 token 只需算自己的 Q 再与缓存交互——这就是「KV cache 避免重算」的含义。
       </p>
     </div>
   )

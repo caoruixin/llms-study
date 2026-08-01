@@ -8,7 +8,7 @@ export default function SettingsPage() {
   return (
     <div className="max-w-2xl space-y-6">
       <h1 className="text-2xl font-bold">设置</h1>
-      <section className="space-y-4 rounded-xl border border-line bg-panel p-5">
+      <section className="space-y-4 rounded-xl border border-line bg-panel shadow-sm p-5">
         <h2 className="font-semibold text-accent">评分用 LLM API</h2>
         <label className="block space-y-1">
           <span className="text-sm text-dim">Provider（固定 allowlist，代理转发）</span>

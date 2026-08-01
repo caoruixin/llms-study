@@ -10,10 +10,10 @@ import { useHistory, useSettings } from '../store'
 import MasteryDashboard from '../components/MasteryDashboard'
 
 const GRADE_STYLE: Record<Grade, string> = {
-  A: 'bg-ok/20 text-ok',
-  B: 'bg-accent/20 text-accent',
-  C: 'bg-warn/20 text-warn',
-  D: 'bg-bad/20 text-bad',
+  A: 'bg-ok text-white',
+  B: 'bg-accent text-white',
+  C: 'bg-warn text-white',
+  D: 'bg-bad text-white',
 }
 
 const DIMENSIONS: { key: keyof Pick<ScoreResult, 'accuracy' | 'structure' | 'business' | 'depth'>; label: string }[] = [
@@ -197,7 +197,7 @@ export default function InterviewPage() {
 
       {/* 右侧答题区 */}
       <section className="min-w-0 flex-1 space-y-4">
-        <div className="rounded-xl border border-line bg-panel p-5">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <div className="mb-2 flex items-center gap-2 text-xs text-dim">
             <span className="rounded bg-panel-2 px-2 py-0.5">{CATEGORY_LABELS[question.category]}</span>
             {question.lang === 'en' && <span className="rounded bg-accent-2/20 px-2 py-0.5 text-accent-2">英文题</span>}
@@ -206,7 +206,7 @@ export default function InterviewPage() {
           {question.followUp && <p className="mt-2 text-sm text-dim">追问：{question.followUp}</p>}
         </div>
 
-        <div className="rounded-xl border border-line bg-panel p-5">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <textarea
             value={answer + (interim ? ` ${interim}` : '')}
             onChange={(e) => setAnswer(e.target.value)}
@@ -220,7 +220,7 @@ export default function InterviewPage() {
               disabled={!isSpeechSupported()}
               title={isSpeechSupported() ? '' : '当前浏览器不支持语音识别（请用 Chrome）'}
               className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-40 ${
-                dictating ? 'bg-bad/20 text-bad' : 'bg-panel-2 text-white hover:bg-line'
+                dictating ? 'bg-bad text-white' : 'border border-line bg-panel text-fg hover:bg-panel-2'
               }`}
             >
               {dictating ? '■ 停止录音' : `🎙 语音回答（${question.lang === 'en' ? 'en-US' : 'zh-CN'}）`}
@@ -228,11 +228,11 @@ export default function InterviewPage() {
             <button
               onClick={grade}
               disabled={phase === 'grading' || !answer.trim()}
-              className="rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/80 disabled:opacity-40"
+              className="rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
             >
               {phase === 'grading' ? '评分中…' : '提交评分'}
             </button>
-            <button onClick={() => setShowRef((v) => !v)} className="text-sm text-dim hover:text-white">
+            <button onClick={() => setShowRef((v) => !v)} className="text-sm text-dim hover:text-fg">
               {showRef ? '隐藏参考要点' : '查看参考要点'}
             </button>
           </div>
@@ -240,7 +240,7 @@ export default function InterviewPage() {
         </div>
 
         {showRef && (
-          <div className="rounded-xl border border-line bg-panel p-5 text-sm leading-relaxed">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-5 text-sm leading-relaxed">
             <h3 className="mb-2 font-semibold text-warn">参考要点（先自己答，再看）</h3>
             <div className="mb-3">
               <div className="mb-1 text-xs text-dim">必须覆盖</div>
@@ -263,7 +263,7 @@ export default function InterviewPage() {
         )}
 
         {result && (
-          <div className="rounded-xl border border-line bg-panel p-5">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
             <div className="mb-4 flex items-center gap-4">
               <span className={`rounded-lg px-4 py-2 text-2xl font-bold ${GRADE_STYLE[result.grade]}`}>
                 {result.grade}
@@ -310,7 +310,7 @@ export default function InterviewPage() {
         )}
 
         {pastAttempts.length > 0 && (
-          <div className="rounded-xl border border-line bg-panel p-5">
+          <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
             <h3 className="mb-2 text-sm font-semibold text-dim">本题历史（{pastAttempts.length} 次）</h3>
             <div className="space-y-2">
               {pastAttempts.slice(0, 5).map((a) => (
