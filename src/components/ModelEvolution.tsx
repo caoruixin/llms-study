@@ -18,7 +18,7 @@ export default function ModelEvolution() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-dim">
-        按时间排列的开源模型演进。<span className="text-accent">蓝色标签</span>为该模型相对经典 Transformer 的架构
+        按时间排列的开源模型演进。<span className="text-accent">红色标签</span>为该模型相对经典 Transformer 的架构
         diff，点击卡片展开亮点详解。
       </p>
       {MODELS.map((m) => {
@@ -26,7 +26,7 @@ export default function ModelEvolution() {
         return (
           <div
             key={m.id}
-            className={`rounded-xl border transition-colors ${open ? 'border-accent/60 bg-panel' : 'border-line bg-panel hover:border-accent/40'}`}
+            className={`rounded-xl border shadow-sm transition-colors ${open ? 'border-accent/60 bg-panel' : 'border-line bg-panel hover:border-accent/40'}`}
           >
             <button onClick={() => setOpenId(open ? null : m.id)} className="w-full px-5 py-4 text-left">
               <div className="flex flex-wrap items-center gap-3">

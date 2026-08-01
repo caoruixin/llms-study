@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import SegmentedTabs from '../components/ui/SegmentedTabs'
 import StackExplorer from '../components/StackExplorer'
 import LifecycleSim from '../components/LifecycleSim'
 import MemoryCalculator from '../components/MemoryCalculator'
@@ -18,19 +19,7 @@ export default function InferencePage() {
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap gap-2">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
-              tab === t.id ? 'bg-accent text-white' : 'bg-panel text-dim hover:bg-panel-2 hover:text-white'
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
       {tab === 'stack' && <StackExplorer />}
       {tab === 'lifecycle' && <LifecycleSim />}
       {tab === 'memory' && <MemoryCalculator />}

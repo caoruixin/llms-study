@@ -15,10 +15,10 @@ import { PRICING } from '../data/pricing'
 import { WORKED_CASES } from '../data/cases'
 import { apiBlendedPerMTok, breakEvenDailyMTok, selfHostCostPerMTok } from '../lib/simEngine'
 
-const API_COLOR = '#5b8def'
-const SELF_COLOR = '#d97706'
-const INK_MUTED = '#8b96b5'
-const GRID = '#2a3558'
+const API_COLOR = '#9e2b3a'
+const SELF_COLOR = '#0d9488'
+const INK_MUTED = '#6e6a60'
+const GRID = '#e3ded1'
 
 const USD_PRICING = PRICING.filter((p) => p.currency === 'USD' && p.inputPerMTok !== null)
 
@@ -66,10 +66,10 @@ export default function EconomicsPanel() {
   return (
     <div className="space-y-4">
       {/* 参数区 */}
-      <div className="grid gap-3 rounded-xl border border-line bg-panel p-4 md:grid-cols-3 lg:grid-cols-7">
+      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 md:grid-cols-3 lg:grid-cols-7">
         <label className="block text-xs text-dim">
           API 价目（USD）
-          <select value={priceKey} onChange={(e) => setPriceKey(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={priceKey} onChange={(e) => setPriceKey(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {USD_PRICING.map((p) => (
               <option key={`${p.provider}|${p.modelId}`} value={`${p.provider}|${p.modelId}`}>
                 {p.modelId}
@@ -79,7 +79,7 @@ export default function EconomicsPanel() {
         </label>
         <label className="block text-xs text-dim">
           自建 GPU
-          <select value={gpuId} onChange={(e) => { setGpuId(e.target.value); setHourlyOverride(null) }} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={gpuId} onChange={(e) => { setGpuId(e.target.value); setHourlyOverride(null) }} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {GPUS.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}
@@ -93,11 +93,11 @@ export default function EconomicsPanel() {
         </label>
         <label className="block text-xs text-dim">
           时租 $/卡/时
-          <input type="number" step={0.1} value={hourlyPerGpu} onChange={(e) => setHourlyOverride(+e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white" />
+          <input type="number" step={0.1} value={hourlyPerGpu} onChange={(e) => setHourlyOverride(+e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg" />
         </label>
         <label className="block text-xs text-dim">
           集群吞吐 tok/s
-          <input type="number" step={500} value={tps} onChange={(e) => setTps(Math.max(1, +e.target.value))} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white" />
+          <input type="number" step={500} value={tps} onChange={(e) => setTps(Math.max(1, +e.target.value))} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg" />
         </label>
         <label className="block text-xs text-dim">
           利用率：{Math.round(utilization * 100)}%
@@ -112,22 +112,22 @@ export default function EconomicsPanel() {
 
       {/* 结论指标 */}
       <div className="grid gap-3 md:grid-cols-4">
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">API 混合均价</div>
           <div className="mt-1 font-mono text-2xl font-bold" style={{ color: API_COLOR }}>${r.apiPerMTok.toFixed(2)}<span className="text-sm text-dim">/MTok</span></div>
           <div className="mt-1 text-[11px] text-dim">输入/输出/缓存按占比加权</div>
         </div>
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">自建单位成本</div>
           <div className="mt-1 font-mono text-2xl font-bold" style={{ color: SELF_COLOR }}>${r.selfPerMTok.toFixed(2)}<span className="text-sm text-dim">/MTok</span></div>
           <div className="mt-1 text-[11px] text-dim">集群$/h ÷ (tok/s×3600×利用率)×10⁶ —— 利用率在分母</div>
         </div>
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">盈亏平衡点</div>
           <div className="mt-1 font-mono text-2xl font-bold">{r.breakEven.toFixed(0)}<span className="text-sm text-dim"> MTok/日</span></div>
           <div className="mt-1 text-[11px] text-dim">日均量超过此值自建开始更省</div>
         </div>
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">集群日产能（当前利用率）</div>
           <div className="mt-1 font-mono text-2xl font-bold">{r.capacityMTok.toFixed(0)}<span className="text-sm text-dim"> MTok/日</span></div>
           <div className="mt-1 text-[11px] text-dim">超出需加副本（成本阶梯上移）</div>
@@ -135,7 +135,7 @@ export default function EconomicsPanel() {
       </div>
 
       {/* 盈亏平衡图 */}
-      <div className="rounded-xl border border-line bg-panel p-5">
+      <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
         <h4 className="mb-1 text-sm font-semibold">API vs 自建：日成本对比（示意测算）</h4>
         <p className="mb-3 text-xs text-dim">自建为固定日成本（{gpuCount}×{gpu.name} ≈ ${(clusterHourly * 24).toFixed(0)}/日，产能内平线）；API 随用量线性。交点即盈亏平衡。</p>
         <div className="h-72 w-full">
@@ -145,7 +145,7 @@ export default function EconomicsPanel() {
               <XAxis dataKey="x" stroke={INK_MUTED} tick={{ fill: INK_MUTED, fontSize: 11 }} label={{ value: '日均用量（MTok）', position: 'insideBottomRight', offset: -2, fill: INK_MUTED, fontSize: 11 }} />
               <YAxis stroke={INK_MUTED} tick={{ fill: INK_MUTED, fontSize: 11 }} label={{ value: '$/日', angle: -90, position: 'insideLeft', fill: INK_MUTED, fontSize: 11 }} />
               <Tooltip
-                contentStyle={{ background: '#131a2e', border: `1px solid ${GRID}`, borderRadius: 8, fontSize: 12 }}
+                contentStyle={{ background: '#ffffff', border: '1px solid #e3ded1', borderRadius: 8, fontSize: 12, boxShadow: '0 4px 12px rgba(33,31,26,0.08)', color: '#211f1a' }}
                 labelStyle={{ color: INK_MUTED }}
                 formatter={(v: number, name: string) => [`$${v}`, name === 'api' ? 'API 日成本' : '自建日成本']}
                 labelFormatter={(v) => `日均 ${v} MTok`}
@@ -169,7 +169,7 @@ export default function EconomicsPanel() {
         {WORKED_CASES.map((c) => {
           const open = openCase === c.id
           return (
-            <div key={c.id} className={`rounded-xl border bg-panel ${open ? 'border-accent/60' : 'border-line'}`}>
+            <div key={c.id} className={`rounded-xl border bg-panel shadow-sm ${open ? 'border-accent/60' : 'border-line'}`}>
               <button onClick={() => setOpenCase(open ? null : c.id)} className="w-full px-5 py-4 text-left">
                 <div className="flex items-center gap-3">
                   <span className="font-bold">{c.name}</span>

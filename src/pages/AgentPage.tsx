@@ -38,7 +38,7 @@ export default function AgentPage() {
             ))}
           </div>
         </div>
-        <div className="mt-3 rounded-xl border border-line bg-panel p-5">
+        <div className="mt-3 rounded-xl border border-line bg-panel shadow-sm p-5">
           <h3 className="font-bold text-accent">{el.name}</h3>
           <p className="mt-2 text-sm leading-relaxed">{el.what}</p>
           <div className="mt-3 rounded-lg border border-warn/30 bg-warn/10 p-3 text-sm leading-relaxed">
@@ -54,7 +54,7 @@ export default function AgentPage() {
         <p className="mb-3 text-sm text-dim">
           一句话定位：RAG 解决「知识从哪来」，Agent 解决「任务怎么完成」；混合架构 = Agent 循环中把检索当工具按需调用（agentic RAG）。
         </p>
-        <div className="rounded-xl border border-line bg-panel p-5">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <div className="mx-auto max-w-3xl">
             <Box title="用户请求" tone="accent" />
             <V />
@@ -86,7 +86,7 @@ export default function AgentPage() {
 
       {/* 两个编排流程图 */}
       <section className="grid gap-4 lg:grid-cols-2">
-        <div className="rounded-xl border border-line bg-panel p-5">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <h3 className="mb-3 font-bold">编排流程 ①：Function Calling 循环</h3>
           <div className="space-y-2">
             {FC_LOOP.map((s) => (
@@ -104,7 +104,7 @@ export default function AgentPage() {
           </p>
         </div>
 
-        <div className="rounded-xl border border-line bg-panel p-5">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <h3 className="mb-3 font-bold">编排流程 ②：LangGraph 式状态机</h3>
           <div className="space-y-2">
             {GRAPH_NODES.map((n, i) => (
@@ -127,7 +127,7 @@ export default function AgentPage() {
         <h2 className="mb-3 text-lg font-bold">落地坑清单</h2>
         <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
           {AGENT_PITFALLS.map((p) => (
-            <div key={p.name} className="rounded-xl border border-line bg-panel p-4">
+            <div key={p.name} className="rounded-xl border border-line bg-panel shadow-sm p-4">
               <div className="mb-1 font-semibold text-bad">⚠ {p.name}</div>
               <p className="text-sm leading-relaxed text-dim">{p.detail}</p>
             </div>

@@ -56,10 +56,10 @@ export default function MemoryCalculator() {
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-3 rounded-xl border border-line bg-panel p-4 md:grid-cols-5">
+      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 md:grid-cols-5">
         <label className="block text-xs text-dim">
           模型
-          <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {MODELS.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}{m.kvSpec.kind === 'unsupported' ? '（KV 不可估）' : ''}
@@ -69,7 +69,7 @@ export default function MemoryCalculator() {
         </label>
         <label className="block text-xs text-dim">
           GPU
-          <select value={gpuId} onChange={(e) => setGpuId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={gpuId} onChange={(e) => setGpuId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {GPUS.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}（{g.memoryGB}GB / {g.bandwidthTBs}TB/s）
@@ -79,7 +79,7 @@ export default function MemoryCalculator() {
         </label>
         <label className="block text-xs text-dim">
           量化
-          <select value={quantId} onChange={(e) => setQuantId(e.target.value as typeof quantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-white">
+          <select value={quantId} onChange={(e) => setQuantId(e.target.value as typeof quantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {QUANTS.map((q) => (
               <option key={q.id} value={q.id}>
                 {q.label}（{q.bytesPerParam} B/参数）
@@ -97,7 +97,7 @@ export default function MemoryCalculator() {
         </label>
       </div>
 
-      <div className="rounded-xl border border-line bg-panel p-5">
+      <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
         <h4 className="mb-1 text-sm font-semibold">
           显存构成 <span className="font-normal text-dim">（公式：权重 = 总参数×字节 + KV = 每token字节×上下文×并发 + ~10% 开销）</span>
         </h4>
@@ -113,15 +113,15 @@ export default function MemoryCalculator() {
           <>
             <div className="mt-3 flex h-9 w-full gap-0.5 overflow-hidden rounded-lg bg-panel-2">
               {seg(r.bd.weightsGB, 'bg-accent', '权重')}
-              {r.bd.kvGB !== null && seg(r.bd.kvGB, 'bg-[#d97706]', 'KV cache')}
-              {seg(r.bd.overheadGB, 'bg-line', '开销')}
+              {r.bd.kvGB !== null && seg(r.bd.kvGB, 'bg-warn', 'KV cache')}
+              {seg(r.bd.overheadGB, 'bg-dim', '开销')}
             </div>
             <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm">
               <span>
                 合计 <b className="font-mono">{r.bd.totalGB!.toFixed(0)} GB</b>
               </span>
               <span className="text-dim">
-                → 需要 <b className="font-mono text-white">{r.gpus}× {gpu.name}</b>（每卡按 90% 可用算）
+                → 需要 <b className="font-mono text-fg">{r.gpus}× {gpu.name}</b>（每卡按 90% 可用算）
               </span>
               {r.bd.kvGB !== null && r.bd.kvGB > r.bd.weightsGB && (
                 <span className="text-warn">⚠ KV cache 已超过权重——长上下文×高并发的「显存墙」现场</span>
@@ -132,26 +132,26 @@ export default function MemoryCalculator() {
       </div>
 
       <div className="grid gap-3 md:grid-cols-3">
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">TTFT（prefill {CTX_STEPS[ctxIdx] >= 1000 ? '1M' : `${CTX_STEPS[ctxIdx]}K`} tokens）</div>
           <div className="mt-1 font-mono text-2xl font-bold">
             {r.ttft === null ? 'N/A' : r.ttft >= 1000 ? `${(r.ttft / 1000).toFixed(1)}s` : `${r.ttft.toFixed(0)}ms`}
           </div>
           <div className="mt-1 text-[11px] text-dim">算力瓶颈：2×激活参数×tokens ÷ (FP8 算力×MFU 0.4)</div>
         </div>
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">TPOT（每 token 步长）</div>
           <div className="mt-1 font-mono text-2xl font-bold">{r.stepMs.toFixed(1)}ms</div>
           <div className="mt-1 text-[11px] text-dim">带宽瓶颈：(激活权重 + batch×KV) ÷ (带宽×MBU 0.6)</div>
         </div>
-        <div className="rounded-xl border border-line bg-panel p-4">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">集群吞吐（batch={batch}）</div>
           <div className="mt-1 font-mono text-2xl font-bold">{r.tps.toFixed(0)} tok/s</div>
           <div className="mt-1 text-[11px] text-dim">每步出 batch 个 token；MoE 用激活参数（{model.activeParamsB}B）</div>
         </div>
       </div>
 
-      <div className="rounded-xl border border-line bg-panel p-4 text-xs leading-relaxed text-dim">
+      <div className="rounded-xl border border-line bg-panel shadow-sm p-4 text-xs leading-relaxed text-dim">
         <span className="font-semibold text-warn">机架级参考（与单卡不同层级实体，不直接对比）：</span>
         {RACKS.map((rk) => (
           <span key={rk.id} className="ml-2">

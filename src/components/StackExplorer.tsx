@@ -14,7 +14,7 @@ export default function StackExplorer() {
           自顶向下：一个请求穿过的四层。点击任意组件查看讲解与面试考点（顺序即请求流向，硬件层承载全部上层）。
         </p>
         {STACK_LAYERS.map((l) => (
-          <div key={l.id} className="rounded-xl border border-line bg-panel p-4">
+          <div key={l.id} className="rounded-xl border border-line bg-panel shadow-sm p-4">
             <div className="mb-2 flex items-baseline gap-3">
               <span className={`font-bold ${l.color}`}>{l.name}</span>
               <span className="text-xs text-dim">{l.summary}</span>
@@ -26,7 +26,7 @@ export default function StackExplorer() {
                   onClick={() => setSel({ layer: l.id, comp: c.id })}
                   className={`rounded-lg border px-3 py-1.5 text-sm transition-colors ${
                     sel.layer === l.id && sel.comp === c.id
-                      ? 'border-accent bg-accent/20'
+                      ? 'border-accent bg-accent/10'
                       : 'border-line bg-panel-2 hover:border-accent/50'
                   }`}
                 >
@@ -36,7 +36,7 @@ export default function StackExplorer() {
             </div>
           </div>
         ))}
-        <div className="rounded-xl border border-line bg-panel p-4 text-xs leading-relaxed text-dim">
+        <div className="rounded-xl border border-line bg-panel shadow-sm p-4 text-xs leading-relaxed text-dim">
           {INTERCONNECT_NOTES.map((n, i) => (
             <p key={i} className="mb-1">
               · {n}
@@ -46,7 +46,7 @@ export default function StackExplorer() {
       </div>
 
       <div className="w-full shrink-0 lg:w-96">
-        <div className="sticky top-20 rounded-xl border border-line bg-panel p-5">
+        <div className="sticky top-20 rounded-xl border border-line bg-panel shadow-sm p-5">
           <div className={`mb-1 text-xs font-semibold ${layer.color}`}>{layer.name}</div>
           <h3 className="text-lg font-bold">{comp.name}</h3>
           <p className="mt-3 text-sm leading-relaxed">{comp.what}</p>

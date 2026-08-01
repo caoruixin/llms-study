@@ -32,14 +32,14 @@ function renderInline(text: string) {
   return text.split(INLINE_RE).map((part, i) => {
     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
       return (
-        <code key={i} className="rounded bg-ink px-1 py-0.5 text-[12px] text-accent">
+        <code key={i} className="rounded bg-panel-2 px-1 py-0.5 text-[12px] text-accent">
           {part.slice(1, -1)}
         </code>
       )
     }
     if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
       return (
-        <strong key={i} className="font-semibold text-white">
+        <strong key={i} className="font-semibold text-fg">
           {part.slice(2, -2)}
         </strong>
       )
@@ -50,7 +50,7 @@ function renderInline(text: string) {
 
 function renderLine(line: string) {
   const heading = HEADING_RE.exec(line)
-  if (heading) return <strong className="font-semibold text-white">{renderInline(heading[1])}</strong>
+  if (heading) return <strong className="font-semibold text-fg">{renderInline(heading[1])}</strong>
   const bullet = BULLET_RE.exec(line)
   if (bullet) {
     return (
@@ -76,7 +76,7 @@ function renderText(text: string) {
 function renderAssistant(content: string) {
   return splitFences(content).map((seg, i) =>
     seg.type === 'code' ? (
-      <pre key={i} className="overflow-x-auto rounded-md bg-ink p-3 text-xs">
+      <pre key={i} className="overflow-x-auto rounded-md border border-line bg-panel-2 p-3 text-xs">
         <code>{seg.text}</code>
       </pre>
     ) : (
@@ -127,7 +127,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
         role="dialog"
         aria-labelledby="ask-title"
         aria-modal="false"
-        className="pointer-events-auto absolute right-6 bottom-6 flex max-h-[70vh] w-[min(560px,calc(100vw-2rem))] flex-col rounded-xl border border-line bg-panel shadow-2xl"
+        className="pointer-events-auto absolute right-6 bottom-6 flex max-h-[70vh] w-[min(560px,calc(100vw-2rem))] flex-col rounded-xl border border-line bg-panel shadow-xl"
       >
         {/* 仅标题栏可拖 */}
         <div
@@ -150,7 +150,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
             onPointerDown={(e) => e.stopPropagation()}
             onClick={onClose}
             aria-label="关闭对话"
-            className="rounded px-1.5 text-lg leading-none text-dim transition-colors hover:text-white"
+            className="rounded px-1.5 text-lg leading-none text-dim transition-colors hover:text-fg"
           >
             ×
           </button>
@@ -195,7 +195,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
             <p className="mb-2 text-xs text-bad">
               {error}
               {errorKind === 'auth' && (
-                <Link to="/settings" className="ml-2 underline hover:text-white">
+                <Link to="/settings" className="ml-2 underline hover:text-accent">
                   去设置
                 </Link>
               )}
@@ -220,7 +220,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
             {busy ? (
               <button
                 onClick={onStop}
-                className="rounded-lg bg-panel-2 px-4 py-1.5 text-sm font-medium text-bad transition-colors hover:bg-line"
+                className="rounded-lg border border-line bg-panel px-4 py-1.5 text-sm font-medium text-bad transition-colors hover:bg-panel-2"
               >
                 ■ 停止
               </button>
@@ -228,7 +228,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
               <button
                 onClick={submit}
                 disabled={busy || !text.trim()}
-                className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/80 disabled:opacity-40"
+                className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
               >
                 发送
               </button>
