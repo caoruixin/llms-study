@@ -42,6 +42,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react(), tailwindcss()],
     server: { proxy },
+    preview: { proxy },
     test: {
       environment: 'node',
       include: ['src/**/*.test.ts'],

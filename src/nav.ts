@@ -3,6 +3,7 @@ export const NAV = [
   { to: '/architecture', label: '架构演进' },
   { to: '/inference', label: '推理链路' },
   { to: '/agent', label: 'Agent 架构' },
+  { to: '/kda', label: 'KDA 拆解' },
   { to: '/interview', label: '面试陪练' },
   { to: '/settings', label: '设置' },
 ]
