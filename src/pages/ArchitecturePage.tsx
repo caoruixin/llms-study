@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import SegmentedTabs from '../components/ui/SegmentedTabs'
 import TransformerDiagram from '../components/TransformerDiagram'
 import ModelEvolution from '../components/ModelEvolution'
@@ -42,7 +43,15 @@ export default function ArchitecturePage() {
               <tbody>
                 {ATTENTION_EVOLUTION.map((a, i) => (
                   <tr key={a.id} className={i % 2 ? '' : 'bg-panel-2/60'}>
-                    <td className="px-4 py-3 font-semibold whitespace-nowrap text-accent">{a.name}</td>
+                    <td className="px-4 py-3 font-semibold whitespace-nowrap text-accent">
+                      {a.id === 'kda' ? (
+                        <Link to="/kda" className="hover:underline">
+                          {a.name} <span className="text-xs font-normal">→ 交互式拆解</span>
+                        </Link>
+                      ) : (
+                        a.name
+                      )}
+                    </td>
                     <td className="px-4 py-3 leading-relaxed">{a.mechanism}</td>
                     <td className="px-4 py-3 leading-relaxed text-dim">{a.kvCost}</td>
                     <td className="px-4 py-3 text-dim">{a.models}</td>

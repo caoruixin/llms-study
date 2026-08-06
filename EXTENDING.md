@@ -13,6 +13,7 @@
 | 新增推理引擎/算子/组件 | `src/data/stack.ts` 对应层的 `components` | `StackComponent`（what + interview 两段） | 否 |
 | 新增生命周期阶段 | `src/components/LifecycleSim.tsx` 的 `STAGES` | — | 是（该数组就在组件内） |
 | 新增模拟公式 | `src/lib/simEngine.ts` + `simEngine.test.ts` | 纯函数 + 必配已知算例单测 | 否 |
+| 新增 KDA 推导步骤 / 演示场景 | `src/data/kda.ts` 的 `KDA_DERIV_STEPS`（场景数值改 `src/lib/kdaEngine.ts` 的 `DEFAULT_SCENARIO`） | `DerivStep`（`body` 必须是 `(step, fmt) => string` 取数函数，**禁写死数字**）+ `ScenarioSpec` | 否（四个 tab 组件全部按 `views` 声明渲染） |
 | 新增面试题 | `src/data/questions.ts` | `Question`（mustCover/redFlags 必填） | 否 |
 | 新增 ROI/POC 案例 | `src/data/cases.ts` | `WorkedCase` | 否 |
 | 新增 API 价格行 | `src/data/pricing.ts` | `PriceRow`（sourceUrl+asOf 必填） | 否 |
@@ -83,5 +84,9 @@ Authorization，UI 粘贴的 key 走 `X-User-Key` 头被代理改写，两条路
 2. **判别式联合类型**：`KVSpec`/`AttentionType` 等 union 让"新架构"成为编译器强制处理的分支——
    漏写分支编译不过；没有可靠参数就走 `unsupported` 优雅降级，杜绝伪精确。
 3. **纯函数引擎 + 单测回归**：`simEngine` 28 个已知算例单测，改公式跑 `npm test` 即知有没有算错。
+   `kdaEngine` 更进一步：`/kda` 页面所有数字（公式代入值、热力图、曲线、讲解文案）都由 `buildKdaTrace()`
+   单一 trace 派生，讲解文案是取数函数而非字符串常量——`src/data/kda.test.ts` 会在真实 trace 上求值，
+   文案与引擎一旦脱钩立即失败。想新增变体：加一个 `stepXxx` 单步函数 + `VariantId` 字面量，
+   TypeScript 会在 `Record<VariantId, ·>` 处报错提示补全所有分支。
 4. **溯源约定**：所有易变事实（价格/参数/规格）必带 `sourceUrl` + `asOf`，更新时知道对谁核对。
 5. **验证脚手架现成**：`npm run typecheck` + `npm test` + `npm run build` 三连即完成回归。
