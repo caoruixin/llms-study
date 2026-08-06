@@ -1,6 +1,6 @@
 # /kda「KDA 拆解」— K3 KDA 机制交互式讲解 Demo 实施计划
 
-> **进度（2026-08-06）：全部交付完成，0 P0 / 0 P1 / 0 P2。** 终态：typecheck 干净、`npm test` 123/123、build 通过；浏览器 E2E 首轮 0 P0/P1 + 5 P2，修复批后定点复测 6/6 PASS。详见文末「交付日志」与「E2E 交付记录」。改动未 commit。
+> **进度（2026-08-07）：全部交付并上线。** typecheck 干净、`npm test` 123/123、build 通过；浏览器 E2E 首轮 0 P0/P1 + 5 P2，修复批后定点复测 6/6 PASS。已合并 main（PR #3，1dc9c34）；已部署 rkb-ecs：**http://8.130.208.123/llms/#/kda**（`vite build --base=./` + rsync 至 `/work/llms-study/dist`，Caddy IP:80 站点 `/llms/` 子路径 + LLM API allowlist 反代；线上浏览器冒烟通过，部署细节见项目记忆 `ecs-deploy-llms-study`）。详见文末「交付日志」与「E2E 交付记录」。
 
 ## Context
 
