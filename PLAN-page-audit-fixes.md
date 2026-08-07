@@ -1,5 +1,7 @@
 # llm-pro.cn 四页问题审计与修复方案（/agent /inference /interview /kda）
 
+> **进度（2026-08-07）：P0+P1 全部交付并上线。** vitest 134/134（+11 新增数据不变量测试）、build 通过；浏览器 E2E QA 两轮：首轮 1 项阻塞（recharts category 轴导致 产能上限/盈亏平衡 参考线不渲染，XAxis 补 `type="number"` + 阶梯边界点对修复）+ 3 P2（时租输入钳制、跳变格点偏移已一并修，产能标签左缘裁切改动态锚点），复核 5/5 PASS verdict SHIP。PR #6（feat/page-audit-fixes）；已上线 llm-pro.cn（tar 管道原子切换，旧版留 `/var/www/llms-study.old-20260807-1338`），线上冒烟通过（产能线/「—」盈亏口径、/agent 无 JD、红线区块均已验证）。服务端限流已配：nginx 四条 `/api/*` 反代加 `limit_req 6r/m burst 3 nodelay` + `limit_conn 4`（429，conf 备份 `llms-study.conf.bak-20260807-ratelimit`），实测 burst 后 429。P2 留档不做，见「不做」一节。
+
 ## Context
 
 对 https://llm-pro.cn 的四个页面做了代码审查 + 真机浏览器验证（含实际提交一次面试评分）。结论：
