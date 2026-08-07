@@ -34,7 +34,7 @@ export default function SettingsPage() {
           />
         </label>
         <label className="block space-y-1">
-          <span className="text-sm text-dim">API Key（只存本会话 sessionStorage，不落盘；留空则使用 .env.local 中配置）</span>
+          <span className="text-sm text-dim">API Key（留空则使用站点默认代理，key 由服务端注入；粘贴的 key 只存本会话 sessionStorage，不落盘）</span>
           <input
             type="password"
             value={userKey}
@@ -44,10 +44,11 @@ export default function SettingsPage() {
           />
         </label>
         <p className="text-xs leading-relaxed text-dim">
-          推荐方式：在项目根目录复制 <code className="text-accent">.env.example</code> 为{' '}
-          <code className="text-accent">.env.local</code> 填入 key（不进前端代码，由 dev 代理注入鉴权头），改完需重启{' '}
-          <code className="text-accent">npm run dev</code>。此处粘贴的 key 走同源
-          <code className="text-accent"> X-User-Key </code>头，由代理改写为上游 Authorization。
+          留空时评分请求走站点默认代理（key 在服务端注入，不经过浏览器）；粘贴自己的 key 则走同源
+          <code className="text-accent"> X-User-Key </code>头，由代理改写为上游 Authorization，key
+          只存本会话 sessionStorage、不落盘。本地开发时：在项目根目录复制{' '}
+          <code className="text-accent">.env.example</code> 为 <code className="text-accent">.env.local</code>{' '}
+          填入 key（由 dev 代理注入鉴权头，不进前端代码），改完需重启 <code className="text-accent">npm run dev</code>。
         </p>
       </section>
     </div>

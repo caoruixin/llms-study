@@ -34,11 +34,13 @@ export default function InterviewPage() {
   const [error, setError] = useState('')
   const [result, setResult] = useState<{ score: ScoreResult; grade: Grade } | null>(null)
   const [showRef, setShowRef] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
   const dictationRef = useRef<DictationSession | null>(null)
   const wantDictationRef = useRef(false)
+  const restartTimesRef = useRef<number[]>([]) // 自动续录的时间戳窗口，防止立即结束的浏览器无限重启
 
   const settings = useSettings()
-  const { attempts, addAttempt } = useHistory()
+  const { attempts, addAttempt, clear } = useHistory()
 
   const question = useMemo(() => QUESTIONS.find((q) => q.id === selectedId)!, [selectedId])
   const pastAttempts = attempts.filter((a) => a.questionId === selectedId)
@@ -72,7 +74,10 @@ export default function InterviewPage() {
     setInterim('')
   }
 
-  // Chrome 静音数秒后会自动结束识别；只要用户没点停止就自动续录
+  // Chrome 静音数秒后会自动结束识别；只要用户没点停止就自动续录。
+  // 退避上限：短窗口内连续 3 次自动重启（识别刚启动就结束）视为异常，停止并提示，避免无限重启。
+  const MAX_RESTARTS = 3
+  const RESTART_WINDOW_MS = 5000
   function launchDictation() {
     const session = startDictation(
       question.lang,
@@ -87,7 +92,16 @@ export default function InterviewPage() {
           setDictating(false)
           setError(err)
         } else if (wantDictationRef.current) {
-          launchDictation()
+          const now = Date.now()
+          restartTimesRef.current = restartTimesRef.current.filter((t) => now - t < RESTART_WINDOW_MS)
+          if (restartTimesRef.current.length >= MAX_RESTARTS) {
+            wantDictationRef.current = false
+            setDictating(false)
+            setError('语音识别反复中断，已自动停止；请检查麦克风权限后重试，或改用文本输入')
+          } else {
+            restartTimesRef.current.push(now)
+            launchDictation()
+          }
         } else {
           setDictating(false)
         }
@@ -102,6 +116,7 @@ export default function InterviewPage() {
       return
     }
     wantDictationRef.current = true
+    restartTimesRef.current = []
     setDictating(true)
     setError('')
     launchDictation()
@@ -208,12 +223,18 @@ export default function InterviewPage() {
 
         <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <textarea
-            value={answer + (interim ? ` ${interim}` : '')}
+            value={answer}
             onChange={(e) => setAnswer(e.target.value)}
             placeholder={question.lang === 'en' ? 'Answer in English (or Chinese)…' : '口述或输入你的回答…'}
             rows={8}
             className="w-full resize-y rounded-lg border border-line bg-panel-2 px-3 py-2 text-sm leading-relaxed"
           />
+          {/* 语音识别的临时结果只读预览：确定后由 onText 追加进 answer，不直接进 textarea（避免编辑时把临时文本写死） */}
+          {interim && (
+            <p aria-live="polite" className="mt-1 rounded-lg border border-dashed border-line bg-panel-2 px-3 py-1.5 text-sm italic leading-relaxed text-dim">
+              识别中…{interim}
+            </p>
+          )}
           <div className="mt-3 flex items-center gap-3">
             <button
               onClick={toggleDictation}
@@ -254,6 +275,14 @@ export default function InterviewPage() {
               <div className="mb-1 text-xs text-dim">加分项</div>
               <ul className="list-inside list-disc space-y-1 text-dim">
                 {question.niceToHave.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="mb-3">
+              <div className="mb-1 text-xs text-bad">红线（提及即扣分）</div>
+              <ul className="list-inside list-disc space-y-1 text-bad/90">
+                {question.redFlags.map((s, i) => (
                   <li key={i}>{s}</li>
                 ))}
               </ul>
@@ -311,7 +340,27 @@ export default function InterviewPage() {
 
         {pastAttempts.length > 0 && (
           <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
-            <h3 className="mb-2 text-sm font-semibold text-dim">本题历史（{pastAttempts.length} 次）</h3>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold text-dim">本题历史（{pastAttempts.length} 次）</h3>
+              <button
+                onClick={() => {
+                  if (confirmClear) {
+                    clear()
+                    setConfirmClear(false)
+                  } else {
+                    setConfirmClear(true)
+                  }
+                }}
+                onBlur={() => setConfirmClear(false)}
+                className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+                  confirmClear
+                    ? 'border-bad/60 bg-bad/10 font-semibold text-bad'
+                    : 'border-line bg-panel text-dim hover:text-bad'
+                }`}
+              >
+                {confirmClear ? '确认清空？（全部题目）' : '清空练习历史'}
+              </button>
+            </div>
             <div className="space-y-2">
               {pastAttempts.slice(0, 5).map((a) => (
                 <div key={a.id} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">

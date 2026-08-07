@@ -33,7 +33,8 @@ export interface ModelSpec extends Sourced {
   year: number
   totalParamsB: number // 十亿（B）
   activeParamsB: number // MoE 激活参数；dense 与 total 相同
-  moe?: { experts: number; activePerToken: number; shared?: number }
+  // MoE 专家配置：官方未公布时整个字段缺省（勿用 0 占位）；experts 已公布而激活数未公布时 activePerToken 缺省
+  moe?: { experts: number; activePerToken?: number; shared?: number }
   attentionType: AttentionType
   kvSpec: KVSpec
   contextK: number // 上下文（K tokens）
@@ -57,6 +58,7 @@ export interface PriceRow extends Sourced {
   toolCalling: boolean
   openWeights: boolean
   notes?: string
+  validUntil?: string // YYYY-MM-DD：notes 中限时价的截止日；过期后 UI 标注「已过期」
 }
 
 // 硬件分层实体：GPU 芯片与机架系统是不同层级，只在同层比较

@@ -10,6 +10,7 @@ export interface WorkedCase {
   scenario: string
   sections: CaseSection[]
   takeaway: string
+  priceValidUntil?: string // YYYY-MM-DD：案例引用的限时价截止日（与 pricing.ts 对应行 validUntil 同源）；过期后 UI 提示
 }
 
 export const WORKED_CASES: WorkedCase[] = [
@@ -62,6 +63,8 @@ export const WORKED_CASES: WorkedCase[] = [
     name: 'ROI 测算 worked case ②：出海 SaaS 代码助手（USD 结算）',
     scenario:
       '某出海 SaaS 公司（研发 400 人）要上 AI 编码助手，纠结「买国际旗舰 API」vs「混合路由（开源模型托管 + 旗舰兜底）」。USD 结算、数据需留在海外区。',
+    priceValidUntil: '2026-08-31', // claude-sonnet-5 限时价 $2/$10 的截止日
+
     sections: [
       {
         title: '① 负载画像',

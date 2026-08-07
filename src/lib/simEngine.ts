@@ -71,6 +71,16 @@ export function minGpus(totalGB: number, gpuMemoryGB: number, usable = 0.9): num
   return Math.max(1, Math.ceil(totalGB / (gpuMemoryGB * usable)))
 }
 
+// 按所选量化取 GPU 算力口径：仅在官方公布对应精度算力时切换（INT4/FP4 → fp4Tflops），
+// 其余（含 FP16——数据层无官方 FP16 字段）回退 FP8 口径，basis 供 UI 标注「按 FP8 算力口径」；不编造硬件数字
+export function tflopsForQuant(
+  gpu: { fp8Tflops: number | null; fp4Tflops: number | null },
+  quantId: QuantOption['id'],
+): { tflops: number | null; basis: 'fp8' | 'fp4' } {
+  if (quantId === 'int4' && gpu.fp4Tflops !== null) return { tflops: gpu.fp4Tflops, basis: 'fp4' }
+  return { tflops: gpu.fp8Tflops, basis: 'fp8' }
+}
+
 // TTFT 估算（ms）：prefill FLOPs ≈ 2 × 激活参数 × prompt tokens
 export function estTTFTms(
   activeParamsB: number,

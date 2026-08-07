@@ -63,9 +63,10 @@ export default function ModelEvolution() {
                 </div>
                 <div className="flex flex-wrap items-center gap-4 text-xs text-dim">
                   <span>许可证：{m.license}</span>
-                  {m.moe && m.moe.experts > 0 && (
+                  {m.moe && (
                     <span>
-                      MoE：{m.moe.experts} 专家选 {m.moe.activePerToken}
+                      MoE：{m.moe.experts} 专家
+                      {m.moe.activePerToken ? `选 ${m.moe.activePerToken}` : '（激活专家数未公布）'}
                       {m.moe.shared ? ` + ${m.moe.shared} 共享` : ''}
                     </span>
                   )}
