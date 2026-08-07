@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { MODELS } from '../data/models'
 import { GPUS } from '../data/hardware'
-import { PRICING } from '../data/pricing'
+import { isPromoExpired, PRICING } from '../data/pricing'
 import {
   QUANTS,
   apiRequestCost,
@@ -12,8 +12,10 @@ import {
   kvBytesPerToken,
   memoryBreakdown,
   minGpus,
+  tflopsForQuant,
   tokensPerSecond,
 } from '../lib/simEngine'
+import { useInferenceParams, type QuantId } from '../store'
 
 // 仅提供有公开 KV/维度参数、可数值估算的模型（KDA/DSA/CSA-HCA 等新架构无公开参数，不做伪精确估算）
 const SIM_MODELS = MODELS.filter((m) => m.kvSpec.kind !== 'unsupported')
@@ -32,11 +34,9 @@ const MOCK_OUTPUT =
   'KV cache 是推理系统的显存主角：prefill 阶段把输入的 K/V 存下来，decode 阶段每生成一个 token 都要读它。它随「上下文长度 × 并发数」线性膨胀，因此 GQA、MLA、稀疏注意力乃至线性注意力的演进，本质都是在给这份账单降价。'
 
 export default function LifecycleSim() {
-  const [modelId, setModelId] = useState('deepseek-v3')
-  const [gpuId, setGpuId] = useState('h100')
-  const [quantId, setQuantId] = useState<'fp16' | 'fp8' | 'int4'>('fp8')
-  const [batch, setBatch] = useState(16)
-  const [cacheRate, setCacheRate] = useState(0.7)
+  // 模型/GPU/量化/batch/缓存命中率与 /inference 其他面板共享（src/store.ts useInferenceParams）
+  const { modelId, gpuId, quantId, batch, cacheRate, setModelId, setGpuId, setQuantId, setBatch, setCacheRate } =
+    useInferenceParams()
   const [priceKey, setPriceKey] = useState('DeepSeek|deepseek-v4-pro')
   const [prompt, setPrompt] = useState('你是资深售前顾问。请解释为什么长上下文会显著推高推理成本，并给出三个可落地的优化手段。')
   const [tokenOverride, setTokenOverride] = useState<number | null>(null)
@@ -46,7 +46,9 @@ export default function LifecycleSim() {
   const [running, setRunning] = useState(false)
   const timerRef = useRef<ReturnType<typeof setTimeout>[]>([])
 
-  const model = SIM_MODELS.find((m) => m.id === modelId)!
+  // 共享参数里的模型可能无公开 KV 参数（显存计算器可选）→ 本面板退回首个可估算模型并标注
+  const sharedModel = SIM_MODELS.find((m) => m.id === modelId)
+  const model = sharedModel ?? SIM_MODELS[0]
   const gpu = GPUS.find((g) => g.id === gpuId)!
   const quant = QUANTS.find((q) => q.id === quantId)!
   const price = PRICING.find((p) => `${p.provider}|${p.modelId}` === priceKey)!
@@ -57,7 +59,8 @@ export default function LifecycleSim() {
   const calc = useMemo(() => {
     const bd = memoryBreakdown(model.totalParamsB, quant.bytesPerParam, model.kvSpec, inputTokens + 512, batch)
     const gpus = bd.totalGB === null ? 1 : minGpus(bd.totalGB, gpu.memoryGB)
-    const ttft = estTTFTms(model.activeParamsB, inputTokens - cacheHitTokens, gpu.fp8Tflops, gpus)
+    // 量化对应算力口径（无官方对应精度数据时回退 FP8，与显存计算器同口径）
+    const ttft = estTTFTms(model.activeParamsB, inputTokens - cacheHitTokens, tflopsForQuant(gpu, quant.id).tflops, gpus)
     const stepMs = estStepMs(
       model.activeParamsB,
       quant.bytesPerParam,
@@ -126,13 +129,18 @@ export default function LifecycleSim() {
       <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 md:grid-cols-3 lg:grid-cols-6">
         <label className="block text-xs text-dim">
           模型
-          <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
+          <select value={model.id} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {SIM_MODELS.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}
               </option>
             ))}
           </select>
+          {!sharedModel && (
+            <span className="mt-1 block text-[10px] leading-snug text-warn">
+              共享参数所选模型无公开 KV 参数，本面板退回 {model.name} 估算
+            </span>
+          )}
         </label>
         <label className="block text-xs text-dim">
           GPU
@@ -146,7 +154,7 @@ export default function LifecycleSim() {
         </label>
         <label className="block text-xs text-dim">
           量化
-          <select value={quantId} onChange={(e) => setQuantId(e.target.value as typeof quantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
+          <select value={quantId} onChange={(e) => setQuantId(e.target.value as QuantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {QUANTS.map((q) => (
               <option key={q.id} value={q.id}>
                 {q.label}
@@ -167,7 +175,7 @@ export default function LifecycleSim() {
           <select value={priceKey} onChange={(e) => setPriceKey(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {PRICING.filter((p) => p.inputPerMTok !== null).map((p) => (
               <option key={`${p.provider}|${p.modelId}`} value={`${p.provider}|${p.modelId}`}>
-                {p.modelId}（{p.provider}）
+                {p.modelId}（{p.provider}）{isPromoExpired(p.validUntil) ? '·限时价已过期' : ''}
               </option>
             ))}
           </select>

@@ -101,7 +101,8 @@ export const PRICING: PriceRow[] = [
     modality: '文本+图像+PDF',
     toolCalling: true,
     openWeights: false,
-    notes: '限时价 $2/$10 至 2026-08-31',
+    notes: '限时价 $2/$10 至 2026-08-31（表内为标准价）',
+    validUntil: '2026-08-31',
     sourceUrl: 'https://platform.claude.com/docs/en/pricing',
     asOf: '2026-06',
   },
@@ -186,7 +187,7 @@ export const PRICING: PriceRow[] = [
     modality: '文本',
     toolCalling: true,
     openWeights: true,
-    notes: '缓存存储限时免费；MIT 开源可自建',
+    notes: '缓存存储限时免费（截止日期未公布，时限以官方定价页为准）；MIT 开源可自建',
     sourceUrl: 'https://docs.z.ai/guides/overview/pricing',
     asOf: '2026-07',
   },
@@ -220,11 +221,17 @@ export const PRICING: PriceRow[] = [
     modality: '文本',
     toolCalling: true,
     openWeights: false,
-    notes: '限时 5 折（$1.25/$3.75）；隐式缓存命中=输入 20% + 显式缓存（写 1.25×/读 0.1×）；闭源（开源最大杯为 Qwen3.5-397B）',
+    notes: '限时 5 折（$1.25/$3.75，截止日期未公布，时限以官方定价页为准）；隐式缓存命中=输入 20% + 显式缓存（写 1.25×/读 0.1×）；闭源（开源最大杯为 Qwen3.5-397B）',
     sourceUrl: 'https://www.qwencloud.com/models/qwen3.7-max',
     asOf: '2026-07',
   },
 ]
+
+// 限时价是否已过期（validUntil 当天仍有效）；无 validUntil 视为未过期，时限见该行 sourceUrl
+export function isPromoExpired(validUntil: string | null | undefined, now: Date = new Date()): boolean {
+  if (!validUntil) return false
+  return now.getTime() > new Date(`${validUntil}T23:59:59`).getTime()
+}
 
 // 长上下文与商务要点（售前速记）
 export const PRICING_NOTES: string[] = [

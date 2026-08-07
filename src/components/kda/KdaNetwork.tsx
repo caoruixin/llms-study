@@ -1,10 +1,11 @@
 // Tab4 网络结构（PLAN-kda-demo.md §6.1）：TransformerDiagram 双栏模式。
 //
 // 数据一致性：层数只来自 K3_STRUCTURE（条带由 buildLayerBand() 生成，计数有单测互锁）；
-// 其余 K3 事实字段直接引用 src/data/models.ts 的 kimi-k3 条目（K3_MODEL_SPEC），不复制第二份。
+// 其余 K3 事实字段直接引用 src/data/models.ts 的 kimi-k3 条目（getK3ModelSpec()，render 期惰性取值，
+// 条目缺失时 throw 由路由级 ErrorBoundary 接住），不复制第二份。
 // 文案红线：~2.5× 效率提升是架构 + 训练配方的综合收益，不单项归因给 KDA。
 import { useMemo, useState } from 'react'
-import { buildLayerBand, K3_MODEL_SPEC, K3_STRUCTURE, NETWORK_NODES } from '../../data/kda'
+import { buildLayerBand, getK3ModelSpec, K3_STRUCTURE, NETWORK_NODES } from '../../data/kda'
 import KdaLayerFlow from './KdaLayerFlow'
 
 const REPEAT_UNIT: readonly { readonly nodeId: string; readonly label: string }[] = [
@@ -18,7 +19,7 @@ export default function KdaNetwork() {
   const band = useMemo(() => buildLayerBand(), [])
   const [selectedId, setSelectedId] = useState('kda-layer')
   const selected = NETWORK_NODES.find((n) => n.id === selectedId) ?? NETWORK_NODES[0]
-  const spec = K3_MODEL_SPEC
+  const spec = getK3ModelSpec()
   const moe = spec.moe
 
   const arrow = (
@@ -30,7 +31,12 @@ export default function KdaNetwork() {
   const facts: readonly [string, string][] = [
     ['总参 / 激活参', `${spec.totalParamsB}B / ${spec.activeParamsB}B`],
     ['注意力', `${spec.attentionType}（${K3_STRUCTURE.kdaLayers} 层 KDA + ${K3_STRUCTURE.mlaLayers} 层 Gated MLA）`],
-    ['MoE', moe ? `${moe.experts} 专家选 ${moe.activePerToken}${moe.shared ? ` + ${moe.shared} 共享` : ''}` : 'N/A'],
+    [
+      'MoE',
+      moe
+        ? `${moe.experts} 专家${moe.activePerToken ? `选 ${moe.activePerToken}` : '（激活专家数未公布）'}${moe.shared ? ` + ${moe.shared} 共享` : ''}`
+        : 'N/A（专家配置官方未公布）',
+    ],
     ['上下文', spec.contextK >= 1000 ? `${Math.round(spec.contextK / 1000)}M tokens` : `${spec.contextK}K tokens`],
     ['KV cache', spec.kvSpec.kind === 'unsupported' ? spec.kvSpec.note : 'N/A'],
     ['许可 / 多模态', `${spec.license} / ${spec.multimodal ? '原生多模态' : '纯文本'}`],

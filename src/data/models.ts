@@ -60,7 +60,7 @@ export const MODELS: ModelSpec[] = [
       {
         title: 'MLA 多头潜在注意力',
         what: '把 K/V 低秩压缩成共享 latent 向量，推理只缓存 latent，KV cache 比 GQA 再降数倍',
-        why: '567B 模型能以低成本服务 128K 上下文的关键；后被 Kimi K2 等直接沿用',
+        why: '671B 模型能以低成本服务 128K 上下文的关键；后被 Kimi K2 等直接沿用',
       },
       {
         title: '细粒度 MoE + 共享专家',
@@ -108,7 +108,7 @@ export const MODELS: ModelSpec[] = [
     year: 2026,
     totalParamsB: 1600,
     activeParamsB: 49,
-    moe: { experts: 0, activePerToken: 0 }, // 专家配置官方未公布
+    // moe 专家配置官方未公布 → 字段缺省（勿用 0 占位）
     attentionType: 'CSA-HCA',
     kvSpec: {
       kind: 'unsupported',
@@ -183,7 +183,7 @@ export const MODELS: ModelSpec[] = [
     year: 2026,
     totalParamsB: 397,
     activeParamsB: 17,
-    moe: { experts: 512, activePerToken: 0 }, // 512 专家为第三方整理 UNVERIFIED，激活专家数未公布
+    moe: { experts: 512 }, // 512 专家为第三方整理 UNVERIFIED；激活专家数未公布 → activePerToken 缺省
     attentionType: 'GDN',
     kvSpec: {
       kind: 'unsupported',
@@ -299,7 +299,7 @@ export const MODELS: ModelSpec[] = [
     year: 2025,
     totalParamsB: 355,
     activeParamsB: 32,
-    moe: { experts: 0, activePerToken: 0 }, // 专家配置官方博客未公布
+    // moe 专家配置官方博客未公布 → 字段缺省（勿用 0 占位）
     attentionType: 'GQA',
     kvSpec: { kind: 'unsupported', note: '层数/KV heads 官方博客未公布' },
     contextK: 128,
@@ -323,7 +323,7 @@ export const MODELS: ModelSpec[] = [
     year: 2026,
     totalParamsB: 744,
     activeParamsB: 40,
-    moe: { experts: 0, activePerToken: 0 }, // 专家数官方未公布
+    // moe 专家数官方未公布 → 字段缺省（勿用 0 占位）
     attentionType: 'DSA',
     kvSpec: { kind: 'unsupported', note: '层数/维度官方未公布' },
     contextK: 200,
@@ -355,7 +355,7 @@ export const MODELS: ModelSpec[] = [
     year: 2026,
     totalParamsB: 753,
     activeParamsB: 40, // 官方未单独公布，沿用 GLM-5 口径 UNVERIFIED
-    moe: { experts: 0, activePerToken: 0 },
+    // moe 专家配置官方未公布 → 字段缺省（勿用 0 占位）
     attentionType: 'DSA',
     kvSpec: {
       kind: 'unsupported',

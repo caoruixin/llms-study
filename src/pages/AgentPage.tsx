@@ -22,7 +22,7 @@ export default function AgentPage() {
     <div className="space-y-8">
       {/* 五要素蓝图 */}
       <section>
-        <h2 className="mb-3 text-lg font-bold">Agent 架构五要素 <span className="text-sm font-normal text-dim">（JD 原文：工具调用、记忆、编排、多模态、长链路推理）</span></h2>
+        <h2 className="mb-3 text-lg font-bold">Agent 架构五要素</h2>
         <div className="flex flex-col gap-4 lg:flex-row">
           <div className="grid flex-1 grid-cols-2 gap-2 md:grid-cols-5">
             {AGENT_ELEMENTS.map((e) => (
@@ -107,9 +107,9 @@ export default function AgentPage() {
         <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
           <h3 className="mb-3 font-bold">编排流程 ②：LangGraph 式状态机</h3>
           <div className="space-y-2">
-            {GRAPH_NODES.map((n, i) => (
+            {GRAPH_NODES.map((n) => (
               <div key={n.id} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">
-                <span className="shrink-0 rounded bg-ok/20 px-2 py-0.5 text-xs font-semibold text-ok">{i === 1 ? '条件边' : '节点'}</span>
+                <span className="shrink-0 rounded bg-ok/20 px-2 py-0.5 text-xs font-semibold text-ok">{n.kind === 'edge' ? '条件边' : '节点'}</span>
                 <span className="font-medium whitespace-nowrap">{n.name}</span>
                 <span className="text-dim">{n.desc}</span>
               </div>

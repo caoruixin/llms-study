@@ -11,6 +11,7 @@ import {
   memoryBreakdown,
   minGpus,
   selfHostCostPerMTok,
+  tflopsForQuant,
   tokensPerSecond,
   weightMemoryGB,
 } from './simEngine'
@@ -70,6 +71,19 @@ describe('性能估算（示意 roofline）', () => {
     const step32 = estStepMs(70, 1, null, 0, 32, 3.35, 1)
     expect(step32).toBeCloseTo(step1) // 无 KV 时步长与 batch 无关（权重 batch 共享）
     expect(tokensPerSecond(step32, 32)).toBeCloseTo(tokensPerSecond(step1, 1) * 32)
+  })
+
+  it('tflopsForQuant：INT4/FP4 仅在有官方 FP4 值时切换，否则回退 FP8 口径并标注 basis', () => {
+    const b200 = { fp8Tflops: 4500, fp4Tflops: 9000 }
+    const h100 = { fp8Tflops: 1979, fp4Tflops: null }
+    const h20 = { fp8Tflops: null, fp4Tflops: null }
+    expect(tflopsForQuant(b200, 'int4')).toEqual({ tflops: 9000, basis: 'fp4' })
+    expect(tflopsForQuant(b200, 'fp8')).toEqual({ tflops: 4500, basis: 'fp8' })
+    // 数据层无官方 FP16 算力字段 → FP16 也回退 FP8 口径（UI 标注，不编数）
+    expect(tflopsForQuant(h100, 'fp16')).toEqual({ tflops: 1979, basis: 'fp8' })
+    expect(tflopsForQuant(h100, 'int4')).toEqual({ tflops: 1979, basis: 'fp8' })
+    // H20 无任何官方算力值 → null 透传（UI 显示 N/A）
+    expect(tflopsForQuant(h20, 'int4')).toEqual({ tflops: null, basis: 'fp8' })
   })
 
   it('量级 sanity：70B FP8 在 H100 单卡 batch=1 的 TPOT 在几十 ms 量级', () => {

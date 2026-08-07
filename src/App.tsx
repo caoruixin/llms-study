@@ -6,6 +6,7 @@ import KdaPage from './pages/KdaPage'
 import InterviewPage from './pages/InterviewPage'
 import SettingsPage from './pages/SettingsPage'
 import SelectionAsk from './components/ask/SelectionAsk'
+import ErrorBoundary from './components/ErrorBoundary'
 import { NAV } from './nav'
 
 export default function App() {
@@ -41,14 +42,15 @@ export default function App() {
         </div>
       </header>
       <main className="mx-auto max-w-7xl px-4 py-6">
+        {/* 每个页面各包一层 ErrorBoundary：单页 render 期 throw 只废该页，不白屏整站 */}
         <Routes>
           <Route path="/" element={<Navigate to="/architecture" replace />} />
-          <Route path="/architecture" element={<ArchitecturePage />} />
-          <Route path="/inference" element={<InferencePage />} />
-          <Route path="/agent" element={<AgentPage />} />
-          <Route path="/kda" element={<KdaPage />} />
-          <Route path="/interview" element={<InterviewPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/architecture" element={<ErrorBoundary><ArchitecturePage /></ErrorBoundary>} />
+          <Route path="/inference" element={<ErrorBoundary><InferencePage /></ErrorBoundary>} />
+          <Route path="/agent" element={<ErrorBoundary><AgentPage /></ErrorBoundary>} />
+          <Route path="/kda" element={<ErrorBoundary><KdaPage /></ErrorBoundary>} />
+          <Route path="/interview" element={<ErrorBoundary><InterviewPage /></ErrorBoundary>} />
+          <Route path="/settings" element={<ErrorBoundary><SettingsPage /></ErrorBoundary>} />
         </Routes>
       </main>
       <SelectionAsk />

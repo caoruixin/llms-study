@@ -8,17 +8,17 @@ import {
   kvBytesPerToken,
   memoryBreakdown,
   minGpus,
+  tflopsForQuant,
   tokensPerSecond,
 } from '../lib/simEngine'
+import { useInferenceParams, type QuantId } from '../store'
 
 const CTX_STEPS = [4, 8, 16, 32, 64, 128, 256, 512, 1000] // K tokens
 
 export default function MemoryCalculator() {
-  const [modelId, setModelId] = useState('llama3-70b')
-  const [gpuId, setGpuId] = useState('h100')
-  const [quantId, setQuantId] = useState<'fp16' | 'fp8' | 'int4'>('fp8')
+  // 模型/GPU/量化/batch 与 /inference 其他面板共享（src/store.ts useInferenceParams）；上下文长度为本面板专属
+  const { modelId, gpuId, quantId, batch, setModelId, setGpuId, setQuantId, setBatch } = useInferenceParams()
   const [ctxIdx, setCtxIdx] = useState(2) // 16K
-  const [batch, setBatch] = useState(8)
 
   const model = MODELS.find((m) => m.id === modelId)!
   const gpu = GPUS.find((g) => g.id === gpuId)!
@@ -31,7 +31,9 @@ export default function MemoryCalculator() {
     // 无 KV 公式时给「权重下限」估卡数，并明确标注
     const baseGB = bd.totalGB ?? bd.weightsGB + bd.overheadGB
     const gpus = minGpus(baseGB, gpu.memoryGB)
-    const ttft = estTTFTms(model.activeParamsB, contextTokens, gpu.fp8Tflops, gpus)
+    // 量化对应算力口径：仅 INT4/FP4 且该卡有官方 FP4 值时切换，否则回退 FP8 并在下方标注
+    const cap = tflopsForQuant(gpu, quant.id)
+    const ttft = estTTFTms(model.activeParamsB, contextTokens, cap.tflops, gpus)
     const stepMs = estStepMs(
       model.activeParamsB,
       quant.bytesPerParam,
@@ -41,17 +43,23 @@ export default function MemoryCalculator() {
       gpu.bandwidthTBs,
       gpus,
     )
-    return { bd, unsupported, baseGB, gpus, ttft, stepMs, tps: tokensPerSecond(stepMs, batch) }
+    return { bd, unsupported, baseGB, gpus, ttft, ttftBasis: cap.basis, stepMs, tps: tokensPerSecond(stepMs, batch) }
   }, [model, gpu, quant, contextTokens, batch])
 
-  const seg = (gb: number, color: string, label: string) => {
-    const total = r.baseGB
-    const pct = Math.max(2, (gb / total) * 100)
-    return (
-      <div className={`${color} flex items-center justify-center overflow-hidden rounded px-1 text-[11px] font-medium whitespace-nowrap text-white`} style={{ width: `${pct}%` }} title={`${label} ${gb.toFixed(1)} GB`}>
-        {label} {gb.toFixed(0)}G
+  // 分段先给 2% 可见性下限，再整体归一化——三段之和恒为 100%，不会溢出
+  const segs = (defs: { gb: number; color: string; label: string }[]) => {
+    const floored = defs.map((d) => Math.max(2, (d.gb / r.baseGB) * 100))
+    const sum = floored.reduce((a, b) => a + b, 0)
+    return defs.map((d, i) => (
+      <div
+        key={d.label}
+        className={`${d.color} flex items-center justify-center overflow-hidden rounded px-1 text-[11px] font-medium whitespace-nowrap text-white`}
+        style={{ width: `${(floored[i] / sum) * 100}%` }}
+        title={`${d.label} ${d.gb.toFixed(1)} GB`}
+      >
+        {d.label} {d.gb.toFixed(0)}G
       </div>
-    )
+    ))
   }
 
   return (
@@ -79,7 +87,7 @@ export default function MemoryCalculator() {
         </label>
         <label className="block text-xs text-dim">
           量化
-          <select value={quantId} onChange={(e) => setQuantId(e.target.value as typeof quantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
+          <select value={quantId} onChange={(e) => setQuantId(e.target.value as QuantId)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
             {QUANTS.map((q) => (
               <option key={q.id} value={q.id}>
                 {q.label}（{q.bytesPerParam} B/参数）
@@ -112,9 +120,11 @@ export default function MemoryCalculator() {
         ) : (
           <>
             <div className="mt-3 flex h-9 w-full gap-0.5 overflow-hidden rounded-lg bg-panel-2">
-              {seg(r.bd.weightsGB, 'bg-accent', '权重')}
-              {r.bd.kvGB !== null && seg(r.bd.kvGB, 'bg-warn', 'KV cache')}
-              {seg(r.bd.overheadGB, 'bg-dim', '开销')}
+              {segs([
+                { gb: r.bd.weightsGB, color: 'bg-accent', label: '权重' },
+                ...(r.bd.kvGB !== null ? [{ gb: r.bd.kvGB, color: 'bg-warn', label: 'KV cache' }] : []),
+                { gb: r.bd.overheadGB, color: 'bg-dim', label: '开销' },
+              ])}
             </div>
             <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm">
               <span>
@@ -137,7 +147,13 @@ export default function MemoryCalculator() {
           <div className="mt-1 font-mono text-2xl font-bold">
             {r.ttft === null ? 'N/A' : r.ttft >= 1000 ? `${(r.ttft / 1000).toFixed(1)}s` : `${r.ttft.toFixed(0)}ms`}
           </div>
-          <div className="mt-1 text-[11px] text-dim">算力瓶颈：2×激活参数×tokens ÷ (FP8 算力×MFU 0.4)</div>
+          <div className="mt-1 text-[11px] text-dim">
+            {r.ttft === null
+              ? '该卡算力无官方数据（见硬件层备注），不做伪精确估算'
+              : `算力瓶颈：2×激活参数×tokens ÷ (${r.ttftBasis === 'fp4' ? 'FP4' : 'FP8'} 算力×MFU 0.4)${
+                  r.ttftBasis === 'fp8' && quantId !== 'fp8' ? '——所选量化无官方算力数据，按 FP8 算力口径' : ''
+                }`}
+          </div>
         </div>
         <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
           <div className="text-xs text-dim">TPOT（每 token 步长）</div>

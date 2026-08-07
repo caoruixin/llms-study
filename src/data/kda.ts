@@ -653,10 +653,21 @@ export const CHUNK_INTRO =
 
 // ─────────── Tab4 网络结构 ───────────
 
-const K3_MODEL = MODELS.find((m) => m.id === 'kimi-k3')
-if (!K3_MODEL) throw new Error('kda.ts: models.ts 缺少 kimi-k3 条目，网络结构 tab 无法引用事实数据')
-/** K3 事实字段的唯一引用出口（不复制第二份，字段更新只改 models.ts） */
-export const K3_MODEL_SPEC = K3_MODEL
+let k3ModelCache: (typeof MODELS)[number] | null = null
+
+/**
+ * K3 事实字段的唯一引用出口（不复制第二份，字段更新只改 models.ts）。
+ * 惰性求值：条目缺失时在首次调用（组件 render 期）才 throw，
+ * 由路由级 ErrorBoundary 接住只废当前页——模块级 throw 会在 import 时炸掉整个 chunk，边界接不住。
+ */
+export function getK3ModelSpec(): (typeof MODELS)[number] {
+  if (!k3ModelCache) {
+    const found = MODELS.find((m) => m.id === 'kimi-k3')
+    if (!found) throw new Error('kda.ts: models.ts 缺少 kimi-k3 条目，网络结构 tab 无法引用事实数据')
+    k3ModelCache = found
+  }
+  return k3ModelCache
+}
 
 const KDA_LAYERS = 69
 const MLA_LAYERS = 24
@@ -682,8 +693,13 @@ export const K3_STRUCTURE: K3Structure = {
   totalLayers: KDA_LAYERS + MLA_LAYERS,
   ratioNote: '约 3:1（每 3 层 KDA 配 1 层 Gated MLA）',
   interleaveNote: '条带按 3:1 顺序示意排布——官方未公布逐层的具体交错顺序，此处仅示意比例。',
-  sourceUrl: K3_MODEL.sourceUrl,
-  asOf: K3_MODEL.asOf,
+  // getter 惰性引用 models.ts 条目：保持与 getK3ModelSpec 相同的「首次访问才 throw」语义
+  get sourceUrl() {
+    return getK3ModelSpec().sourceUrl
+  },
+  get asOf() {
+    return getK3ModelSpec().asOf
+  },
 }
 
 export type LayerKind = 'kda' | 'mla'

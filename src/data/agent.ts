@@ -1,4 +1,7 @@
-// Agent 架构学习内容（JD 核心话题：工具调用/记忆/编排/多模态/长链路推理）
+// Agent 架构学习内容：工具调用/记忆/编排/多模态/长链路推理。
+// 数据规范（PLAN.md）：本文件以定性认知为主，不承载易变事实数字；
+// 涉及具体模型的口径与 src/data/pricing.ts 对应条目对齐（该处带 sourceUrl/asOf），
+// 量级类断言一律标注「经验量级（非实测）」，不编造引用。
 export interface AgentElement {
   id: string
   name: string
@@ -28,7 +31,7 @@ export const AGENT_ELEMENTS: AgentElement[] = [
   {
     id: 'multimodal',
     name: '多模态',
-    what: '原生多模态模型（图/文/视频同一模型理解，如 Kimi K3）vs 管线式（OCR/ASR 前置转文本）。原生路线上下文成本高但信息保真；管线路线便宜可控但丢失版面/语气信息。',
+    what: '原生多模态模型（图/文/视频同一模型理解，如 Kimi K3——其权重卡自称原生多模态，API 当前按文本口径提供）vs 管线式（OCR/ASR 前置转文本）。原生路线上下文成本高但信息保真；管线路线便宜可控但丢失版面/语气信息。',
     interview: '售前判断：单据审核类（版面关键）用原生视觉，语音客服（文本足够）用 ASR 管线——按信息损耗与成本折中，不是越原生越好。',
   },
   {
@@ -46,7 +49,7 @@ export interface AgentPitfall {
 
 export const AGENT_PITFALLS: AgentPitfall[] = [
   { name: '检索质量差 → 幻觉', detail: '切块策略与文档结构不匹配、缺重排；端到端质量的上限在检索不在模型。评估要把「检索命中率」和「回答质量」分开测。' },
-  { name: 'Token 放大效应', detail: 'Agent 一次任务 = 多轮循环 × 工具结果回填，消耗可达单轮问答的 10~50 倍；不配前缀缓存和上下文裁剪，成本会失控。' },
+  { name: 'Token 放大效应', detail: 'Agent 一次任务 = 多轮循环 × 工具结果回填，消耗比单轮问答高出一到两个数量级（经验量级，非实测）；不配前缀缓存和上下文裁剪，成本会失控。' },
   { name: '工具幻觉与死循环', detail: '编造参数枚举值、对失败工具无限重试。解法：schema 收紧 + 失败注入上下文 + 重试预算。' },
   { name: '权限与数据隔离', detail: '多租户下 Agent 检索/工具必须带租户过滤；「模型能看到什么」要在检索层控制，不能靠 prompt 叮嘱。' },
   { name: '没有评估闭环', detail: '上线后无 tracing、无任务级成功率指标，迭代全靠感觉。tracing 是调试与信任的前置条件，不是锦上添花。' },
@@ -62,12 +65,14 @@ export const FC_LOOP = [
   { step: '⑤ 继续', desc: '模型读结果：继续调工具（回到②）或产出最终回答', actor: 'model' },
 ] as const
 
-// LangGraph 式状态机（流程图 2）
-export const GRAPH_NODES = [
-  { id: 'plan', name: 'Plan 规划', desc: '拆解任务、更新计划（状态外置到 State）' },
-  { id: 'route', name: 'Router 条件边', desc: '按状态决定下一节点：继续执行 / 需要人工 / 完成' },
-  { id: 'act', name: 'Act 执行', desc: '调用工具或子 Agent（每个子任务独立上下文）' },
-  { id: 'observe', name: 'Observe 观察', desc: '校验结果、写 checkpoint（可回滚/断点续跑）' },
-  { id: 'human', name: 'Human Gate', desc: '不可逆操作暂停等人工批准' },
-  { id: 'done', name: 'End', desc: '产出结果 + 全程 trace 落盘' },
+// LangGraph 式状态机（流程图 2）；kind 区分图中的节点与条件边，UI 标签只依据它（不按数组顺序）
+export type GraphNodeKind = 'node' | 'edge'
+
+export const GRAPH_NODES: readonly { id: string; kind: GraphNodeKind; name: string; desc: string }[] = [
+  { id: 'plan', kind: 'node', name: 'Plan 规划', desc: '拆解任务、更新计划（状态外置到 State）' },
+  { id: 'route', kind: 'edge', name: 'Router 条件边', desc: '按状态决定下一节点：继续执行 / 需要人工 / 完成' },
+  { id: 'act', kind: 'node', name: 'Act 执行', desc: '调用工具或子 Agent（每个子任务独立上下文）' },
+  { id: 'observe', kind: 'node', name: 'Observe 观察', desc: '校验结果、写 checkpoint（可回滚/断点续跑）' },
+  { id: 'human', kind: 'node', name: 'Human Gate', desc: '不可逆操作暂停等人工批准' },
+  { id: 'done', kind: 'node', name: 'End', desc: '产出结果 + 全程 trace 落盘' },
 ] as const

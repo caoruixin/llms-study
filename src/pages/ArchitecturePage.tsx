@@ -4,7 +4,7 @@ import SegmentedTabs from '../components/ui/SegmentedTabs'
 import TransformerDiagram from '../components/TransformerDiagram'
 import ModelEvolution from '../components/ModelEvolution'
 import { ATTENTION_EVOLUTION, ATTENTION_SUMMARY } from '../data/attention'
-import { PRICING, PRICING_NOTES } from '../data/pricing'
+import { isPromoExpired, PRICING, PRICING_NOTES } from '../data/pricing'
 
 const TABS = [
   { id: 'transformer', label: '经典 Transformer' },
@@ -101,7 +101,12 @@ export default function ArchitecturePage() {
                       <td className="px-3 py-3 text-right">{p.maxOutputK === null ? 'N/A' : `${p.maxOutputK}K`}</td>
                       <td className="px-3 py-3 text-xs text-dim">{p.practicalContextNote ?? 'N/A'}</td>
                       <td className="px-3 py-3">{p.openWeights ? <span className="text-ok">✓</span> : <span className="text-dim">—</span>}</td>
-                      <td className="max-w-64 px-3 py-3 text-xs leading-relaxed text-dim">{p.notes}</td>
+                      <td className="max-w-64 px-3 py-3 text-xs leading-relaxed text-dim">
+                        {p.notes}
+                        {isPromoExpired(p.validUntil) && (
+                          <span className="ml-1 font-semibold text-warn">限时价已过期，现价见来源 ↗</span>
+                        )}
+                      </td>
                     </tr>
                   )
                 })}
