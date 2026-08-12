@@ -192,9 +192,28 @@ export interface CopilotMessage {
   usage?: { provider: string; model: string; inputTokens: number; outputTokens: number; estimated: boolean; cost: number }
   /** user：来自选区快捷操作时的标签（解释这段/更简单/…） */
   actionLabel?: string
+  /** Phase 4：assistant 消息的来源标注（如「kimi-k3 深度解释」并列展示时） */
+  sourceLabel?: string
+  /** Phase 4：用户对这条回答的深度反馈（太浅/刚好/太深），刷新后仍显示已选态 */
+  feedback?: 'shallow' | 'right' | 'deep'
 }
 
-/** Phase 4 落地：按概念的掌握度画像 */
+/** 画像证据的持久化形态（不含问题原文/论文正文，§8） */
+export interface StoredEvidence {
+  dir: 1 | 0 | -1
+  weight: number
+  ts: number
+  source: string
+}
+
+/**
+ * Phase 4 落地：按概念的掌握度画像。conceptId = '*' 的行是整篇论文的整体画像
+ * （层级 chip 与 pin 写在这一行）。
+ *
+ * recentEvidence 是最近 ≤24 条证据的滚动窗口，与 evidence 表刻意冗余：
+ * evidence 表是 append-only 日志（供 L3 巩固与诊断），这里的窗口让画像纯函数
+ * 在装载时无需扫描全量日志即可重算 confidence 与跨层判定。
+ */
 export interface LearnerConceptState {
   id: string
   paperId: string
@@ -202,14 +221,19 @@ export interface LearnerConceptState {
   mastery: number
   confidence: number
   updatedAt: number
+  /** Phase 4 加法字段（schema 不动） */
+  level?: string
+  pinnedLevel?: string
+  levelChangedAt?: number
+  recentEvidence?: StoredEvidence[]
 }
 
-/** Phase 4 落地：画像证据日志（不含论文正文与问题原文） */
+/** Phase 4 落地：画像证据日志（不含论文正文与问题原文）；dir=0 表示「刚好」类确认信号 */
 export interface EvidenceRecord {
   id: string
   paperId: string
   conceptId: string
-  dir: 1 | -1
+  dir: 1 | 0 | -1
   weight: number
   source: string
   ts: number

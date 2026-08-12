@@ -12,6 +12,14 @@ import PlanChip from './PlanChip'
 import BlockFallback from './blocks/BlockFallback'
 import BlockSkeleton from './blocks/BlockSkeleton'
 import FormulaBlock from './blocks/FormulaBlock'
+import StepperBlock from './blocks/StepperBlock'
+import ComparisonBlock from './blocks/ComparisonBlock'
+import GraphBlock from './blocks/GraphBlock'
+import TimelineBlock from './blocks/TimelineBlock'
+import QuizBlock from './blocks/QuizBlock'
+import FlashcardBlock from './blocks/FlashcardBlock'
+import TeachBackBlock from './blocks/TeachBackBlock'
+import type { BlockInteractions } from './blocks/interactions'
 
 /**
  * Copilot 回复渲染（§7.6）：raw 流文本 → splitCopilotStream → 分段渲染。
@@ -21,7 +29,7 @@ import FormulaBlock from './blocks/FormulaBlock'
  *   delta 的 rAF 批量合并在 CopilotPanel 完成。
  */
 
-interface Props {
+interface Props extends BlockInteractions {
   content: string
   /** 流已结束（finalize）：未闭合岛转降级卡、残缺 citeToken 不再抑制 */
   done: boolean
@@ -90,34 +98,84 @@ const ProseSeg = memo(function ProseSeg({ md, citeIndex, badges, onJumpCite }: P
   )
 })
 
+/** advisory 控制岛：坏了静默忽略（§7.5），不出降级卡 */
+const ADVISORY_ISLANDS = new Set(['plan', 'memo', 'learner', 'verdict'])
+
 function IslandSeg({
   seg,
+  index,
   done,
   citeIndex,
   badges,
   onJumpCite,
   citeMap,
+  interactions,
 }: {
   seg: Extract<CopilotSeg, { type: 'island' }>
+  /** 岛序号：交互块的稳定 React key 与洗牌种子 */
+  index: number
   done: boolean
   citeIndex: ReadonlyMap<string, StoredCiteEntry>
   badges: Readonly<Record<string, CiteLevel>> | null
   onJumpCite: (entry: StoredCiteEntry) => void
   citeMap: readonly StoredCiteEntry[]
+  interactions: BlockInteractions
 }) {
   if (!seg.closed) {
     return done ? <BlockFallback islandType={seg.islandType} failure="unclosed" raw={seg.raw} /> : <BlockSkeleton islandType={seg.islandType} />
   }
   if (!seg.block) {
-    // plan/memo 是 advisory：坏了静默忽略（§7.5），其余降级卡
-    if (seg.failure && (seg.islandType === 'plan' || seg.islandType === 'memo')) return null
+    if (seg.failure && ADVISORY_ISLANDS.has(seg.islandType)) return null
     return <BlockFallback islandType={seg.islandType} failure={seg.failure ?? 'invalid'} raw={seg.raw} />
   }
   switch (seg.block.kind) {
     case 'plan':
       return <PlanChip plan={seg.block} />
     case 'memo':
-      return null // 滚动摘要控制岛：不可见
+    case 'learner':
+      return null // 控制岛：不可见（learner 信号在 finalize 时进画像）
+    case 'verdict': {
+      const v = seg.block
+      if (v.missed.length === 0) return null // 无遗漏点时正文反馈已足够
+      return (
+        <div className="my-2 rounded-lg border border-warn/40 bg-panel-2 p-3 text-xs">
+          <p className="mb-1 font-medium text-warn">复述中遗漏的点</p>
+          <ul className="list-disc space-y-0.5 pl-4 text-dim">
+            {v.missed.map((m, i) => (
+              <li key={i}>{m}</li>
+            ))}
+          </ul>
+        </div>
+      )
+    }
+    case 'stepper':
+      return <StepperBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} />
+    case 'comparison':
+      return <ComparisonBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} />
+    case 'concept-map':
+    case 'flow':
+      return <GraphBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} />
+    case 'timeline':
+      return <TimelineBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} />
+    case 'quiz':
+      return (
+        <QuizBlock
+          block={seg.block}
+          seed={index + 1}
+          citeIndex={citeIndex}
+          badges={badges}
+          onJump={onJumpCite}
+          {...interactions}
+        />
+      )
+    case 'flashcard':
+      return (
+        <FlashcardBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} {...interactions} />
+      )
+    case 'teach-back':
+      return (
+        <TeachBackBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} {...interactions} />
+      )
     case 'evidence':
       if (seg.block.status !== 'insufficient') return null
       return (
@@ -168,7 +226,18 @@ function runsToMarkdownFromText(text: string, citeIndex: ReadonlyMap<string, Sto
   })
 }
 
-export default function CopilotMessage({ content, done, citeMap, badges, interrupted, insufficient, onJumpCite }: Props) {
+export default function CopilotMessage({
+  content,
+  done,
+  citeMap,
+  badges,
+  interrupted,
+  insufficient,
+  onJumpCite,
+  onEvidence,
+  onTeachBack,
+  busy,
+}: Props) {
   // 每条消息一个解析器实例：闭合岛校验结果缓存 + 未变全文直接复用
   const parseRef = useRef<ReturnType<typeof createStreamParserMemo> | null>(null)
   parseRef.current ??= createStreamParserMemo()
@@ -178,6 +247,11 @@ export default function CopilotMessage({ content, done, citeMap, badges, interru
 
   const weakCount = useMemo(() => (badges ? Object.values(badges).filter((l) => l === 'weak').length : 0), [badges])
   const missingCount = useMemo(() => (badges ? Object.values(badges).filter((l) => l === 'missing').length : 0), [badges])
+
+  const interactions = useMemo<BlockInteractions>(
+    () => ({ ...(onEvidence ? { onEvidence } : {}), ...(onTeachBack ? { onTeachBack } : {}), busy }),
+    [onEvidence, onTeachBack, busy],
+  )
 
   return (
     <div className="space-y-1">
@@ -204,11 +278,13 @@ export default function CopilotMessage({ content, done, citeMap, badges, interru
           <IslandSeg
             key={`i${i}`}
             seg={seg}
+            index={i}
             done={done}
             citeIndex={citeIndex}
             badges={badges}
             onJumpCite={onJumpCite}
             citeMap={citeMap}
+            interactions={interactions}
           />
         )
       })}

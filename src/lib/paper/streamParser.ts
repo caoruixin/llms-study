@@ -108,6 +108,24 @@ export function splitCopilotStream(src: string, opts: SplitOptions = {}): Copilo
 }
 
 /**
+ * 收集某一类已闭合结构岛（按出现顺序）。
+ * 画像接线用：finalize 后从 TurnOutcome.segs 里取 learner / verdict / plan 岛（§6.2 L2）。
+ * 坏岛没有 block 字段，天然被过滤掉——「坏则静默忽略」的降级语义在这里落地。
+ */
+export function collectIslands<K extends CopilotBlock['kind']>(
+  segs: readonly CopilotSeg[],
+  kind: K,
+): Extract<CopilotBlock, { kind: K }>[] {
+  const out: Extract<CopilotBlock, { kind: K }>[] = []
+  for (const seg of segs) {
+    if (seg.type === 'island' && seg.closed && seg.block?.kind === kind) {
+      out.push(seg.block as Extract<CopilotBlock, { kind: K }>)
+    }
+  }
+  return out
+}
+
+/**
  * 前缀记忆化辅助（§7.4，可选）。
  *
  * 选择说明：splitCopilotStream 保持纯函数（测试与 finalize 复用），本包装做两件事——

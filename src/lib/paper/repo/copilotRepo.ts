@@ -29,6 +29,8 @@ export interface CopilotRepository {
   resetSession(sessionId: string): Promise<void>
   listMessages(sessionId: string): Promise<CopilotMessage[]>
   addMessage(msg: Omit<CopilotMessage, 'id'>): Promise<CopilotMessage>
+  /** 局部更新（Phase 4：深度反馈 太浅/刚好/太深 的已选态） */
+  updateMessage(id: string, patch: Partial<CopilotMessage>): Promise<void>
 
   getConsent(provider: string): Promise<ProviderConsent | undefined>
   setConsent(provider: string, granted: boolean): Promise<void>
@@ -85,6 +87,10 @@ export function createCopilotRepository(db: PaperDb): CopilotRepository {
       const row: CopilotMessage = { ...msg, id: newId() }
       await db.messages.add(row)
       return row
+    },
+
+    async updateMessage(id, patch) {
+      await db.messages.update(id, patch)
     },
 
     getConsent: (provider) => db.consents.get(provider),

@@ -85,6 +85,8 @@ export default function PaperWorkbenchPage() {
   const alignedKey = useRef('')
   // 抽屉与桌面左栏是两件事：桌面左栏默认展开，小屏抽屉默认收起（否则一进页面就被目录盖住）
   const [drawerOpen, setDrawerOpen] = useState(false)
+  // 手机：Copilot 底部面板可切全屏（长回答 + 交互块在 390px 下需要整屏）
+  const [sheetFull, setSheetFull] = useState(false)
 
   const isDesktop = useMediaQuery('(min-width: 1280px)')
   const isTablet = useMediaQuery('(min-width: 768px)')
@@ -483,7 +485,10 @@ export default function PaperWorkbenchPage() {
         onRemoveAsk={removePendingAsk}
         onClearAsks={clearPendingAsks}
         onJumpAnchor={jumpToAnchor}
-        onClose={() => setCopilotOpen(false)}
+        onClose={() => {
+          setCopilotOpen(false)
+          setSheetFull(false)
+        }}
         onToggleSensitive={handleToggleSensitive}
       />
     </Suspense>
@@ -605,10 +610,23 @@ export default function PaperWorkbenchPage() {
           </div>
         )}
 
-        {/* 手机：Copilot 底部面板 */}
+        {/* 手机：Copilot 底部面板（可切全屏） */}
         {showCopilotSheet && (
-          <div className="fixed inset-x-0 bottom-0 z-40 max-h-[70dvh] overflow-hidden rounded-t-xl border-t border-line bg-panel p-4 shadow-lg">
-            <div className="h-[min(60dvh,32rem)]">{copilotPane}</div>
+          <div
+            className={`fixed inset-x-0 bottom-0 z-40 overflow-hidden border-t border-line bg-panel shadow-lg ${
+              sheetFull ? 'top-0 rounded-none p-3' : 'max-h-[70dvh] rounded-t-xl p-4'
+            }`}
+          >
+            <div className="mb-1 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setSheetFull((f) => !f)}
+                className="rounded border border-line px-2 py-0.5 text-[0.7rem] text-dim transition-colors hover:text-fg"
+              >
+                {sheetFull ? '退出全屏' : '全屏'}
+              </button>
+            </div>
+            <div className={sheetFull ? 'h-[calc(100dvh-3.5rem)]' : 'h-[min(60dvh,32rem)]'}>{copilotPane}</div>
           </div>
         )}
 

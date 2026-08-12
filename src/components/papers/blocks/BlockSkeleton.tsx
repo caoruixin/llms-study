@@ -3,9 +3,19 @@
 const TYPE_LABELS: Record<string, string> = {
   explanation: '讲解块',
   formula: '公式块',
+  stepper: '步骤演示',
+  comparison: '对比表',
+  'concept-map': '概念关系图',
+  flow: '流程图',
+  timeline: '时间线',
+  quiz: '理解检查',
+  flashcard: '术语卡',
+  'teach-back': '复述检查',
   plan: '教学计划',
   memo: '摘要',
   evidence: '证据核对',
+  learner: '学习信号',
+  verdict: '复述判定',
 }
 
 export default function BlockSkeleton({ islandType }: { islandType: string }) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
   buildKimiStructuredSpec,
   COST_CONFIRM_THRESHOLDS,
@@ -18,10 +18,48 @@ import {
 } from '../../lib/paper/briefPipeline'
 import { createModelGateway } from '../../lib/paper/modelGateway'
 import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
+import { createLearnerRepository } from '../../lib/paper/repo/learnerRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
 import { createTurnRunner, type TurnError, type TurnState } from '../../lib/paper/turnEngine'
 import { KEEP_PAIRS_AFTER_FOLD, MAX_LIVE_TURN_PAIRS, foldMemo, shouldRequestMemo, trimHistoryPairs } from '../../lib/paper/summarizer'
 import { formatTokens, formatUsd } from '../../lib/paper/usage'
+import { collectIslands, createStreamParserMemo, splitCopilotStream } from '../../lib/paper/streamParser'
+import {
+  applyEvidenceToStore,
+  evidenceFromFeedback,
+  evidenceFromLearnerIsland,
+  evidenceFromQuestion,
+  evidenceFromShortcut,
+  evidenceFromVerdict,
+  nextProfileHint,
+  setPinnedLevel,
+  summarizeProfile,
+  type ConceptProfile,
+  type DepthFeedback,
+  type LearnerLevel,
+  type ProfileEvidence,
+  type ProfileHint,
+} from '../../lib/paper/learnerProfile'
+import {
+  GUIDED_MODE_DEFS,
+  LEARNER_DIRECTIVE,
+  VERDICT_DIRECTIVE,
+  advanceGuided,
+  guidedStepAt,
+  startGuided,
+  type GuidedContext,
+  type GuidedRun,
+} from '../../lib/paper/guidedModes'
+import {
+  createTtsPlayer,
+  initialTtsState,
+  isTtsSupported,
+  speakableText,
+  takeCompleteSentences,
+  ttsReducer,
+  type TtsPlayer,
+} from '../../lib/paper/tts'
+import { isSpeechSupported, startDictation, type DictationSession } from '../../lib/speech'
 import type { RetrievalService } from '../../lib/paper/retrieval'
 import type { ScrollTarget } from '../../lib/paper/anchors'
 import type { CopilotMessage as StoredMessage, PaperBlock, PaperRecord, SourceAnchor, StoredCiteEntry } from '../../lib/paper/types'
@@ -30,6 +68,8 @@ import type { ChatMessage } from '../../lib/llmClient'
 import CopilotMessageView from './CopilotMessage'
 import ConsentDialog from './ConsentDialog'
 import CostConfirm, { type CostConfirmInfo } from './CostConfirm'
+import ProfileChip from './ProfileChip'
+import TurnFeedback from './TurnFeedback'
 
 /**
  * Paper Copilot 面板（Phase 3 真实现）：会话消息、流式轮次、pendingAsks 消费、
@@ -51,22 +91,33 @@ interface Props {
   onToggleSensitive: (sensitive: boolean) => void
 }
 
+/** 本轮任务档位：chat/deep 走 DeepSeek，deepAlt 是用户显式点击的 Kimi 深度升级（§5.1） */
+type TurnTask = 'chat' | 'deep' | 'deepAlt'
+
 interface SendParams {
   question: string
   retrievalQuery?: string
   selection?: string | null
-  task: 'chat' | 'deep'
+  task: TurnTask
   planIsland: boolean
   label?: string
   /** 落库与展示用的用户消息文本（含引用的选区） */
   displayText: string
+  /** 逐轮附加指令（引导步脚本 / learner / verdict 岛要求） */
+  extraDirectives?: readonly string[]
+  /** teach-back 轮：verdict 岛回写画像时的概念 */
+  teachBackConcept?: string
+  /** 回答来源标注（并列展示 Kimi 深度解释时） */
+  sourceLabel?: string
+  /** 问题由用户自己写（不是脚本/模板）：只有这种问题才做抽象度启发式画像 */
+  userAuthored?: boolean
 }
 
 type GateRequest =
   | { kind: 'consent'; provider: PaperProviderId; resolve: (ok: boolean) => void }
   | { kind: 'cost'; info: CostConfirmInfo; resolve: (ok: boolean) => void }
 
-const ASK_TEMPLATES: Record<Exclude<PaperAskAction, 'queue'>, { question: string; task: 'chat' | 'deep' }> = {
+const ASK_TEMPLATES: Record<Exclude<PaperAskAction, 'queue'>, { question: string; task: TurnTask }> = {
   explain: { question: '请解释我选中的这段论文内容。', task: 'chat' },
   simpler: {
     question: '请用更简单的方式解释我选中的这段内容：假设我是入门读者，先给直觉和类比，再给必要术语。',
@@ -76,19 +127,15 @@ const ASK_TEMPLATES: Record<Exclude<PaperAskAction, 'queue'>, { question: string
   example: { question: '请举一个具体的例子帮助理解我选中的这段内容。', task: 'chat' },
 }
 
-const GUIDED_MODES = [
-  { id: 'overview', label: '论文速览', enabled: true },
-  { id: 'section', label: '逐节精读', enabled: false },
-  { id: 'method', label: '方法拆解', enabled: false },
-  { id: 'derive', label: '公式推导', enabled: false },
-  { id: 'experiment', label: '实验复盘', enabled: false },
-  { id: 'review', label: '批判性审阅', enabled: false },
-] as const
+const PROVIDER_KEY_HINT: Record<PaperProviderId, string> = {
+  deepseek: 'DEEPSEEK_API_KEY',
+  kimi: 'KIMI_API_KEY（或 MOONSHOT_API_KEY）',
+}
 
-function friendlyTurnError(err: TurnError): string {
+function friendlyTurnError(err: TurnError, provider: PaperProviderId = 'deepseek'): string {
   switch (err.kind) {
     case 'auth':
-      return 'API key 无效或未配置：请在 .env.local 配置 DEEPSEEK_API_KEY 后重启 dev'
+      return `API key 无效或未配置：请在 .env.local 配置 ${PROVIDER_KEY_HINT[provider]} 后重启 dev`
     case 'rate-limit':
       return '触发上游限流（429），稍候会自动排队，也可稍后手动重试'
     case 'timeout':
@@ -118,14 +165,18 @@ export default function CopilotPanel({
   onToggleSensitive,
 }: Props) {
   const repo = useMemo(() => createCopilotRepository(getPaperDb()), [])
+  const learnerRepo = useMemo(() => createLearnerRepository(getPaperDb()), [])
 
   const [session, setSession] = useState<Awaited<ReturnType<typeof repo.getOrCreateSession>> | null>(null)
   const [messages, setMessages] = useState<StoredMessage[]>([])
   const [live, setLive] = useState<TurnState | null>(null)
   const [error, setError] = useState<TurnError | null>(null)
+  const [errorProvider, setErrorProvider] = useState<PaperProviderId>('deepseek')
   const [gate, setGate] = useState<GateRequest | null>(null)
   const [input, setInput] = useState('')
   const [attachedAsk, setAttachedAsk] = useState<PendingAsk | null>(null)
+  const [profiles, setProfiles] = useState<ConceptProfile[]>([])
+  const [guided, setGuided] = useState<GuidedRun | null>(null)
 
   const { briefUi, briefData, briefRequestTick, setBriefUi, setBriefData } = usePaperUi()
 
@@ -141,6 +192,66 @@ export default function CopilotPanel({
   const messagesRef = useRef(messages)
   messagesRef.current = messages
   const lastParamsRef = useRef<SendParams | null>(null)
+  const profilesRef = useRef(profiles)
+  profilesRef.current = profiles
+  /** 上一版画像文案：层级桶不变时原样复用，system#2 字节稳定（§5.4 前缀缓存） */
+  const hintRef = useRef<ProfileHint | null>(null)
+  const guidedRef = useRef(guided)
+  guidedRef.current = guided
+  /** 最近一轮 plan 岛给出的概念：反馈/快捷键等无概念上下文的证据挂到它上面 */
+  const lastTurnConceptsRef = useRef<string[]>([])
+
+  // -----------------------------------------------------------------------
+  // 学习画像（§6.2）：装载 / 记证据 / pin / 重置
+  // -----------------------------------------------------------------------
+  useEffect(() => {
+    let alive = true
+    setProfiles([])
+    hintRef.current = null
+    void learnerRepo
+      .load(paper.id)
+      .then((rows) => {
+        if (!alive) return
+        profilesRef.current = rows
+        setProfiles(rows)
+      })
+      .catch(() => undefined) // 画像读失败不阻断陪读，退回默认层级
+    return () => {
+      alive = false
+    }
+  }, [paper.id, learnerRepo])
+
+  const profileSummary = useMemo(() => summarizeProfile(profiles, Date.now()), [profiles])
+
+  const recordEvidence = useCallback(
+    (ev: ProfileEvidence) => {
+      const now = Date.now()
+      const next = applyEvidenceToStore(profilesRef.current, ev, now)
+      profilesRef.current = next // 同步写 ref：连续事件不丢
+      setProfiles(next)
+      const paperId = paperRef.current.id
+      void learnerRepo.save(paperId, next).catch(() => undefined)
+      void learnerRepo.logEvidence(paperId, ev).catch(() => undefined)
+    },
+    [learnerRepo],
+  )
+
+  const pinLevel = useCallback(
+    (level: LearnerLevel | null) => {
+      const next = setPinnedLevel(profilesRef.current, level, Date.now())
+      profilesRef.current = next
+      setProfiles(next)
+      void learnerRepo.save(paperRef.current.id, next).catch(() => undefined)
+    },
+    [learnerRepo],
+  )
+
+  const resetProfile = useCallback(() => {
+    profilesRef.current = []
+    setProfiles([])
+    hintRef.current = null
+    void learnerRepo.reset(paperRef.current.id).catch(() => undefined)
+  }, [learnerRepo])
 
   // -----------------------------------------------------------------------
   // 授权 / 成本确认（promise 化对话框）
@@ -242,6 +353,7 @@ export default function CopilotPanel({
     setLive(null)
     setError(null)
     setAttachedAsk(null)
+    setGuided(null)
     void (async () => {
       const s = await repo.getOrCreateSession(paper.id, paper.title)
       if (!alive) return
@@ -271,9 +383,15 @@ export default function CopilotPanel({
       }
       setError(null)
       lastParamsRef.current = params
-      const ok = await ensureConsent('deepseek')
+      const spec = PAPER_TASKS[params.task]
+      const provider = spec.cap.provider
+      setErrorProvider(provider)
+      const ok = await ensureConsent(provider)
       if (!ok) {
-        setError({ message: '未授权 DeepSeek：陪读对话需要先授权发送论文片段', kind: 'no-consent' })
+        setError({
+          message: `未授权 ${provider === 'kimi' ? 'Moonshot (Kimi)' : 'DeepSeek'}：需要先授权才能发送论文片段`,
+          kind: 'no-consent',
+        })
         return
       }
 
@@ -299,17 +417,22 @@ export default function CopilotPanel({
 
       const brief = briefData && briefData.paperId === paperRef.current.id ? briefContextText(briefData.data) : null
 
+      // 画像注入（§6.2）：层级桶/来源不变时复用上一版文案，system#2 字节稳定
+      const hint = nextProfileHint(hintRef.current, summarizeProfile(profilesRef.current, Date.now()))
+      hintRef.current = hint
+
       const outcome = await getRunner().run(
         {
           question: params.question,
           retrievalQuery: params.retrievalQuery,
           selection: params.selection ?? null,
-          spec: PAPER_TASKS[params.task],
+          spec,
           planIsland: params.planIsland,
           memoIsland,
+          extraDirectives: params.extraDirectives,
           context: {
             brief,
-            profileHint: '讲解层次：进阶（自适应画像 Phase 4 接入，当前固定）',
+            profileHint: hint.text,
             rollingSummary: s.rollingSummary ?? null,
             history,
             currentSection: positionRef.current.section,
@@ -336,6 +459,7 @@ export default function CopilotPanel({
         auditBadges: st.audit?.badges,
         interrupted: st.interrupted || st.phase === 'error',
         insufficient: st.insufficient,
+        sourceLabel: params.sourceLabel,
         usage: st.usage
           ? {
               provider: st.usage.provider,
@@ -348,8 +472,23 @@ export default function CopilotPanel({
           : undefined,
       })
       if (st.phase === 'error') {
-        setError({ message: `响应中断：${friendlyTurnError(st.error!)}（已保留部分内容）`, kind: st.error!.kind })
+        setError({ message: `响应中断：${friendlyTurnError(st.error!, provider)}（已保留部分内容）`, kind: st.error!.kind })
       }
+
+      // L2 画像（§6.2）：finalize 后从流内岛提取 learner 弱信号与 teach-back 判定
+      const planConcepts = collectIslands(outcome.segs, 'plan').flatMap((p) => p.concepts)
+      for (const island of collectIslands(outcome.segs, 'learner')) {
+        for (const ev of evidenceFromLearnerIsland(island, Date.now())) recordEvidence(ev)
+      }
+      for (const island of collectIslands(outcome.segs, 'verdict')) {
+        recordEvidence(
+          evidenceFromVerdict(island, params.teachBackConcept ? [params.teachBackConcept] : planConcepts, Date.now()),
+        )
+      }
+      // L1 抽象度启发式：只对用户自己写的问题生效——引导脚本里的「推导/公式」是模板措辞，不是读者信号
+      const abstraction = params.userAuthored ? evidenceFromQuestion(params.question, planConcepts, Date.now()) : null
+      if (abstraction) recordEvidence(abstraction)
+      lastTurnConceptsRef.current = planConcepts
 
       const fold = foldMemo({
         rollingSummary: s.rollingSummary ?? null,
@@ -368,7 +507,7 @@ export default function CopilotPanel({
       setMessages((m) => [...m, assistantMsg])
       setLive(null)
     },
-    [briefData, ensureConsent, getRunner, pushLive, repo],
+    [briefData, ensureConsent, getRunner, pushLive, recordEvidence, repo],
   )
 
   /** runSendTurn 的兜底外壳：持久化等意外失败不留下无响应的挂起态 */
@@ -394,6 +533,8 @@ export default function CopilotPanel({
         selection: sel,
         task: 'chat',
         planIsland: true,
+        extraDirectives: [LEARNER_DIRECTIVE],
+        userAuthored: true,
         displayText: sel ? `"""\n${sel.slice(0, 600)}\n"""\n${text}` : text,
       })
     },
@@ -409,6 +550,9 @@ export default function CopilotPanel({
       }
       const tpl = ASK_TEMPLATES[ask.action]
       onRemoveAsk(ask.id)
+      // L1 证据（§6.2）：「更简单 / 推导」这两个快捷键本身就是层级信号
+      const shortcut = evidenceFromShortcut(ask.action, lastTurnConceptsRef.current, Date.now())
+      if (shortcut) recordEvidence(shortcut)
       void sendTurn({
         question: tpl.question,
         selection: ask.text,
@@ -418,22 +562,245 @@ export default function CopilotPanel({
         displayText: `【${ask.label}】\n"""\n${ask.text.slice(0, 600)}\n"""`,
       })
     },
-    [busy, onRemoveAsk, sendTurn],
+    [busy, onRemoveAsk, recordEvidence, sendTurn],
   )
 
-  const startOverview = useCallback(() => {
-    if (busy) return
-    void sendTurn({
-      question: '请给出这篇论文的速览：一句话结论、研究问题、方法要点、主要实验结果与局限，最后给出建议的阅读顺序。',
-      retrievalQuery: `${paperRef.current.title} 结论 方法 贡献 实验 局限`,
-      task: 'chat',
-      planIsland: true,
-      label: '论文速览',
-      displayText: '【论文速览】请带我快速过一遍这篇论文。',
-    })
-  }, [busy, sendTurn])
+  // -----------------------------------------------------------------------
+  // 引导模式（§3.4 六入口 / §6.1c 每步 1 调用）
+  // -----------------------------------------------------------------------
+  const guidedCtx = useCallback(
+    (): GuidedContext => ({
+      paperTitle: paperRef.current.title,
+      sectionTitles: sectionTitlesRef.current,
+      ...(positionRef.current.section ? { currentSection: positionRef.current.section } : {}),
+    }),
+    [],
+  )
 
-  const stopTurn = useCallback(() => runnerRef.current?.stop(), [])
+  const runGuidedStep = useCallback(
+    (run: GuidedRun) => {
+      const spec = guidedStepAt(run, guidedCtx())
+      if (!spec) return
+      void sendTurn({
+        question: spec.question,
+        retrievalQuery: spec.retrievalQuery,
+        task: spec.task,
+        planIsland: spec.planIsland,
+        extraDirectives: spec.extraDirectives,
+        label: spec.label,
+        displayText: spec.displayText,
+      })
+    },
+    [guidedCtx, sendTurn],
+  )
+
+  const startGuidedMode = useCallback(
+    (modeId: string) => {
+      if (busy) return
+      const run = startGuided(modeId, guidedCtx())
+      if (!run) return
+      setGuided(run)
+      runGuidedStep(run)
+    },
+    [busy, guidedCtx, runGuidedStep],
+  )
+
+  const nextGuidedStep = useCallback(() => {
+    const run = guidedRef.current
+    if (!run || busy) return
+    const next = advanceGuided(run, guidedCtx())
+    setGuided(next)
+    if (next) runGuidedStep(next) // 用户点击才推进：严格 1 调用/步
+  }, [busy, guidedCtx, runGuidedStep])
+
+  // -----------------------------------------------------------------------
+  // teach-back / 深度反馈 / Kimi 深度升级
+  // -----------------------------------------------------------------------
+  const sendTeachBack = useCallback(
+    (payload: { prompt: string; answer: string; concept?: string }) => {
+      if (busy) return
+      void sendTurn({
+        question: `我对「${payload.prompt}」的复述如下，请对照论文指出遗漏、错误与讲得好的地方：\n"""\n${payload.answer.slice(0, 2000)}\n"""`,
+        retrievalQuery: `${payload.concept ?? ''} ${payload.prompt}`.trim(),
+        task: 'chat',
+        planIsland: false,
+        extraDirectives: [VERDICT_DIRECTIVE],
+        label: '复述检查',
+        ...(payload.concept ? { teachBackConcept: payload.concept } : {}),
+        displayText: `【我的复述】\n${payload.answer.slice(0, 600)}`,
+      })
+    },
+    [busy, sendTurn],
+  )
+
+  const giveFeedback = useCallback(
+    (msg: StoredMessage, kind: DepthFeedback) => {
+      if (msg.feedback === kind) return
+      // 概念取这条回答自己的 plan 岛（可能是历史消息，未必是最近一轮）
+      const concepts = collectIslands(splitCopilotStream(msg.content, { open: false }), 'plan').flatMap((p) => p.concepts)
+      recordEvidence(evidenceFromFeedback(kind, concepts.length ? concepts : lastTurnConceptsRef.current, Date.now()))
+      setMessages((list) => list.map((m) => (m.id === msg.id ? { ...m, feedback: kind } : m)))
+      void repo.updateMessage(msg.id, { feedback: kind }).catch(() => undefined)
+    },
+    [recordEvidence, repo],
+  )
+
+  /** 「换一种深度解释」：同轮上下文用 kimi-k3 effort high 重发（§5.1），并列展示并标注来源 */
+  const deepAlternative = useCallback(
+    (msg: StoredMessage) => {
+      if (busy) return
+      const list = messagesRef.current
+      const idx = list.findIndex((m) => m.id === msg.id)
+      const question = [...list.slice(0, idx === -1 ? list.length : idx)].reverse().find((m) => m.role === 'user')?.content
+      if (!question) return
+      void sendTurn({
+        question: `请换一种讲法，给出更有深度的解释（可以补充推导、边界条件与相关方法差异）：\n${question.slice(0, 1500)}`,
+        retrievalQuery: question.slice(0, 300),
+        task: 'deepAlt',
+        planIsland: false,
+        label: '深度解释',
+        sourceLabel: 'kimi-k3 · 深度解释',
+        displayText: '【换一种深度解释】',
+      })
+    },
+    [busy, sendTurn],
+  )
+
+  // -----------------------------------------------------------------------
+  // 语音（§9）：听写输入 + 朗读回答
+  // -----------------------------------------------------------------------
+  const [tts, dispatchTts] = useReducer(ttsReducer, initialTtsState)
+  const ttsSupported = useMemo(() => isTtsSupported(), [])
+  const playerRef = useRef<TtsPlayer | null>(null)
+  const getPlayer = useCallback(() => {
+    playerRef.current ??= createTtsPlayer()
+    return playerRef.current
+  }, [])
+  /** 正在朗读的对象：消息 id 或 'live'（流式跟读） */
+  const [speakingId, setSpeakingId] = useState<string | null>(null)
+  /** 已入队到的字符位置（跟读续接点） */
+  const consumedRef = useRef(0)
+  const liveSpeechRef = useRef('')
+  const liveFlushedRef = useRef(false)
+
+  // 播放驱动：current 变化即朗读一句，结束回 'ended' 取下一句
+  useEffect(() => {
+    if (tts.status !== 'speaking' || tts.current === null) return
+    getPlayer().speak(tts.current, () => dispatchTts({ type: 'ended' }))
+  }, [tts.seq, tts.status, tts.current, getPlayer])
+
+  const stopSpeaking = useCallback(() => {
+    getPlayer().cancel()
+    dispatchTts({ type: 'stop' })
+    setSpeakingId(null)
+    consumedRef.current = 0
+  }, [getPlayer])
+
+  const speakText = useCallback(
+    (id: string, text: string) => {
+      if (speakingId === id) {
+        stopSpeaking()
+        return
+      }
+      getPlayer().cancel()
+      dispatchTts({ type: 'stop' })
+      const { sentences } = takeCompleteSentences(text, 0, true)
+      consumedRef.current = text.length
+      setSpeakingId(id)
+      dispatchTts({ type: 'enqueue', sentences })
+      dispatchTts({ type: 'start' })
+      dispatchTts({ type: 'source-end' })
+    },
+    [getPlayer, speakingId, stopSpeaking],
+  )
+
+  const speakMessage = useCallback(
+    (msg: StoredMessage) => {
+      const parser = createStreamParserMemo()
+      speakText(msg.id, speakableText(parser(msg.content, { open: false })))
+    },
+    [speakText],
+  )
+
+  /** 边生成边朗读：队列先空转，等流式句子补进来 */
+  const startLiveSpeak = useCallback(() => {
+    getPlayer().cancel()
+    dispatchTts({ type: 'stop' })
+    consumedRef.current = 0
+    liveSpeechRef.current = ''
+    liveFlushedRef.current = false
+    setSpeakingId('live')
+    dispatchTts({ type: 'start' })
+  }, [getPlayer])
+
+  /** 流式跟读：完整句子就绪即入队；轮次结束时补尾句并标记源结束（§9） */
+  useEffect(() => {
+    if (speakingId !== 'live') return
+    const streaming = live !== null && live.phase !== 'done' && live.phase !== 'error'
+    if (streaming) {
+      const text = speakableText(splitCopilotStream(live.text, { open: true }))
+      liveSpeechRef.current = text
+      const { sentences, consumed } = takeCompleteSentences(text, consumedRef.current)
+      if (sentences.length === 0) return
+      consumedRef.current = consumed
+      dispatchTts({ type: 'enqueue', sentences })
+      return
+    }
+    if (liveFlushedRef.current) return
+    liveFlushedRef.current = true
+    const { sentences } = takeCompleteSentences(liveSpeechRef.current, consumedRef.current, true)
+    consumedRef.current = liveSpeechRef.current.length
+    if (sentences.length > 0) dispatchTts({ type: 'enqueue', sentences })
+    dispatchTts({ type: 'source-end' })
+  }, [live, speakingId])
+
+  const stopTurn = useCallback(() => {
+    runnerRef.current?.stop()
+    if (speakingId === 'live') stopSpeaking() // Stop 生成时同时清空未读队列
+  }, [speakingId, stopSpeaking])
+
+  // 听写输入（复用 src/lib/speech.ts）
+  const speechSupported = useMemo(() => isSpeechSupported(), [])
+  const [listening, setListening] = useState(false)
+  const [interim, setInterim] = useState('')
+  const dictationRef = useRef<DictationSession | null>(null)
+
+  const stopDictation = useCallback(() => {
+    dictationRef.current?.stop()
+    dictationRef.current = null
+    setListening(false)
+    setInterim('')
+  }, [])
+
+  const toggleDictation = useCallback(() => {
+    if (listening) {
+      stopDictation()
+      return
+    }
+    setListening(true)
+    dictationRef.current = startDictation(
+      'zh',
+      (finalText, interimText) => {
+        if (finalText) setInput((v) => v + finalText)
+        setInterim(interimText)
+      },
+      (err) => {
+        dictationRef.current = null
+        setListening(false)
+        setInterim('')
+        if (err) setError({ message: err, kind: 'speech' })
+      },
+    )
+  }, [listening, stopDictation])
+
+  useEffect(
+    () => () => {
+      dictationRef.current?.stop()
+      dictationRef.current = null
+      playerRef.current?.cancel()
+    },
+    [],
+  )
 
   const retryLast = useCallback(() => {
     const params = lastParamsRef.current
@@ -558,10 +925,11 @@ export default function CopilotPanel({
   const submit = useCallback(() => {
     const value = input.trim()
     if (!value || busy) return
+    if (listening) stopDictation()
     setInput('')
     stickRef.current = true
     sendFree(value)
-  }, [busy, input, sendFree])
+  }, [busy, input, listening, sendFree, stopDictation])
 
   const sessionCost = session?.costTotal ?? 0
   const lastUsage = live?.usage ?? null
@@ -586,18 +954,21 @@ export default function CopilotPanel({
         </div>
       </div>
 
-      <p className="mb-2 text-[0.7rem] text-dim">
-        {sessionCost > 0 && <>会话累计 {formatUsd(sessionCost)} · </>}
-        deepseek-v4-pro
-        {paper.sensitive ? ' · 敏感模式（远程调用已禁用）' : ''}
+      <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.7rem] text-dim">
+        <ProfileChip summary={profileSummary} onPin={pinLevel} onReset={resetProfile} />
+        <span>
+          {sessionCost > 0 && <>会话累计 {formatUsd(sessionCost)} · </>}
+          deepseek-v4-pro
+          {paper.sensitive ? ' · 敏感模式（远程调用已禁用）' : ''}
+        </span>
         <button
           type="button"
           onClick={() => onToggleSensitive(!paper.sensitive)}
-          className="ml-2 rounded border border-line px-1.5 py-0.5 text-[0.65rem] text-dim transition-colors hover:text-fg"
+          className="rounded border border-line px-1.5 py-0.5 text-[0.65rem] text-dim transition-colors hover:text-fg"
         >
           {paper.sensitive ? '取消敏感标记' : '标记为敏感'}
         </button>
-      </p>
+      </div>
 
       <div
         ref={listRef}
@@ -675,26 +1046,21 @@ export default function CopilotPanel({
           </section>
         )}
 
-        {/* 引导模式入口 */}
-        {messages.length === 0 && !busy && (
+        {/* 引导模式入口（六入口全开；每步 1 次调用，由用户点击推进） */}
+        {!guided && !busy && (
           <section>
             <p className="mb-1.5 text-xs font-medium text-fg">引导模式</p>
             <div className="flex flex-wrap gap-1.5">
-              {GUIDED_MODES.map((m) => (
+              {GUIDED_MODE_DEFS.map((m) => (
                 <button
                   key={m.id}
                   type="button"
-                  disabled={!m.enabled || busy}
-                  title={m.enabled ? undefined : 'Phase 4 开放'}
-                  onClick={m.id === 'overview' ? startOverview : undefined}
-                  className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
-                    m.enabled
-                      ? 'border-accent/40 text-accent hover:bg-accent/10'
-                      : 'cursor-not-allowed border-line text-dim opacity-60'
-                  }`}
+                  disabled={busy}
+                  title={m.hint}
+                  onClick={() => startGuidedMode(m.id)}
+                  className="rounded-lg border border-accent/40 px-2.5 py-1 text-xs text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
                 >
                   {m.label}
-                  {!m.enabled && <span className="ml-1 text-[0.6rem]">P4</span>}
                 </button>
               ))}
             </div>
@@ -711,6 +1077,11 @@ export default function CopilotPanel({
             </div>
           ) : (
             <div key={m.id}>
+              {m.sourceLabel && (
+                <p className="mb-0.5 inline-block rounded-full border border-accent-2/40 bg-accent-2/10 px-2 py-0.5 text-[0.65rem] text-accent-2">
+                  {m.sourceLabel}
+                </p>
+              )}
               <CopilotMessageView
                 content={m.content}
                 done
@@ -719,6 +1090,9 @@ export default function CopilotPanel({
                 interrupted={m.interrupted}
                 insufficient={m.insufficient}
                 onJumpCite={jumpEntry}
+                onEvidence={recordEvidence}
+                onTeachBack={sendTeachBack}
+                busy={busy}
               />
               {m.usage && (
                 <p className="mt-0.5 text-[0.65rem] text-dim">
@@ -727,6 +1101,15 @@ export default function CopilotPanel({
                   {m.usage.estimated ? '（估算）' : ''}
                 </p>
               )}
+              <TurnFeedback
+                {...(m.feedback ? { value: m.feedback } : {})}
+                onFeedback={(kind) => giveFeedback(m, kind)}
+                onDeepAlt={m.sourceLabel ? undefined : () => deepAlternative(m)}
+                disabled={busy}
+                speech={
+                  ttsSupported ? { label: speakingId === m.id ? '停止朗读' : '朗读本条', onClick: () => speakMessage(m) } : null
+                }
+              />
             </div>
           ),
         )}
@@ -755,6 +1138,7 @@ export default function CopilotPanel({
                 citeMap={live.citeMap}
                 badges={null}
                 onJumpCite={jumpEntry}
+                busy
               />
             )}
             {lastUsage && (
@@ -765,13 +1149,62 @@ export default function CopilotPanel({
             )}
           </div>
         )}
+
+        {/* 引导模式进度与推进（每次点击 = 1 次调用） */}
+        {guided && (
+          <div className="rounded-lg border border-accent/30 bg-panel-2 p-2.5 text-xs">
+            <p className="mb-1.5 text-dim">
+              {GUIDED_MODE_DEFS.find((m) => m.id === guided.modeId)?.label} · 第 {guided.stepIndex + 1}/{guided.total} 步
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                onClick={nextGuidedStep}
+                disabled={busy}
+                className="rounded-lg bg-accent px-2.5 py-1 text-[0.7rem] font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
+              >
+                {guided.stepIndex + 1 >= guided.total ? '完成引导' : '继续下一步'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setGuided(null)}
+                className="rounded-lg border border-line px-2.5 py-1 text-[0.7rem] text-dim transition-colors hover:text-fg"
+              >
+                退出引导
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 输入区 */}
       <div className="mt-2 border-t border-line pt-2">
+        {tts.status !== 'idle' && (
+          <div className="mb-1.5 flex flex-wrap items-center gap-2 text-[0.7rem] text-dim">
+            <span className="text-accent">{tts.status === 'paused' ? '朗读已暂停' : '正在朗读…'}</span>
+            <button
+              type="button"
+              onClick={() => {
+                if (tts.status === 'paused') {
+                  getPlayer().resume()
+                  dispatchTts({ type: 'resume' })
+                } else {
+                  getPlayer().pause()
+                  dispatchTts({ type: 'pause' })
+                }
+              }}
+              className="rounded border border-line px-1.5 py-0.5 transition-colors hover:text-fg"
+            >
+              {tts.status === 'paused' ? '继续' : '暂停'}
+            </button>
+            <button type="button" onClick={stopSpeaking} className="rounded border border-line px-1.5 py-0.5 transition-colors hover:text-bad">
+              停止朗读
+            </button>
+          </div>
+        )}
         {error && (
           <p className="mb-1.5 text-xs text-bad">
-            {friendlyTurnError(error)}
+            {friendlyTurnError(error, errorProvider)}
             {error.kind !== 'cost-declined' && error.kind !== 'sensitive-blocked' && (
               <button type="button" onClick={retryLast} className="ml-2 text-accent underline underline-offset-2">
                 重试
@@ -780,7 +1213,7 @@ export default function CopilotPanel({
             {error.kind === 'no-consent' && (
               <button
                 type="button"
-                onClick={() => void ensureConsent('deepseek')}
+                onClick={() => void ensureConsent(errorProvider)}
                 className="ml-2 text-accent underline underline-offset-2"
               >
                 重新授权
@@ -797,7 +1230,7 @@ export default function CopilotPanel({
           </div>
         )}
         <textarea
-          value={input}
+          value={listening && interim ? `${input}${interim}` : input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             // IME-safe：中文输入法回车不误发；流式中吞掉 Enter
@@ -811,9 +1244,37 @@ export default function CopilotPanel({
           className="w-full resize-y rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-sm leading-relaxed"
         />
         <div className="mt-1.5 flex items-center justify-between gap-2">
-          <span className="text-[0.65rem] text-dim">
-            {busy ? (live?.reasoning ? '深度思考中…' : '回答中…') : '回答基于本地检索片段，均带可回跳引用'}
+          <span className="min-w-0 flex-1 truncate text-[0.65rem] text-dim">
+            {listening
+              ? '正在听写…（再次点击麦克风结束）'
+              : busy
+                ? live?.reasoning
+                  ? '深度思考中…'
+                  : '回答中…'
+                : '回答基于本地检索片段，均带可回跳引用'}
           </span>
+          {speechSupported && (
+            <button
+              type="button"
+              onClick={toggleDictation}
+              aria-pressed={listening}
+              title={listening ? '结束语音输入' : '语音提问'}
+              className={`shrink-0 rounded-lg border px-2 py-1 text-sm transition-colors ${
+                listening ? 'border-accent bg-accent/10 text-accent' : 'border-line text-dim hover:text-fg'
+              }`}
+            >
+              🎙
+            </button>
+          )}
+          {ttsSupported && busy && (
+            <button
+              type="button"
+              onClick={() => (speakingId === 'live' ? stopSpeaking() : startLiveSpeak())}
+              className="shrink-0 rounded-lg border border-line px-2 py-1 text-[0.7rem] text-dim transition-colors hover:text-fg"
+            >
+              {speakingId === 'live' ? '停止跟读' : '边生成边朗读'}
+            </button>
+          )}
           {busy ? (
             <button
               type="button"

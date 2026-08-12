@@ -108,6 +108,17 @@ export const PAPER_TASKS = {
     temperature: 0.2,
     inputBudgetTokens: 32_000,
   },
+  /**
+   * 显式深度升级（§5.1）：用户点「换一种深度解释」时才走的 kimi-k3 effort high 独立回答。
+   * 永远不自动触发——需 Moonshot 独立授权 + 成本二次确认（Kimi 阈值）。
+   * sampling fixed → 不带 temperature（providerAdapters 会一并省略采样参数）。
+   */
+  deepAlt: {
+    cap: KIMI_K3,
+    thinking: 'effort-high',
+    maxOutputTokens: 3000,
+    inputBudgetTokens: 24_000,
+  },
 } as const satisfies Record<string, PaperTaskSpec>
 
 export type PaperTaskId = keyof typeof PAPER_TASKS
@@ -138,6 +149,17 @@ export const PAPER_PROVIDER_LABELS: Record<PaperProviderId, string> = {
   deepseek: 'DeepSeek',
   kimi: 'Kimi (Moonshot)',
 }
+
+/**
+ * feature 开关（默认关闭的可选链路）。
+ * - profileConsolidation：§6.2 L3 定期画像巩固调用（每 10 轮/会话结束 1 次 JSON 调用）。
+ *   Phase 4 只留开关不实弹：L1/L2 已足够驱动层级选择，跳过 L3 不影响任何行为。
+ */
+export const PAPER_FEATURES = {
+  profileConsolidation: false,
+  /** L3 触发间隔（轮），开关打开后生效 */
+  profileConsolidationEveryTurns: 10,
+} as const
 
 /** 检索条数（§8.1）：常规 6，深度任务 / evidence 扩检索 12 */
 export const RETRIEVE_TOP_K = { normal: 6, deep: 12 } as const

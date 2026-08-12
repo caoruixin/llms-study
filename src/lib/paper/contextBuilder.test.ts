@@ -112,12 +112,14 @@ describe('assembleContext · 裁剪阶梯', () => {
   })
 
   it('阶梯 4：截选区', () => {
+    // 预算取 1600：Phase 4 的结构岛目录让静态 system 提示变长（308 → 680 token 量级），
+    // 900 已装不下「提示 + 强截后的选区」，本例的意图（选区被截且随后不超预算）需要更大的窗口
     const { report } = assembleContext(
       baseInput({
         selection: 's'.repeat(4000),
         chunks: [mkChunk('c1', '小')],
         history: [],
-        inputBudgetTokens: 900,
+        inputBudgetTokens: 1600,
       }),
     )
     expect(report.selectionTruncated).toBe(true)

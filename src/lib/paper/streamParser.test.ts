@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createStreamParserMemo, splitCopilotStream, splitProseRuns } from './streamParser'
+import { collectIslands, createStreamParserMemo, splitCopilotStream, splitProseRuns } from './streamParser'
 
 const FORMULA_ISLAND = '```copilot:formula\n{"expr":"2nL","terms":[{"sym":"L","mean":"长度"}],"cites":["c2"]}\n```'
 
@@ -42,8 +42,9 @@ describe('splitCopilotStream · 岛识别', () => {
   })
 
   it('未知类型闭合岛 → unknown-type', () => {
-    const segs = splitCopilotStream('```copilot:learner\n{"signals":[]}\n```')
-    expect(segs[0]).toMatchObject({ type: 'island', islandType: 'learner', failure: 'unknown-type' })
+    // 用一个协议表外的类型：learner/verdict 自 Phase 4 起已是已知类型
+    const segs = splitCopilotStream('```copilot:hologram\n{"x":1}\n```')
+    expect(segs[0]).toMatchObject({ type: 'island', islandType: 'hologram', failure: 'unknown-type' })
   })
 
   it('JSON 内出现行首 ``` 导致围栏早闭：岛坏 + 泄漏尾按 prose 渲染（§7.5）', () => {
@@ -115,5 +116,39 @@ describe('createStreamParserMemo', () => {
     const c = parse(`${src1}继续写`, { open: true })
     expect(c).not.toBe(a)
     expect(c[0]).toBe(a[0]) // 已闭合岛 seg 从缓存取，引用相等 → React.memo 直接跳过
+  })
+})
+
+describe('collectIslands（画像接线：finalize 后取控制岛）', () => {
+  const LEARNER = '```copilot:learner\n{"signals":[{"concept":"kv-cache","dir":1,"evidence":"追问了分页注意力"}]}\n```'
+  const VERDICT = '```copilot:verdict\n{"verdict":"partial","missed":["没提到显存线性增长"],"evidence":["讲清了 K/V 各存一份"]}\n```'
+  const PLAN = '```copilot:plan\n{"concepts":["kv-cache","rope"],"level":"进阶"}\n```'
+
+  it('按类型取出已闭合岛，顺序与出现顺序一致', () => {
+    const segs = splitCopilotStream(`${PLAN}\n正文 [[cite:c1]]。\n${LEARNER}\n${VERDICT}`, { open: false })
+    expect(collectIslands(segs, 'plan')[0].concepts).toEqual(['kv-cache', 'rope'])
+    expect(collectIslands(segs, 'learner')[0].signals[0]).toEqual({
+      concept: 'kv-cache',
+      dir: 1,
+      evidence: '追问了分页注意力',
+    })
+    expect(collectIslands(segs, 'verdict')[0]).toMatchObject({ verdict: 'partial', missed: ['没提到显存线性增长'] })
+  })
+
+  it('多个同类岛全部返回', () => {
+    const segs = splitCopilotStream(`${LEARNER}\n中间\n${LEARNER}`, { open: false })
+    expect(collectIslands(segs, 'learner')).toHaveLength(2)
+  })
+
+  it('坏岛与未闭合岛被静默跳过（advisory 语义）', () => {
+    const bad = '```copilot:learner\n{"signals":[]}\n```'
+    const unclosed = '```copilot:verdict\n{"missed":["半截'
+    const segs = splitCopilotStream(`${bad}\n${unclosed}`, { open: false })
+    expect(collectIslands(segs, 'learner')).toEqual([])
+    expect(collectIslands(segs, 'verdict')).toEqual([])
+  })
+
+  it('没有目标类型时返回空数组', () => {
+    expect(collectIslands(splitCopilotStream('只有正文'), 'learner')).toEqual([])
   })
 })
