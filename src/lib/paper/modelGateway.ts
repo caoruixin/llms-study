@@ -267,10 +267,30 @@ export function createModelGateway(deps: GatewayDeps): ModelGateway {
       spec.thinking === 'on-high' &&
       text === ''
 
+    // 同类残余边界（评测实测 attn-c-cross run2）：推理烧掉 ≈全部预算后只漏出百余字符截断正文——
+    // 不是空流（不抛错），但答案不可用。判定 = 真实 usage 显示输出触顶 + 正文极短。
+    // 注意：降级重试成功后本记录只计第二次调用的 usage（首次烧掉的成本进 provider 账单但不入本地明细，见注释）。
+    const budgetBurnedSliver = (r: { text: string; aborted: boolean; usage: unknown }): boolean => {
+      const out = (r.usage as StreamUsage | null)?.outputTokens
+      return (
+        !r.aborted &&
+        spec.thinking === 'on-high' &&
+        typeof out === 'number' &&
+        out >= spec.maxOutputTokens - 64 &&
+        r.text.trim().length < 200
+      )
+    }
+
     let result: Awaited<ReturnType<typeof attempt>>
     try {
       try {
         result = await attempt(spec)
+        if (budgetBurnedSliver(result) && !req.signal?.aborted) {
+          req.onRetry?.('thinking-downgrade') // turnEngine 收到后清空已流出的截断残句
+          text = ''
+          result = await attempt({ ...spec, thinking: 'off' })
+          thinkingDowngraded = true
+        }
       } catch (e) {
         if (emptyStreamNeedsDowngrade(e)) {
           req.onRetry?.('thinking-downgrade')

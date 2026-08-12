@@ -191,6 +191,34 @@ describe('modelGateway · streamPaperChat', () => {
     expect(calls).toHaveLength(2)
   })
 
+  it('deep 预算烧尽残句（非空流）：usage 触顶 + 正文极短 → 同样降级重试', async () => {
+    // 评测实测 attn-c-cross run2：outputTokens=5999/6000 但正文仅百余字符截断——不抛空流错，需主动检测
+    const { calls } = stubFetch((_c, i) =>
+      i === 0
+        ? sseResponse([dsContent('…会把不同'), dsUsageTail(1000, 6000), DONE])
+        : sseResponse([dsContent('完整答案'), dsUsageTail(1000, 800), DONE]),
+    )
+    const gw = makeGateway()
+    const reasons: string[] = []
+    const r = await gw.gateway.streamPaperChat(
+      streamReq(gw, { spec: PAPER_TASKS.deep, onRetry: (why: string) => reasons.push(why) }),
+    )
+    expect(r.text).toBe('完整答案')
+    expect(r.thinkingDowngraded).toBe(true)
+    expect(reasons).toEqual(['thinking-downgrade'])
+    expect(calls).toHaveLength(2)
+    expect(calls[1].body.thinking).toEqual({ type: 'disabled' })
+  })
+
+  it('deep 正常短答（usage 未触顶）：不误判降级', async () => {
+    const { calls } = stubFetch(() => sseResponse([dsContent('简短但完整'), dsUsageTail(1000, 400), DONE]))
+    const gw = makeGateway()
+    const r = await gw.gateway.streamPaperChat(streamReq(gw, { spec: PAPER_TASKS.deep }))
+    expect(r.text).toBe('简短但完整')
+    expect(r.thinkingDowngraded).toBeUndefined()
+    expect(calls).toHaveLength(1)
+  })
+
   it('chat（thinking 本就 off）空流：同参重试，不标记降级', async () => {
     const { calls } = stubFetch((_c, i) => (i === 0 ? sseResponse([DONE]) : sseResponse([dsContent('ok'), DONE])))
     const gw = makeGateway()
