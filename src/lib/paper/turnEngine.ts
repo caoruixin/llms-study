@@ -26,6 +26,53 @@ export interface TurnError {
   kind: string | null
 }
 
+const HAS_CJK = /[一-鿿]/
+
+/**
+ * 底层 message → 面向用户的明细。
+ *
+ * 上游已经中文化过一次（llmClient 抛的是「网络错误：Failed to fetch」），UI 再套一层
+ * 「网络异常：」就成了双前缀，且把 fetch 的英文原文直接怼给用户。规则：
+ * - 纯英文 message → 换成调用方给的中文兜底，原文只进 console.debug；
+ * - 「中文前缀：英文原文」→ 只保留中文前缀，英文同样只进 console.debug；
+ * - 已经是完整中文文案 → 原样返回（调用方不再叠加前缀）。
+ */
+export function turnErrorDetail(raw: string | null | undefined, fallback: string): string {
+  const s = (raw ?? '').trim()
+  if (!s) return fallback
+  const debug = () => console.debug('[paper-copilot] 原始错误：', s)
+  if (!HAS_CJK.test(s)) {
+    debug()
+    return fallback
+  }
+  const split = /^([^：:]*[一-鿿][^：:]*)[：:]\s*([\s\S]+)$/.exec(s)
+  if (split && !HAS_CJK.test(split[2])) {
+    debug()
+    return split[1]
+  }
+  return s
+}
+
+/**
+ * 「有问无答」的孤儿轮：页面在流式中途被关掉/刷新时，用户消息已落库而回答没有。
+ * 恢复会话时据此标注「已中断」并给一键重发（§QA D-8）。
+ * liveTail=true 表示末条用户消息正在生成回答，不算孤儿。
+ */
+export function findOrphanTurns<T extends { id: string; role: 'user' | 'assistant' }>(
+  messages: readonly T[],
+  opts: { liveTail?: boolean } = {},
+): Set<string> {
+  const orphans = new Set<string>()
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (m.role !== 'user') continue
+    const isLast = i === messages.length - 1
+    if (isLast && opts.liveTail) continue
+    if (isLast || messages[i + 1].role === 'user') orphans.add(m.id)
+  }
+  return orphans
+}
+
 export interface TurnState {
   phase: TurnPhase
   /** 累计正文（流式中实时增长；Stop 后保留半截） */

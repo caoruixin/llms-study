@@ -4,13 +4,13 @@ import { evidenceFromFlashcard, type FlashcardRating } from '../../../lib/paper/
 import type { CiteLevel } from '../../../lib/paper/citations'
 import type { StoredCiteEntry } from '../../../lib/paper/types'
 import BlockCites from './BlockCites'
-import type { BlockInteractions } from './interactions'
+import type { BlockInteractions, BlockStateSlot } from './interactions'
 
 /**
  * flashcard 展示块（§7.2）：术语卡正反面翻转 + 自评「认识/模糊/不认识」→ L1 画像证据（0 调用）。
  */
 
-interface Props extends BlockInteractions {
+interface Props extends BlockInteractions, BlockStateSlot {
   block: FlashcardBlockData
   citeIndex: ReadonlyMap<string, StoredCiteEntry>
   badges: Readonly<Record<string, CiteLevel>> | null
@@ -23,14 +23,22 @@ const RATINGS: readonly (readonly [FlashcardRating, string])[] = [
   ['unknown', '不认识'],
 ]
 
-export default function FlashcardBlock({ block, citeIndex, badges, onJump, onEvidence }: Props) {
-  const [flipped, setFlipped] = useState(false)
-  const [rated, setRated] = useState<FlashcardRating | null>(null)
+export default function FlashcardBlock({ block, citeIndex, badges, onJump, onEvidence, state, onState }: Props) {
+  // 初值取自持久化状态：刷新后保持已翻面 + 已自评
+  const [flipped, setFlipped] = useState(() => state?.revealed ?? state?.rating !== undefined)
+  const [rated, setRated] = useState<FlashcardRating | null>(() => state?.rating ?? null)
+
+  const flip = () => {
+    const next = !flipped
+    setFlipped(next)
+    if (next && !state?.revealed) onState?.({ revealed: true })
+  }
 
   const rate = (r: FlashcardRating) => {
     if (rated !== null) return
     setRated(r)
     onEvidence?.(evidenceFromFlashcard(r, block.concept ? [block.concept] : [], Date.now()))
+    onState?.({ rating: r, revealed: true })
   }
 
   return (
@@ -38,7 +46,7 @@ export default function FlashcardBlock({ block, citeIndex, badges, onJump, onEvi
       <p className="mb-1 text-[0.65rem] text-accent">术语卡</p>
       <button
         type="button"
-        onClick={() => setFlipped((f) => !f)}
+        onClick={flip}
         aria-expanded={flipped}
         className="w-full rounded border border-line bg-panel px-2.5 py-2 text-left transition-colors hover:border-accent/40"
       >

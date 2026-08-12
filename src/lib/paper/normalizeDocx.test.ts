@@ -52,6 +52,57 @@ describe('normalizeDocxHtml', () => {
     })
   })
 
+  describe('伪标题（整段加粗）', () => {
+    // scripts/paper-eval/fixtures/kv-cache-note.docx 经 mammoth 转换后的真实 HTML 形状
+    const KV_NOTE_HTML =
+      '<p><strong>KV Cache 显存占用分析</strong></p>' +
+      '<p>本文分析大语言模型推理阶段 KV cache 的显存占用规律。</p>' +
+      '<p><strong>1. 背景</strong></p>' +
+      '<p>自回归解码时，每生成一个 token 都需要与历史全部 token 做注意力计算。</p>' +
+      '<p><strong>2. 显存占用公式</strong></p>' +
+      '<p>KV cache 的字节数为：2 × n_layers × n_kv_heads × d_head × L × bytes_per_elem。</p>'
+
+    it('整段加粗的短段落按标题处理：数字前缀走编号层级，无前缀统一 level 2', () => {
+      const blocks = normalizeDocxHtml(KV_NOTE_HTML)
+      expect(blocks.filter((b) => b.kind === 'heading').map((b) => [b.text, b.level])).toEqual([
+        ['KV Cache 显存占用分析', 2],
+        ['1. 背景', 1],
+        ['2. 显存占用公式', 1],
+      ])
+      // 修复前整篇 section 全是 undefined（→ 全文坍缩成 1 个 chunk）
+      expect(blocks.map((b) => b.anchor.section)).toEqual([
+        'KV Cache 显存占用分析',
+        'KV Cache 显存占用分析',
+        '1. 背景',
+        '1. 背景',
+        '2. 显存占用公式',
+        '2. 显存占用公式',
+      ])
+    })
+
+    it('多级编号前缀按深度定级', () => {
+      const blocks = normalizeDocxHtml('<p><b>3.2.1 分页注意力</b></p>')
+      expect(blocks[0]).toMatchObject({ kind: 'heading', level: 3, text: '3.2.1 分页注意力' })
+    })
+
+    it('行内强调不算标题：段内还有加粗之外的正文时仍是 paragraph', () => {
+      const blocks = normalizeDocxHtml('<p><strong>KV cache</strong> 是推理引擎的显存大户</p>')
+      expect(blocks[0]).toMatchObject({ kind: 'paragraph', text: 'KV cache 是推理引擎的显存大户' })
+    })
+
+    it('整段加粗但过长或以句末标点结尾 → 仍是 paragraph', () => {
+      const long = `<p><strong>${'很长的加粗强调句'.repeat(9)}</strong></p>` // 72 字 > 60
+      expect(normalizeDocxHtml(long)[0].kind).toBe('paragraph')
+      expect(normalizeDocxHtml('<p><strong>这是一句被整体加粗的结论。</strong></p>')[0].kind).toBe('paragraph')
+      expect(normalizeDocxHtml('<p><strong>Bold sentence ends here.</strong></p>')[0].kind).toBe('paragraph')
+    })
+
+    it('h1..h6 的既有行为不变（真标题优先，不受伪标题规则影响）', () => {
+      const blocks = normalizeDocxHtml('<h2><strong>1 方法</strong></h2>')
+      expect(blocks[0]).toMatchObject({ kind: 'heading', level: 2, text: '1 方法' })
+    })
+  })
+
   it('内联标签被抹平为纯文本，中文不会被插入多余空格', () => {
     const blocks = normalizeDocxHtml('<p>注意<strong>力</strong>机制与 <em>KV</em> cache</p>')
     expect(blocks[0].text).toBe('注意力机制与 KV cache')

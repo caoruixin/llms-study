@@ -5,8 +5,9 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import { createStreamParserMemo, type CopilotSeg, type ProseRun } from '../../lib/paper/streamParser'
+import { islandRenderMode } from '../../lib/paper/blockSchemas'
 import type { CiteLevel } from '../../lib/paper/citations'
-import type { StoredCiteEntry } from '../../lib/paper/types'
+import type { CopilotBlockState, StoredCiteEntry } from '../../lib/paper/types'
 import CiteBadge, { citeLabel } from './CiteBadge'
 import PlanChip from './PlanChip'
 import BlockFallback from './blocks/BlockFallback'
@@ -19,7 +20,7 @@ import TimelineBlock from './blocks/TimelineBlock'
 import QuizBlock from './blocks/QuizBlock'
 import FlashcardBlock from './blocks/FlashcardBlock'
 import TeachBackBlock from './blocks/TeachBackBlock'
-import type { BlockInteractions } from './blocks/interactions'
+import type { BlockInteractions, BlockStateSlot } from './blocks/interactions'
 
 /**
  * Copilot 回复渲染（§7.6）：raw 流文本 → splitCopilotStream → 分段渲染。
@@ -98,9 +99,6 @@ const ProseSeg = memo(function ProseSeg({ md, citeIndex, badges, onJumpCite }: P
   )
 })
 
-/** advisory 控制岛：坏了静默忽略（§7.5），不出降级卡 */
-const ADVISORY_ISLANDS = new Set(['plan', 'memo', 'learner', 'verdict'])
-
 function IslandSeg({
   seg,
   index,
@@ -121,13 +119,33 @@ function IslandSeg({
   citeMap: readonly StoredCiteEntry[]
   interactions: BlockInteractions
 }) {
-  if (!seg.closed) {
-    return done ? <BlockFallback islandType={seg.islandType} failure="unclosed" raw={seg.raw} /> : <BlockSkeleton islandType={seg.islandType} />
+  // 岛序号即作答状态的键：append-only 流里同一条消息的岛序号稳定
+  const stateKey = String(index)
+  const stateSlot: BlockStateSlot = {
+    ...(interactions.blockStates?.[stateKey] ? { state: interactions.blockStates[stateKey] } : {}),
+    ...(interactions.onBlockState
+      ? { onState: (patch: CopilotBlockState) => interactions.onBlockState?.(stateKey, patch) }
+      : {}),
   }
-  if (!seg.block) {
-    if (seg.failure && ADVISORY_ISLANDS.has(seg.islandType)) return null
-    return <BlockFallback islandType={seg.islandType} failure={seg.failure ?? 'invalid'} raw={seg.raw} />
+  // §7.5 分发：控制岛坏/未闭合一律静默丢弃，降级卡只给展示块
+  const mode = islandRenderMode({
+    islandType: seg.islandType,
+    closed: seg.closed,
+    hasBlock: seg.block !== undefined,
+    done,
+  })
+  if (mode === 'drop') return null
+  if (mode === 'skeleton') return <BlockSkeleton islandType={seg.islandType} />
+  if (mode === 'fallback') {
+    return (
+      <BlockFallback
+        islandType={seg.islandType}
+        failure={seg.closed ? (seg.failure ?? 'invalid') : 'unclosed'}
+        raw={seg.raw}
+      />
+    )
   }
+  if (!seg.block) return null
   switch (seg.block.kind) {
     case 'plan':
       return <PlanChip plan={seg.block} />
@@ -166,15 +184,30 @@ function IslandSeg({
           badges={badges}
           onJump={onJumpCite}
           {...interactions}
+          {...stateSlot}
         />
       )
     case 'flashcard':
       return (
-        <FlashcardBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} {...interactions} />
+        <FlashcardBlock
+          block={seg.block}
+          citeIndex={citeIndex}
+          badges={badges}
+          onJump={onJumpCite}
+          {...interactions}
+          {...stateSlot}
+        />
       )
     case 'teach-back':
       return (
-        <TeachBackBlock block={seg.block} citeIndex={citeIndex} badges={badges} onJump={onJumpCite} {...interactions} />
+        <TeachBackBlock
+          block={seg.block}
+          citeIndex={citeIndex}
+          badges={badges}
+          onJump={onJumpCite}
+          {...interactions}
+          {...stateSlot}
+        />
       )
     case 'evidence':
       if (seg.block.status !== 'insufficient') return null
@@ -237,6 +270,8 @@ export default function CopilotMessage({
   onEvidence,
   onTeachBack,
   busy,
+  blockStates,
+  onBlockState,
 }: Props) {
   // 每条消息一个解析器实例：闭合岛校验结果缓存 + 未变全文直接复用
   const parseRef = useRef<ReturnType<typeof createStreamParserMemo> | null>(null)
@@ -249,8 +284,14 @@ export default function CopilotMessage({
   const missingCount = useMemo(() => (badges ? Object.values(badges).filter((l) => l === 'missing').length : 0), [badges])
 
   const interactions = useMemo<BlockInteractions>(
-    () => ({ ...(onEvidence ? { onEvidence } : {}), ...(onTeachBack ? { onTeachBack } : {}), busy }),
-    [onEvidence, onTeachBack, busy],
+    () => ({
+      ...(onEvidence ? { onEvidence } : {}),
+      ...(onTeachBack ? { onTeachBack } : {}),
+      ...(blockStates ? { blockStates } : {}),
+      ...(onBlockState ? { onBlockState } : {}),
+      busy,
+    }),
+    [onEvidence, onTeachBack, blockStates, onBlockState, busy],
   )
 
   return (

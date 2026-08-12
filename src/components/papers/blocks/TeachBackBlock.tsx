@@ -3,29 +3,31 @@ import type { TeachBackBlockData } from '../../../lib/paper/blockSchemas'
 import type { CiteLevel } from '../../../lib/paper/citations'
 import type { StoredCiteEntry } from '../../../lib/paper/types'
 import BlockCites from './BlockCites'
-import type { BlockInteractions } from './interactions'
+import type { BlockInteractions, BlockStateSlot } from './interactions'
 
 /**
  * teach-back 展示块（§7.2 / §6.1e'）：用户用自己的话复述 → 面板发起 1 次调用，
  * 模型给流式反馈 + copilot:verdict 尾岛（遗漏点/掌握证据），verdict 进画像。
  */
 
-interface Props extends BlockInteractions {
+interface Props extends BlockInteractions, BlockStateSlot {
   block: TeachBackBlockData
   citeIndex: ReadonlyMap<string, StoredCiteEntry>
   badges: Readonly<Record<string, CiteLevel>> | null
   onJump: (entry: StoredCiteEntry) => void
 }
 
-export default function TeachBackBlock({ block, citeIndex, badges, onJump, onTeachBack, busy }: Props) {
+export default function TeachBackBlock({ block, citeIndex, badges, onJump, onTeachBack, busy, state, onState }: Props) {
   const [answer, setAnswer] = useState('')
-  const [submitted, setSubmitted] = useState(false)
+  // 已提交态持久化：刷新后不会又出现一个可再次提交的输入框（复述正文按 §8 不落库）
+  const [submitted, setSubmitted] = useState(() => state?.submitted ?? false)
 
   const submit = () => {
     const text = answer.trim()
     if (!text || busy || submitted) return
     setSubmitted(true)
     onTeachBack?.({ prompt: block.prompt, answer: text, ...(block.concept ? { concept: block.concept } : {}) })
+    onState?.({ submitted: true })
   }
 
   return (

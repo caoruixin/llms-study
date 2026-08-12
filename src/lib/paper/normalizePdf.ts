@@ -45,6 +45,35 @@ const PAGE_NUMBER_ONLY = /^\d{1,4}$/
 /** 编号标题：1 / 2.3 / 4.1.2 起头；首段数字限制 2 位，避免把 "2020. ..." 误判为标题 */
 const NUMBERED_HEADING = /^(\d{1,2}(?:\.\d{1,2})*)[.、]?\s+(\S.*)$/
 
+const LATIN_LETTER = /[A-Za-z]/
+const DIGIT = /[0-9]/
+/** 标题正文的最小「实词量」：拉丁字母记 1 分，CJK 记 2 分（「方法」「结论」两字即成章节名） */
+const MIN_HEADING_CONTENT_SCORE = 3
+/** 数字 + 空白在标题正文中的占比上限（表格数字行、公式碎片几乎全由这两类字符构成） */
+const MAX_HEADING_NUMERIC_RATIO = 0.5
+
+/**
+ * 标题正文的实词密度守卫。
+ *
+ * 为什么必须有这一层：`NUMBERED_HEADING` 只看「数字起头 + 后面还有字符」，于是 PDF 文字层里
+ * 表格的数字行（`1 512 512 5.29 24.9`）、公式碎片（`1 n 1 n i i`）、图表轴标签（`1 2 4 8 16`）
+ * 全都能匹配。它们一旦被判成标题，就会污染目录、`anchor.section`、buildCiteMap 的 § 标签。
+ * 判据：正文部分要有足够的字母/CJK 内容，且不能几乎全是数字与空白。
+ */
+function hasHeadingContent(body: string): boolean {
+  const s = body.trim()
+  if (!s) return false
+  let score = 0
+  let numericLike = 0
+  for (const ch of s) {
+    if (CJK.test(ch)) score += 2
+    else if (LATIN_LETTER.test(ch)) score += 1
+    else if (DIGIT.test(ch) || /\s/.test(ch)) numericLike += 1
+  }
+  if (score < MIN_HEADING_CONTENT_SCORE) return false
+  return numericLike / s.length < MAX_HEADING_NUMERIC_RATIO
+}
+
 const HEADING_WORDS = new Set([
   'abstract', 'introduction', 'background', 'related work', 'method', 'methods', 'methodology',
   'approach', 'experiment', 'experiments', 'experimental setup', 'results', 'evaluation',
@@ -260,7 +289,7 @@ function detectHeading(line: Line, bodyHeight: number): HeadingInfo | null {
   if (!t) return null
 
   const numbered = NUMBERED_HEADING.exec(t)
-  if (numbered && t.length <= 80 && !ENDS_SENTENCE.test(t)) {
+  if (numbered && t.length <= 80 && !ENDS_SENTENCE.test(t) && hasHeadingContent(numbered[2])) {
     return { level: Math.min(6, numbered[1].split('.').length), text: t }
   }
 
@@ -268,7 +297,7 @@ function detectHeading(line: Line, bodyHeight: number): HeadingInfo | null {
   if (HEADING_WORDS.has(key)) return { level: 1, text: t }
 
   const bigger = bodyHeight > 0 && line.height >= bodyHeight * 1.15
-  if (bigger && t.length <= 60 && !ENDS_SENTENCE.test(t) && !/[,，、]$/.test(t)) {
+  if (bigger && t.length <= 60 && !ENDS_SENTENCE.test(t) && !/[,，、]$/.test(t) && hasHeadingContent(t)) {
     return { level: 2, text: t }
   }
   return null

@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { createTurnRunner, initialTurnState, turnReducer, type TurnRequest, type TurnRunnerDeps, type TurnState } from './turnEngine'
+import {
+  createTurnRunner,
+  findOrphanTurns,
+  initialTurnState,
+  turnErrorDetail,
+  turnReducer,
+  type TurnRequest,
+  type TurnRunnerDeps,
+  type TurnState,
+} from './turnEngine'
 import { PAPER_TASKS } from '../../data/paperPolicy'
 import type { RetrieveResult, RetrievedChunk } from './retrieval'
 import type { StreamPaperChatResult } from './modelGateway'
@@ -277,5 +286,50 @@ describe('createTurnRunner · 编排', () => {
     const outcome = await createTurnRunner(deps).run(baseReq, () => {})
     expect(outcome!.state.phase).toBe('error')
     expect(outcome!.state.error?.kind).toBe('rate-limit')
+  })
+})
+
+describe('turnErrorDetail（错误文案不叠前缀、不外露英文）', () => {
+  it('「中文前缀：英文原文」只保留中文前缀', () => {
+    // 修复前 UI 会拼成「网络异常：网络错误：Failed to fetch」
+    expect(turnErrorDetail('网络错误：Failed to fetch', '网络异常，请检查网络后重试')).toBe('网络错误')
+    expect(turnErrorDetail('网络错误: NetworkError when attempting to fetch resource.', 'fb')).toBe('网络错误')
+  })
+
+  it('纯英文 message 换成中文兜底（原文只留 console.debug）', () => {
+    expect(turnErrorDetail('Failed to fetch', '网络异常，请检查网络后重试')).toBe('网络异常，请检查网络后重试')
+    expect(turnErrorDetail('', 'fb')).toBe('fb')
+    expect(turnErrorDetail(undefined, 'fb')).toBe('fb')
+  })
+
+  it('完整中文文案原样返回（含中文冒号后仍是中文的情况）', () => {
+    expect(turnErrorDetail('本轮上下文超出预算且无法继续裁剪，请缩短选区后重试', 'fb')).toBe(
+      '本轮上下文超出预算且无法继续裁剪，请缩短选区后重试',
+    )
+    expect(turnErrorDetail('触发限流：请稍后重试', 'fb')).toBe('触发限流：请稍后重试')
+  })
+})
+
+describe('findOrphanTurns（有问无答的中断轮）', () => {
+  const u = (id: string) => ({ id, role: 'user' as const })
+  const a = (id: string) => ({ id, role: 'assistant' as const })
+
+  it('末尾的用户消息没有回答 → 孤儿', () => {
+    expect([...findOrphanTurns([u('1'), a('2'), u('3')])]).toEqual(['3'])
+  })
+
+  it('两条用户消息相邻 → 前一条也是孤儿', () => {
+    expect([...findOrphanTurns([u('1'), u('2'), a('3')])]).toEqual(['1'])
+  })
+
+  it('liveTail：末条正在生成回答时不算孤儿', () => {
+    expect([...findOrphanTurns([u('1'), a('2'), u('3')], { liveTail: true })]).toEqual([])
+    // 中间的孤儿不受 liveTail 影响
+    expect([...findOrphanTurns([u('1'), u('2'), a('3'), u('4')], { liveTail: true })]).toEqual(['1'])
+  })
+
+  it('成对完整的会话没有孤儿；空列表安全', () => {
+    expect(findOrphanTurns([u('1'), a('2'), u('3'), a('4')]).size).toBe(0)
+    expect(findOrphanTurns([]).size).toBe(0)
   })
 })

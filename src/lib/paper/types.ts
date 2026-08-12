@@ -196,6 +196,25 @@ export interface CopilotMessage {
   sourceLabel?: string
   /** Phase 4：用户对这条回答的深度反馈（太浅/刚好/太深），刷新后仍显示已选态 */
   feedback?: 'shallow' | 'right' | 'deep'
+  /** Phase 5：交互块作答状态（key = 岛序号），刷新后恢复已答态并禁止重复作答 */
+  blockStates?: Record<string, CopilotBlockState>
+}
+
+/**
+ * 交互块的作答/自评状态（quiz / flashcard / teach-back）。
+ * 只存结果不存原文：与 §8「默认不记录用户问题与论文正文」一致。
+ */
+export interface CopilotBlockState {
+  /** quiz：所选项下标（单选为单元素数组） */
+  picked?: number[]
+  /** quiz：判分或自评结果 */
+  outcome?: 'correct' | 'partial' | 'wrong'
+  /** flashcard：自评掌握度 */
+  rating?: 'known' | 'fuzzy' | 'unknown'
+  /** quiz(简答) 已看参考答案 / flashcard 已翻面 */
+  revealed?: boolean
+  /** teach-back：已提交复述 */
+  submitted?: boolean
 }
 
 /** 画像证据的持久化形态（不含问题原文/论文正文，§8） */

@@ -1,4 +1,5 @@
 import type { ProfileEvidence } from '../../../lib/paper/learnerProfile'
+import type { CopilotBlockState } from '../../../lib/paper/types'
 
 /**
  * 交互块 → 面板的回调契约（§6.2 L1 证据源）。
@@ -11,4 +12,14 @@ export interface BlockInteractions {
   onTeachBack?: (payload: { prompt: string; answer: string; concept?: string }) => void
   /** 有轮次进行中：交互块禁用发起类操作 */
   busy?: boolean
+  /** 已持久化的作答状态（key = 岛序号），刷新后据此恢复 */
+  blockStates?: Readonly<Record<string, CopilotBlockState>>
+  /** 作答/自评结果回写消息元数据（面板负责合并 + 落库） */
+  onBlockState?: (key: string, patch: CopilotBlockState) => void
+}
+
+/** 单个交互块拿到的作答状态口子（由 CopilotMessage 按岛序号派发） */
+export interface BlockStateSlot {
+  state?: CopilotBlockState
+  onState?: (patch: CopilotBlockState) => void
 }

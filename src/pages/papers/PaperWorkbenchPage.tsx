@@ -242,6 +242,23 @@ export default function PaperWorkbenchPage() {
         flashElement(el)
       }
     }
+    // 程序化跳转（引用回跳 / 目录）立刻把「当前第 N 页」推到目标位置：
+    // 平滑滚动期间 IntersectionObserver 要几百毫秒才结算，等它会让指示器长时间停在旧页
+    if (target.blockIndex !== undefined || target.page !== undefined) {
+      setPosition((prev) => {
+        const blockIndex = target.blockIndex ?? prev.blockIndex
+        const block = blockByIndexRef.current[blockIndex]
+        const page = target.page ?? block?.anchor.page
+        const section = target.section ?? block?.anchor.section
+        return prev.blockIndex === blockIndex && prev.page === page && prev.section === section
+          ? prev
+          : { blockIndex, page, section }
+      })
+      if (target.blockIndex !== undefined) {
+        const idx = target.blockIndex
+        setMaxBlockIndex((m) => (idx > m ? idx : m))
+      }
+    }
     return target
   }, [])
 
@@ -590,9 +607,10 @@ export default function PaperWorkbenchPage() {
           )}
         </div>
 
-        {/* 平板 / 手机：目录抽屉 */}
+        {/* 平板 / 手机：目录抽屉（z-50 必须高于 Copilot 底部面板的 z-40——
+            同层且 DOM 靠后时，手机上抽屉会被面板整片盖住） */}
         {showOutlineDrawer && (
-          <div className="fixed inset-0 z-40 flex">
+          <div className="fixed inset-0 z-50 flex">
             <div
               className="flex-1 bg-ink/60 backdrop-blur-[1px]"
               role="presentation"

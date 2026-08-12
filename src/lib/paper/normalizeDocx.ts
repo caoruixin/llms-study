@@ -119,6 +119,34 @@ function tableToText(inner: string): string {
   return rows.join('\n')
 }
 
+/** 伪标题的长度上限：超过这个长度的整段加粗更像强调正文而不是标题 */
+const PSEUDO_HEADING_MAX_CHARS = 60
+/** 句末终止标点：标题不会以它结尾（冒号除外——「结论：」仍是标题） */
+const PSEUDO_HEADING_ENDS_SENTENCE = /[.。!！?？;；]["'”’)）]?$/
+/** 编号前缀：1. / 2.3 / 4.1.2（与 normalizePdf 的 NUMBERED_HEADING 同口径） */
+const PSEUDO_HEADING_NUMBER = /^(\d{1,2}(?:\.\d{1,2})*)[.、]?\s+\S/
+const BOLD_TAG = /<(strong|b)\b[^>]*>[\s\S]*?<\/\1\s*>/gi
+
+/**
+ * DOCX 伪标题识别。
+ *
+ * 为什么需要：大量论文/笔记类 DOCX 从不使用 Word 的「标题」样式，而是把章节名写成
+ * 整段加粗（mammoth 产出 `<p><strong>2. 显存占用公式</strong></p>`）。只认 h1..h6 时，
+ * 这类文档会坍缩成一个巨大 chunk、`anchor.section` 全为 undefined，目录与引用 § 标签同时失效。
+ *
+ * 判据（三条同时成立）：段内**全部**文本都在 strong/b 内、长度 ≤60、不以句末标点结尾。
+ * 级别：有 `1.` / `2.3` 编号前缀时按编号层级，否则统一 level 2。
+ */
+function detectPseudoHeading(inner: string, text: string): { level: number } | null {
+  if (!text || text.length > PSEUDO_HEADING_MAX_CHARS) return null
+  if (PSEUDO_HEADING_ENDS_SENTENCE.test(text)) return null
+  if (!/<(strong|b)\b/i.test(inner)) return null
+  // 把所有 strong/b 整段抠掉后还剩正文 → 只是行内强调，不是标题
+  if (toText(inner.replace(BOLD_TAG, ' '))) return null
+  const numbered = PSEUDO_HEADING_NUMBER.exec(text)
+  return { level: numbered ? Math.min(6, numbered[1].split('.').length) : 2 }
+}
+
 export function normalizeDocxHtml(html: string): NormalizedBlock[] {
   const raw = extractBlocks(html)
   const blocks: NormalizedBlock[] = []
@@ -166,9 +194,17 @@ export function normalizeDocxHtml(html: string): NormalizedBlock[] {
       case 'pre':
         push('code', toText(b.inner))
         break
-      default:
-        push('paragraph', toText(b.inner))
+      default: {
+        const text = toText(b.inner)
+        const pseudo = b.tag === 'p' ? detectPseudoHeading(b.inner, text) : null
+        if (pseudo) {
+          section = text // 与 h1..h6 一致：标题块自身的 anchor.section 就是它自己
+          push('heading', text, { level: pseudo.level })
+          break
+        }
+        push('paragraph', text)
         break
+      }
     }
   }
 

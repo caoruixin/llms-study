@@ -223,6 +223,39 @@ export const KNOWN_ISLAND_TYPES = [
   'verdict',
 ] as const
 
+/**
+ * 控制岛：用户不可见，只在 finalize 后回写状态（画像 / 摘要 / 证据不足）。
+ * §7.5 的「plan/learner/memo 岛坏 → 静默忽略（advisory）」对整组成立——
+ * 降级卡是给**展示块**的（用户本来期待看到一个块，坏了要有交代），
+ * 控制岛坏掉时用户从不知道它存在，弹「交互块未完成」只是噪声。
+ */
+export const CONTROL_ISLAND_TYPES = ['plan', 'memo', 'evidence', 'learner', 'verdict'] as const
+
+export const isControlIsland = (type: string): boolean =>
+  (CONTROL_ISLAND_TYPES as readonly string[]).includes(type.toLowerCase())
+
+/** 岛的渲染分发档位：骨架 / 降级卡 / 静默丢弃 / 正常渲染 */
+export type IslandRenderMode = 'skeleton' | 'fallback' | 'drop' | 'block'
+
+/**
+ * §7.5 降级矩阵的渲染分发（纯函数，便于逐条锁定）。
+ * closed=false 且 done=true 即「Stop/流结束时岛未闭合」那一行。
+ */
+export function islandRenderMode(input: {
+  islandType: string
+  closed: boolean
+  /** 校验通过并拿到了 block */
+  hasBlock: boolean
+  /** 流已结束（finalize） */
+  done: boolean
+}): IslandRenderMode {
+  const control = isControlIsland(input.islandType)
+  // 流仍在跑：一律骨架（控制岛的骨架是「正在生成」的可见反馈，此时还不知道它会不会闭合）
+  if (!input.closed) return input.done ? (control ? 'drop' : 'fallback') : 'skeleton'
+  if (input.hasBlock) return 'block'
+  return control ? 'drop' : 'fallback'
+}
+
 export type IslandFailure = 'too-large' | 'bad-json' | 'invalid' | 'unknown-type'
 
 export type IslandParseResult = { ok: true; block: CopilotBlock } | { ok: false; failure: IslandFailure; detail?: string }
@@ -251,18 +284,64 @@ const strArr = (v: unknown, maxItems: number, maxLen: number): string[] => {
 /** cites：剔除不合白名单语法的别名（存在性校验在 citations.ts，这里只管语法） */
 const citeArr = (v: unknown): string[] => strArr(v, 12, 8).filter((x) => CITE_ID_RE.test(x))
 
+/** JSON 合法转义符：\" \\ \/ \b \f \n \r \t \uXXXX */
+const JSON_ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'])
+
+/**
+ * LaTeX 反斜杠温和修复（§7.5 之前的一次挽救）：公式密集的岛里模型常把 `\alpha` 直接写进
+ * JSON 字符串而忘了双写，导致整个岛 bad-json 被丢弃。这里只做**一种**修复——
+ * 把「`\` + 字母且不是合法 JSON 转义符」补成 `\\`，其余一律不动：
+ * - `\\` 成对出现时整对跳过（已正确转义的 `\\alpha` 不会被再加一层）；
+ * - `\n` / `\t` / `\uXXXX` 等合法转义原样保留（不会把换行改成字面量）。
+ * 修复后仍解析失败的，照旧走 bad-json 降级。
+ *
+ * 已知边界：`\beta` / `\frac` 这类以合法转义符（b/f/n/r/t/u）开头的 LaTeX 命令不在修复范围内——
+ * 它们本身就能被 JSON.parse 接受（解析成退格/换页控制符），根本走不到这条修复路径；
+ * 这一档由 contextBuilder 系统提示里的「JSON 转义铁律」负责收敛。
+ */
+export function repairLatexBackslashes(src: string): string {
+  if (!src.includes('\\')) return src
+  let out = ''
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i]
+    if (ch !== '\\') {
+      out += ch
+      continue
+    }
+    const next = src[i + 1]
+    if (next === '\\') {
+      out += '\\\\' // 已成对：整对跳过，避免越修越坏
+      i++
+      continue
+    }
+    if (next !== undefined && /[a-zA-Z]/.test(next) && !JSON_ESCAPES.has(next)) {
+      out += '\\\\'
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
 /** 首 { 末 } 切片 + JSON.parse（parseScoreJson 同法） */
 export function parseIslandJson(raw: string): Record<string, unknown> | null {
   const start = raw.indexOf('{')
   const end = raw.lastIndexOf('}')
   if (start === -1 || end === -1 || end <= start) return null
-  try {
-    const parsed: unknown = JSON.parse(raw.slice(start, end + 1))
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
-    return parsed as Record<string, unknown>
-  } catch {
-    return null
+  const sliced = raw.slice(start, end + 1)
+  const attempt = (text: string): Record<string, unknown> | null => {
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+      return parsed as Record<string, unknown>
+    } catch {
+      return null
+    }
   }
+  const first = attempt(sliced)
+  if (first !== null) return first
+  const repaired = repairLatexBackslashes(sliced)
+  return repaired === sliced ? null : attempt(repaired)
 }
 
 // ---------------------------------------------------------------------------

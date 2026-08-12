@@ -5,7 +5,7 @@ import { evidenceFromQuiz, type QuizOutcome } from '../../../lib/paper/learnerPr
 import type { CiteLevel } from '../../../lib/paper/citations'
 import type { StoredCiteEntry } from '../../../lib/paper/types'
 import BlockCites from './BlockCites'
-import type { BlockInteractions } from './interactions'
+import type { BlockInteractions, BlockStateSlot } from './interactions'
 
 /**
  * quiz 展示块（§7.2 / §6.1e：判分 0 次 LLM 调用）。
@@ -14,7 +14,7 @@ import type { BlockInteractions } from './interactions'
  * 判分结果 → L1 画像证据。选项顺序可确定性洗牌（默认关闭：解析文案常引用原顺序）。
  */
 
-interface Props extends BlockInteractions {
+interface Props extends BlockInteractions, BlockStateSlot {
   block: QuizBlockData
   /** 岛序号：洗牌种子（同一块每次渲染顺序一致） */
   seed: number
@@ -28,17 +28,19 @@ const SHUFFLE_OPTIONS = false
 const OUTCOME_LABEL: Record<QuizOutcome, string> = { correct: '答对了', partial: '部分正确', wrong: '答错了' }
 const OUTCOME_CLASS: Record<QuizOutcome, string> = { correct: 'text-ok', partial: 'text-warn', wrong: 'text-bad' }
 
-export default function QuizBlock({ block, seed, citeIndex, badges, onJump, onEvidence }: Props) {
-  const [picked, setPicked] = useState<number[]>([])
-  const [outcome, setOutcome] = useState<QuizOutcome | null>(null)
-  const [revealed, setRevealed] = useState(false)
+export default function QuizBlock({ block, seed, citeIndex, badges, onJump, onEvidence, state, onState }: Props) {
+  // 初值取自持久化状态：刷新后仍显示所选与判分，且 outcome !== null 天然禁止重复作答
+  const [picked, setPicked] = useState<number[]>(() => state?.picked ?? [])
+  const [outcome, setOutcome] = useState<QuizOutcome | null>(() => state?.outcome ?? null)
+  const [revealed, setRevealed] = useState(() => state?.revealed ?? state?.outcome !== undefined)
   const order = useMemo(() => optionOrder(block.options.length, seed, SHUFFLE_OPTIONS), [block.options.length, seed])
 
   const concepts = block.concept ? [block.concept] : []
-  const settle = (result: QuizOutcome) => {
+  const settle = (result: QuizOutcome, chosen: number[] = picked) => {
     if (outcome !== null) return // 一题只记一次证据
     setOutcome(result)
     onEvidence?.(evidenceFromQuiz(result, concepts, Date.now()))
+    onState?.({ picked: chosen, outcome: result, revealed: true })
   }
 
   const toggle = (idx: number) => {
@@ -48,7 +50,7 @@ export default function QuizBlock({ block, seed, citeIndex, badges, onJump, onEv
 
   const grade = () => {
     if (picked.length === 0) return
-    settle(gradeChoice(block, picked).outcome)
+    settle(gradeChoice(block, picked).outcome, picked)
   }
 
   const answers = block.answer === null ? [] : Array.isArray(block.answer) ? block.answer : [block.answer]
@@ -65,7 +67,10 @@ export default function QuizBlock({ block, seed, citeIndex, badges, onJump, onEv
           {!revealed ? (
             <button
               type="button"
-              onClick={() => setRevealed(true)}
+              onClick={() => {
+                setRevealed(true)
+                onState?.({ revealed: true })
+              }}
               className="rounded border border-accent/40 px-2 py-0.5 text-[0.7rem] text-accent transition-colors hover:bg-accent/10"
             >
               先自己答，再看参考答案

@@ -27,6 +27,8 @@ interface Props {
 const WINDOW_PAGES = 2
 /** 位图倍率上限：高 DPI 屏上 3x 只带来内存压力，看不出差别 */
 const MAX_DPR = 2
+/** 容器宽度变化 → 重绘的防抖窗口：面板收起/展开动画与拖拽期间只重渲一次 */
+const RESIZE_DEBOUNCE_MS = 150
 
 interface PageProps {
   lib: PdfjsModule
@@ -36,13 +38,22 @@ interface PageProps {
   width: number
   height: number
   active: boolean
+  /** 容器宽度变化计数：进 effect 依赖，宽度变了就主动重跑渲染（scale 被钳位时也生效） */
+  layoutTick: number
 }
 
 /** memo 是必需的：滚动时 range 每变一次，父组件都会重渲染全部页占位（150 页文档尤其明显） */
-const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, height, active }: PageProps) {
+const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, height, active, layoutTick }: PageProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const textRef = useRef<HTMLDivElement>(null)
   const [rendered, setRendered] = useState(false)
+  /**
+   * 上一次渲染任务的 promise。pdf.js 不允许同一 canvas 上并发 render()——
+   * 面板收起/展开改变容器宽度时 effect 会紧接着重跑，不等上一次任务落地就调 render()
+   * 会直接抛「Cannot use the same canvas during multiple render operations」，
+   * 被 catch 吞掉后页面就停在「已按新尺寸重建、但一个像素都没画」的空白态（QA P1-4）。
+   */
+  const inflightRef = useRef<Promise<unknown> | null>(null)
 
   useEffect(() => {
     if (!active) return
@@ -50,7 +61,10 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
     let renderTask: { cancel: () => void } | null = null
     let textLayer: { cancel: () => void } | null = null
 
-    void (async () => {
+    const done = (async () => {
+      // 先等上一轮（可能刚被 cancel）彻底结束，再开始新一轮
+      await inflightRef.current?.catch(() => undefined)
+      if (cancelled) return
       const page = await doc.getPage(pageNumber)
       if (cancelled) return
       const viewport = page.getViewport({ scale })
@@ -85,6 +99,7 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
     })().catch(() => {
       // 渲染被取消（快速滚动）或单页损坏：不影响其他页，占位继续显示
     })
+    inflightRef.current = done
 
     return () => {
       cancelled = true
@@ -99,7 +114,8 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
       }
       setRendered(false)
     }
-  }, [active, doc, lib, pageNumber, scale])
+    // layoutTick：容器宽度变化后强制重跑（与滚动触发同一条渲染路径）
+  }, [active, doc, lib, pageNumber, scale, layoutTick])
 
   return (
     <div
@@ -134,6 +150,7 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
   const [error, setError] = useState('')
   const wrapRef = useRef<HTMLDivElement>(null)
   const [boxWidth, setBoxWidth] = useState(0)
+  const [layoutTick, setLayoutTick] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -174,14 +191,35 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
     }
   }, [bytes, onLoaded])
 
-  // 容器宽度 → 适宽缩放
+  /**
+   * 容器宽度 → 适宽缩放。防抖 150ms：Copilot 面板收起/展开、窗口拖拽都会连发 resize，
+   * 每一次都会让视口内页面整体重绘一遍。
+   * layoutTick 与 boxWidth 一起递增——scale 被 min/max 钳住（宽度变化但 scale 不变）时，
+   * 光靠 scale 依赖无法触发重绘，页面会停在旧位图/空白 canvas 上（QA P1-4）。
+   */
   useEffect(() => {
     const el = wrapRef.current
     if (!el || typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(([entry]) => setBoxWidth(entry.contentRect.width))
+    let timer = 0
+    let lastWidth = el.clientWidth
+    const apply = (w: number) => {
+      // 只认宽度变化：被观察元素的高度会随页面渲染不断增长，若一并触发就成了自激重绘
+      if (Math.abs(w - lastWidth) < 1) return
+      lastWidth = w
+      setBoxWidth(w)
+      setLayoutTick((t) => t + 1)
+    }
+    const ro = new ResizeObserver(([entry]) => {
+      const w = entry.contentRect.width
+      clearTimeout(timer)
+      timer = setTimeout(() => apply(w), RESIZE_DEBOUNCE_MS) as unknown as number
+    })
     ro.observe(el)
-    setBoxWidth(el.clientWidth)
-    return () => ro.disconnect()
+    setBoxWidth(lastWidth)
+    return () => {
+      clearTimeout(timer)
+      ro.disconnect()
+    }
   }, [])
 
   const scale = useMemo(() => {
@@ -240,6 +278,7 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
             scale={scale}
             width={base.width * scale}
             height={base.height * scale}
+            layoutTick={layoutTick}
             active={range !== null && p >= range.min - WINDOW_PAGES && p <= range.max + WINDOW_PAGES}
           />
         ))

@@ -20,7 +20,7 @@ import { createModelGateway } from '../../lib/paper/modelGateway'
 import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
 import { createLearnerRepository } from '../../lib/paper/repo/learnerRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
-import { createTurnRunner, type TurnError, type TurnState } from '../../lib/paper/turnEngine'
+import { createTurnRunner, findOrphanTurns, turnErrorDetail, type TurnError, type TurnState } from '../../lib/paper/turnEngine'
 import { KEEP_PAIRS_AFTER_FOLD, MAX_LIVE_TURN_PAIRS, foldMemo, shouldRequestMemo, trimHistoryPairs } from '../../lib/paper/summarizer'
 import { formatTokens, formatUsd } from '../../lib/paper/usage'
 import { collectIslands, createStreamParserMemo, splitCopilotStream } from '../../lib/paper/streamParser'
@@ -62,7 +62,14 @@ import {
 import { isSpeechSupported, startDictation, type DictationSession } from '../../lib/speech'
 import type { RetrievalService } from '../../lib/paper/retrieval'
 import type { ScrollTarget } from '../../lib/paper/anchors'
-import type { CopilotMessage as StoredMessage, PaperBlock, PaperRecord, SourceAnchor, StoredCiteEntry } from '../../lib/paper/types'
+import type {
+  CopilotBlockState,
+  CopilotMessage as StoredMessage,
+  PaperBlock,
+  PaperRecord,
+  SourceAnchor,
+  StoredCiteEntry,
+} from '../../lib/paper/types'
 import { usePaperUi, type PaperAskAction, type PendingAsk } from '../../pages/papers/paperUiStore'
 import type { ChatMessage } from '../../lib/llmClient'
 import CopilotMessageView from './CopilotMessage'
@@ -132,6 +139,10 @@ const PROVIDER_KEY_HINT: Record<PaperProviderId, string> = {
   kimi: 'KIMI_API_KEY（或 MOONSHOT_API_KEY）',
 }
 
+/**
+ * 错误文案（§QA D-10）：底层 message 已经中文化过一次，这里再套前缀就成了
+ * 「网络异常：网络错误：Failed to fetch」；一律走 turnErrorDetail 去重 + 去英文原文。
+ */
 function friendlyTurnError(err: TurnError, provider: PaperProviderId = 'deepseek'): string {
   switch (err.kind) {
     case 'auth':
@@ -141,13 +152,13 @@ function friendlyTurnError(err: TurnError, provider: PaperProviderId = 'deepseek
     case 'timeout':
       return '请求超时：可以重试；深度推导可能需要更长时间'
     case 'network':
-      return `网络异常：${err.message}`
+      return turnErrorDetail(err.message, '网络异常：请求没能送达，请检查网络后重试')
     case 'bad-response':
-      return `上游返回异常：${err.message}`
+      return turnErrorDetail(err.message, '上游返回异常，请重试')
     case 'server':
-      return `上游报错：${err.message}`
+      return turnErrorDetail(err.message, '上游报错，请稍后重试')
     default:
-      return err.message || '出错了，请重试'
+      return turnErrorDetail(err.message, '出错了，请重试')
   }
 }
 
@@ -633,6 +644,45 @@ export default function CopilotPanel({
     [busy, sendTurn],
   )
 
+  /**
+   * 「有问无答」的中断轮（§QA D-8）：页面在流式中途被关掉时，用户消息已落库而回答没有。
+   * 恢复会话后标注「已中断」并给一键重发；末条正在生成回答时不算孤儿。
+   */
+  // 依赖用 live !== null 而不是 live 本身：否则每个 delta 的 rAF 刷新都要重算一遍（§7.6）
+  const hasLiveTurn = live !== null
+  const orphanIds = useMemo(() => findOrphanTurns(messages, { liveTail: hasLiveTurn }), [messages, hasLiveTurn])
+
+  const resendOrphan = useCallback(
+    (msg: StoredMessage) => {
+      if (busy) return
+      void sendTurn({
+        question: msg.content,
+        task: 'chat',
+        planIsland: true,
+        extraDirectives: [LEARNER_DIRECTIVE],
+        userAuthored: true,
+        displayText: msg.content,
+        ...(msg.actionLabel ? { label: msg.actionLabel } : {}),
+      })
+    },
+    [busy, sendTurn],
+  )
+
+  /** 交互块作答状态回写（§QA D-7）：合并进消息元数据并落库，刷新后由块自身恢复 */
+  const updateBlockState = useCallback(
+    (messageId: string, key: string, patch: CopilotBlockState) => {
+      const msg = messagesRef.current.find((m) => m.id === messageId)
+      if (!msg) return
+      const merged: Record<string, CopilotBlockState> = {
+        ...(msg.blockStates ?? {}),
+        [key]: { ...(msg.blockStates?.[key] ?? {}), ...patch },
+      }
+      setMessages((list) => list.map((m) => (m.id === messageId ? { ...m, blockStates: merged } : m)))
+      void repo.updateMessage(messageId, { blockStates: merged }).catch(() => undefined)
+    },
+    [repo],
+  )
+
   const giveFeedback = useCallback(
     (msg: StoredMessage, kind: DepthFeedback) => {
       if (msg.feedback === kind) return
@@ -922,11 +972,25 @@ export default function CopilotPanel({
 
   const jumpEntry = useCallback((entry: StoredCiteEntry) => onJumpAnchor(entry.anchor), [onJumpAnchor])
 
+  /**
+   * 流式期间的第二次提交（§QA P1-2）：不排队（保持单飞语义），但**不清空输入**、
+   * 给一行 aria-live 提示。修复前问题会被静默吞掉——输入框清空、没有任何反馈。
+   */
+  const [sendBlocked, setSendBlocked] = useState(false)
+  useEffect(() => {
+    if (!busy) setSendBlocked(false)
+  }, [busy])
+
   const submit = useCallback(() => {
     const value = input.trim()
-    if (!value || busy) return
+    if (!value) return
+    if (busy) {
+      setSendBlocked(true)
+      return
+    }
     if (listening) stopDictation()
     setInput('')
+    setSendBlocked(false)
     stickRef.current = true
     sendFree(value)
   }, [busy, input, listening, sendFree, stopDictation])
@@ -1021,25 +1085,27 @@ export default function CopilotPanel({
             </div>
             <ul className="space-y-1.5">
               {paperAsks.map((ask) => (
-                <li key={ask.id} className="rounded-lg border border-line bg-panel-2 p-2">
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => consumeAsk(ask)}
-                      className="rounded border border-accent/40 px-1.5 py-0.5 text-[0.65rem] text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
-                    >
+                // 整卡可点：只有小标签可点时，用户会以为卡片本身没有动作（§QA D-6）
+                <li key={ask.id} className="relative rounded-lg border border-line bg-panel-2">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => consumeAsk(ask)}
+                    title={busy ? '回答进行中，完成后可发起' : '点击发起这条提问'}
+                    className="block w-full rounded-lg border border-transparent p-2 pr-12 text-left transition-colors hover:border-accent/40 hover:bg-accent/5 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-transparent disabled:hover:bg-transparent"
+                  >
+                    <span className="mb-1 inline-block rounded border border-accent/40 px-1.5 py-0.5 text-[0.65rem] text-accent">
                       {ask.action === 'queue' ? '引用并提问' : ask.label}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onRemoveAsk(ask.id)}
-                      className="text-[0.7rem] text-dim transition-colors hover:text-bad"
-                    >
-                      移除
-                    </button>
-                  </div>
-                  <p className="line-clamp-2 text-[0.7rem] leading-relaxed text-fg">{ask.text}</p>
+                    </span>
+                    <span className="line-clamp-2 block text-[0.7rem] leading-relaxed text-fg">{ask.text}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRemoveAsk(ask.id)}
+                    className="absolute top-2 right-2 text-[0.7rem] text-dim transition-colors hover:text-bad"
+                  >
+                    移除
+                  </button>
                 </li>
               ))}
             </ul>
@@ -1070,10 +1136,23 @@ export default function CopilotPanel({
         {/* 历史消息 */}
         {messages.map((m) =>
           m.role === 'user' ? (
-            <div key={m.id} className="flex justify-end">
+            <div key={m.id} className="flex flex-col items-end">
               <div className="max-w-[92%] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
                 {m.content}
               </div>
+              {orphanIds.has(m.id) && (
+                <p className="mt-0.5 flex items-center gap-2 text-[0.65rem] text-warn">
+                  已中断（这条提问没有得到回答）
+                  <button
+                    type="button"
+                    onClick={() => resendOrphan(m)}
+                    disabled={busy}
+                    className="rounded border border-line px-1.5 py-0.5 text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
+                  >
+                    重新发送
+                  </button>
+                </p>
+              )}
             </div>
           ) : (
             <div key={m.id}>
@@ -1093,6 +1172,8 @@ export default function CopilotPanel({
                 onEvidence={recordEvidence}
                 onTeachBack={sendTeachBack}
                 busy={busy}
+                {...(m.blockStates ? { blockStates: m.blockStates } : {})}
+                onBlockState={(key, patch) => updateBlockState(m.id, key, patch)}
               />
               {m.usage && (
                 <p className="mt-0.5 text-[0.65rem] text-dim">
@@ -1233,16 +1314,20 @@ export default function CopilotPanel({
           value={listening && interim ? `${input}${interim}` : input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
-            // IME-safe：中文输入法回车不误发；流式中吞掉 Enter
+            // IME-safe：中文输入法回车不误发；流式中 submit 只提示不发送、也不清空输入
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault()
-              if (!busy) submit()
+              submit()
             }
           }}
           rows={2}
           placeholder="围绕这篇论文提问，Enter 发送 / Shift+Enter 换行"
           className="w-full resize-y rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-sm leading-relaxed"
         />
+        {/* 常驻于 DOM（aria-live 区域先存在才会播报），空时不占高度 */}
+        <p aria-live="polite" className="mt-0.5 text-[0.65rem] text-warn">
+          {sendBlocked && busy ? '回答进行中，完成后可发送（问题已保留在输入框）' : null}
+        </p>
         <div className="mt-1.5 flex items-center justify-between gap-2">
           <span className="min-w-0 flex-1 truncate text-[0.65rem] text-dim">
             {listening

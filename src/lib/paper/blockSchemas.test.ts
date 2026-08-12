@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { BLOCK_LIMITS, MAX_ISLAND_RAW_BYTES, parseIslandJson, validateIsland } from './blockSchemas'
+import {
+  BLOCK_LIMITS,
+  CONTROL_ISLAND_TYPES,
+  MAX_ISLAND_RAW_BYTES,
+  isControlIsland,
+  islandRenderMode,
+  parseIslandJson,
+  repairLatexBackslashes,
+  validateIsland,
+} from './blockSchemas'
 
 /** 取校验通过的块，失败直接抛（测试里省掉逐处 ok 判断） */
 function block(type: string, json: unknown): Record<string, unknown> {
@@ -16,6 +25,38 @@ describe('parseIslandJson（首{末}切片）', () => {
     expect(parseIslandJson('没有对象')).toBeNull()
     expect(parseIslandJson('{"a":')).toBeNull()
     expect(parseIslandJson('[1,2]')).toBeNull()
+  })
+})
+
+describe('repairLatexBackslashes（公式密集岛的唯一一种温和修复）', () => {
+  it('未转义的 LaTeX 反斜杠补成 \\\\，修复后可解析', () => {
+    const broken = String.raw`{"expr":"\alpha + \sigma"}`
+    expect(parseIslandJson(broken)).toEqual({ expr: String.raw`\alpha + \sigma` })
+    const formula = validateIsland('formula', String.raw`{"expr":"\sqrt{d_k} \cdot \alpha","terms":[],"steps":[]}`)
+    expect(formula.ok && (formula.block as { expr: string }).expr).toBe(String.raw`\sqrt{d_k} \cdot \alpha`)
+  })
+
+  it('已知边界：\\b / \\f 开头的命令（\\beta、\\frac）本身就是合法 JSON 转义，不在修复范围内', () => {
+    // 单独出现时 JSON.parse 直接成功（得到退格/换页控制符），修复路径根本不会被触发——
+    // 这一档只能靠 prompt 的「JSON 转义铁律」收敛，此处锁定行为避免误以为已修复
+    expect(parseIslandJson(String.raw`{"expr":"\beta"}`)).toEqual({ expr: '\beta' })
+  })
+
+  it('合法 JSON 转义不被误改：\\n 仍是换行，已双写的 \\\\ 不再加层', () => {
+    // \n 是合法转义（保持换行语义），同段里的 \alpha 才被修复
+    expect(parseIslandJson(String.raw`{"a":"x\ny\alpha"}`)).toEqual({ a: 'x\ny\\alpha' })
+    // 已正确双写的输入首次 parse 就成功，修复函数不介入；单独调用也保持幂等
+    expect(parseIslandJson(String.raw`{"a":"\\alpha"}`)).toEqual({ a: String.raw`\alpha` })
+    expect(repairLatexBackslashes(String.raw`{"a":"\\alpha"}`)).toBe(String.raw`{"a":"\\alpha"}`)
+    expect(repairLatexBackslashes(String.raw`{"a":"line\nnext\ttabé"}`)).toBe(
+      String.raw`{"a":"line\nnext\ttabé"}`,
+    )
+    expect(repairLatexBackslashes('无反斜杠原样返回')).toBe('无反斜杠原样返回')
+  })
+
+  it('彻底坏掉的 JSON 修复后仍失败 → 照旧走 bad-json 降级', () => {
+    expect(parseIslandJson(String.raw`{"expr":"\alpha`)).toBeNull()
+    expect(validateIsland('formula', String.raw`{"expr":"\alpha", 截断了`)).toEqual({ ok: false, failure: 'bad-json' })
   })
 })
 
@@ -297,5 +338,44 @@ describe('validateIsland · 降级矩阵（§7.5）', () => {
   })
   it('类型大小写不敏感', () => {
     expect(validateIsland('MEMO', '{"summary":"s"}')).toEqual({ ok: true, block: { kind: 'memo', summary: 's' } })
+  })
+})
+
+describe('islandRenderMode（§7.5 渲染分发）', () => {
+  const DISPLAY = ['explanation', 'formula', 'stepper', 'comparison', 'quiz', 'flashcard', 'teach-back']
+
+  it('流未结束时未闭合岛一律骨架', () => {
+    for (const t of [...DISPLAY, ...CONTROL_ISLAND_TYPES]) {
+      expect(islandRenderMode({ islandType: t, closed: false, hasBlock: false, done: false })).toBe('skeleton')
+    }
+  })
+
+  it('finalize 时未闭合：展示块出降级卡，控制岛静默丢弃', () => {
+    for (const t of DISPLAY) {
+      expect(islandRenderMode({ islandType: t, closed: false, hasBlock: false, done: true })).toBe('fallback')
+    }
+    for (const t of CONTROL_ISLAND_TYPES) {
+      expect(islandRenderMode({ islandType: t, closed: false, hasBlock: false, done: true })).toBe('drop')
+    }
+  })
+
+  it('闭合但校验失败：展示块出降级卡，控制岛（含 evidence）静默丢弃', () => {
+    for (const t of DISPLAY) {
+      expect(islandRenderMode({ islandType: t, closed: true, hasBlock: false, done: true })).toBe('fallback')
+    }
+    for (const t of CONTROL_ISLAND_TYPES) {
+      expect(islandRenderMode({ islandType: t, closed: true, hasBlock: false, done: true })).toBe('drop')
+    }
+  })
+
+  it('未知类型按展示块处理（降级卡 + 计数）', () => {
+    expect(islandRenderMode({ islandType: 'hologram', closed: true, hasBlock: false, done: true })).toBe('fallback')
+    expect(isControlIsland('hologram')).toBe(false)
+    expect(isControlIsland('PLAN')).toBe(true)
+  })
+
+  it('校验通过 → 正常渲染', () => {
+    expect(islandRenderMode({ islandType: 'quiz', closed: true, hasBlock: true, done: true })).toBe('block')
+    expect(islandRenderMode({ islandType: 'plan', closed: true, hasBlock: true, done: false })).toBe('block')
   })
 })

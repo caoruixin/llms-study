@@ -53,6 +53,49 @@ describe('normalizePdf', () => {
     ])
   })
 
+  it('表格数字行 / 公式碎片 / 轴标签不再被误判为编号标题（QA 实测垃圾样例）', () => {
+    // attention.pdf Table 3 的数字行、公式碎片与图表轴标签：全都能匹配「数字起头」的编号标题形状
+    const junk = ['1 512 512 5.29 24.9', '1 h', '1 2', '1 n 1 n i i', '1 2 4 8 16', '2 0.1 0.3']
+    for (const text of junk) {
+      const blocks = normalizePdf([linesPage(1, [text, 'Body text that follows the junk line'])])
+      expect(blocks.filter((b) => b.kind === 'heading').map((b) => b.text)).toEqual([])
+    }
+  })
+
+  it('真实编号标题仍被识别（中英文短章节名不被守卫误伤）', () => {
+    const cases: [string, number][] = [
+      ['3.2 Attention', 2],
+      ['5 Training', 1],
+      ['2 方法', 1],
+      ['4.1 BLEU on WMT 2014 EN-DE', 2],
+    ]
+    for (const [text, level] of cases) {
+      const blocks = normalizePdf([linesPage(1, [text, 'Body text under the section heading'])])
+      expect(blocks[0]).toMatchObject({ kind: 'heading', level, text })
+    }
+  })
+
+  it('垃圾行不再污染后续块的 anchor.section（已读章节 / § 标签的上游修复）', () => {
+    const blocks = normalizePdf([
+      linesPage(1, ['3.2 Attention', '1 512 512 5.29 24.9', 'The attention layer is described here.']),
+    ])
+    // 数字行退回普通段落，section 仍停留在真正的标题上
+    expect(blocks.filter((b) => b.kind === 'heading')).toHaveLength(1)
+    expect(blocks.every((b) => b.anchor.section === '3.2 Attention')).toBe(true)
+  })
+
+  it('大字号短行标题同样要求实词密度：纯数字行不因字号大而成为标题', () => {
+    const page: PdfPageText = {
+      page: 1,
+      items: [
+        item('body line one of the paragraph', 72, 700, 10),
+        item('12 3 45', 72, 660, 14), // 字号更大但没有实词
+        item('body line two of the paragraph', 72, 640, 10),
+      ],
+    }
+    expect(normalizePdf([page]).filter((b) => b.kind === 'heading')).toEqual([])
+  })
+
   it('关键词标题（Abstract / 参考文献）被识别，并写进后续块的 anchor.section', () => {
     const blocks = normalizePdf([linesPage(1, ['Abstract', 'We propose a new method here'])])
     expect(blocks[0]).toMatchObject({ kind: 'heading', level: 1, text: 'Abstract' })
