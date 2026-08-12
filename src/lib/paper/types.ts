@@ -149,22 +149,49 @@ export interface PaperBrief {
   data: unknown
 }
 
-/** Phase 3 落地：某篇论文的持久化陪读会话 */
+/** Phase 3 落地：某篇论文的持久化陪读会话（Phase 3 加法字段，schema 不动） */
 export interface CopilotSession {
   id: string
   paperId: string
   title: string
   createdAt: number
   updatedAt: number
+  /** 滚动摘要（memo 岛折叠产物） */
+  rollingSummary?: string
+  /** 距上次 memo 折叠的轮数 */
+  turnsSinceMemo?: number
+  /** 会话累计成本（美元） */
+  costTotal?: number
 }
 
-/** Phase 3 落地：会话消息（含结构化交互块） */
+/** 与 retrieval.CiteMapEntry 结构一致的可序列化形态（types.ts 不 import retrieval，避免环） */
+export interface StoredCiteEntry {
+  alias: string
+  chunkId: string
+  anchor: SourceAnchor
+  page?: number
+  section?: string
+}
+
+/** Phase 3 落地：会话消息。存原始流文本 + finalize 元数据（单一真相），渲染时重跑线协议解析 */
 export interface CopilotMessage {
   id: string
   sessionId: string
   role: 'user' | 'assistant'
   content: string
   createdAt: number
+  /** assistant：本轮引用白名单（CiteBadge 点击跳转用） */
+  citeMap?: StoredCiteEntry[]
+  /** assistant：引用体检结果（alias → 徽章档位） */
+  auditBadges?: Record<string, 'ok' | 'weak' | 'missing'>
+  /** Stop / 断流：半截保留并标记「响应中断」 */
+  interrupted?: boolean
+  /** 证据不足终态 */
+  insufficient?: boolean
+  /** 本轮 usage（不含正文） */
+  usage?: { provider: string; model: string; inputTokens: number; outputTokens: number; estimated: boolean; cost: number }
+  /** user：来自选区快捷操作时的标签（解释这段/更简单/…） */
+  actionLabel?: string
 }
 
 /** Phase 4 落地：按概念的掌握度画像 */
@@ -206,4 +233,8 @@ export interface ModelUsageRecord {
   estimated: boolean
   cost: number
   ts: number
+  /** Phase 3 加法：调用结局 / 时延 / 任务标签（不含内容） */
+  status?: 'ok' | 'aborted' | 'error'
+  latencyMs?: number
+  task?: string
 }

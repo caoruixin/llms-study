@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { PaperRecord, SourceAnchor } from '../../lib/paper/types'
+import type { BriefData } from '../../lib/paper/briefPipeline'
 
 /**
  * 论文陪读专属的轻量 UI 状态。
@@ -41,6 +42,20 @@ export interface PendingAsk {
   at: number
 }
 
+/** 论文地图生成进度（CopilotPanel 写入，OutlinePane 展示；跨栏共享走 store） */
+export interface BriefUiState {
+  paperId: string
+  status: 'running' | 'done' | 'error'
+  done: number
+  total: number
+  error?: string
+}
+
+export interface BriefDataState {
+  paperId: string
+  data: BriefData
+}
+
 interface PaperUiState {
   sortBy: PaperSortBy
   filter: PaperFilter
@@ -48,8 +63,12 @@ interface PaperUiState {
   outlineOpen: boolean
   pendingDuplicate: PendingDuplicate | null
   confirmDeleteId: string | null
-  /** 待提问队列：Phase 3 接入 Copilot 后由会话消费，这里只负责暂存 */
+  /** 待提问队列：由 Copilot 会话消费 */
   pendingAsks: PendingAsk[]
+  briefUi: BriefUiState | null
+  briefData: BriefDataState | null
+  /** OutlinePane 的「生成论文地图」入口 → CopilotPanel 监听 tick 发起管线（面板收起时先展开） */
+  briefRequestTick: number
   setSortBy: (sortBy: PaperSortBy) => void
   setFilter: (filter: PaperFilter) => void
   setCopilotOpen: (copilotOpen: boolean) => void
@@ -59,6 +78,9 @@ interface PaperUiState {
   addPendingAsk: (ask: Omit<PendingAsk, 'id' | 'at'>) => void
   removePendingAsk: (id: string) => void
   clearPendingAsks: () => void
+  setBriefUi: (briefUi: BriefUiState | null) => void
+  setBriefData: (briefData: BriefDataState | null) => void
+  requestBrief: () => void
 }
 
 const askId = (): string =>
@@ -74,6 +96,9 @@ export const usePaperUi = create<PaperUiState>()((set) => ({
   pendingDuplicate: null,
   confirmDeleteId: null,
   pendingAsks: [],
+  briefUi: null,
+  briefData: null,
+  briefRequestTick: 0,
   setSortBy: (sortBy) => set({ sortBy }),
   setFilter: (filter) => set({ filter }),
   setCopilotOpen: (copilotOpen) => set({ copilotOpen }),
@@ -84,4 +109,7 @@ export const usePaperUi = create<PaperUiState>()((set) => ({
     set((s) => ({ pendingAsks: [...s.pendingAsks, { ...ask, id: askId(), at: Date.now() }] })),
   removePendingAsk: (id) => set((s) => ({ pendingAsks: s.pendingAsks.filter((a) => a.id !== id) })),
   clearPendingAsks: () => set({ pendingAsks: [] }),
+  setBriefUi: (briefUi) => set({ briefUi }),
+  setBriefData: (briefData) => set({ briefData }),
+  requestBrief: () => set((s) => ({ briefRequestTick: s.briefRequestTick + 1, copilotOpen: true })),
 }))

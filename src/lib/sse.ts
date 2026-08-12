@@ -63,6 +63,37 @@ export function extractStreamDelta(data: unknown): string | null {
   return typeof content === 'string' && content.length > 0 ? content : null
 }
 
+export interface StreamUsage {
+  inputTokens: number
+  outputTokens: number
+}
+
+function readUsageShape(usage: unknown): StreamUsage | null {
+  if (typeof usage !== 'object' || usage === null) return null
+  const prompt = (usage as { prompt_tokens?: unknown }).prompt_tokens
+  const completion = (usage as { completion_tokens?: unknown }).completion_tokens
+  if (typeof prompt !== 'number' || typeof completion !== 'number') return null
+  if (!Number.isFinite(prompt) || !Number.isFinite(completion)) return null
+  return { inputTokens: prompt, outputTokens: completion }
+}
+
+/**
+ * 流式 usage 尾帧（Phase 3 加法）。两家形状归一：
+ * - DeepSeek（OpenAI stream_options 形）：choices 为空数组/缺失 + 顶层 usage；
+ * - Kimi/Moonshot：末帧 choices[0] 内带 usage（finish_reason 帧）。
+ * 均归一为 { inputTokens, outputTokens }；无 usage 或字段非法 → null。
+ */
+export function extractStreamUsage(data: unknown): StreamUsage | null {
+  if (typeof data !== 'object' || data === null) return null
+  const top = readUsageShape((data as { usage?: unknown }).usage)
+  if (top) return top
+  const choices = (data as { choices?: unknown }).choices
+  if (!Array.isArray(choices) || choices.length === 0) return null
+  const first = choices[0]
+  if (typeof first !== 'object' || first === null) return null
+  return readUsageShape((first as { usage?: unknown }).usage)
+}
+
 // 流中错误帧：{"error":{"message":...}} 或 {"error":"..."}
 export function extractStreamError(data: unknown): string | null {
   if (typeof data !== 'object' || data === null) return null

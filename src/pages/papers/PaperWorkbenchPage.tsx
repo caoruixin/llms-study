@@ -1,17 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import BlockReader from '../../components/papers/BlockReader'
-import CopilotPanel from '../../components/papers/CopilotPanel'
 import OutlinePane, { buildOutline, type OutlineTab } from '../../components/papers/OutlinePane'
 import PdfViewer from '../../components/papers/PdfViewer'
 import SelectionActions from '../../components/papers/SelectionActions'
 import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
 import { buildAnchorContext, resolveAnchor, type ReaderMode, type ScrollTarget } from '../../lib/paper/anchors'
+import { briefCacheKey, type BriefData } from '../../lib/paper/briefPipeline'
 import { buildPaperIndex } from '../../lib/paper/ingest'
 import { createRetrievalService, type SearchHit } from '../../lib/paper/retrieval'
+import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
 import { createPaperRepository } from '../../lib/paper/repo/paperRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
+import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
 import type { PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import { MAX_ASK_TEXT, PAPER_ASK_ACTIONS, usePaperUi, type PaperAskAction } from './paperUiStore'
 
@@ -25,6 +27,9 @@ import { MAX_ASK_TEXT, PAPER_ASK_ACTIONS, usePaperUi, type PaperAskAction } from
 /** 阅读进度写库节流 */
 const PROGRESS_DEBOUNCE_MS = 600
 const TOAST_MS = 2600
+
+/** Copilot 面板懒加载（§4.7）：react-markdown + KaTeX（JS/CSS/字体）只在首次展开面板时拉取 */
+const CopilotPanel = lazy(() => import('../../components/papers/CopilotPanel'))
 
 const MODE_TABS = [
   { id: 'original', label: '原版 PDF' },
@@ -57,6 +62,7 @@ export default function PaperWorkbenchPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const repo = useMemo(() => createPaperRepository(getPaperDb()), [])
+  const copilotRepo = useMemo(() => createCopilotRepository(getPaperDb()), [])
   const retrieval = useMemo(() => createRetrievalService({ loadChunks: (id) => repo.getChunks(id) }), [repo])
 
   const [paper, setPaper] = useState<PaperRecord | null>(null)
@@ -87,11 +93,16 @@ export default function PaperWorkbenchPage() {
     copilotOpen,
     outlineOpen,
     pendingAsks,
+    briefUi,
+    briefData,
     setCopilotOpen,
     setOutlineOpen,
     addPendingAsk,
     removePendingAsk,
     clearPendingAsks,
+    setBriefData,
+    setBriefUi,
+    requestBrief,
   } = usePaperUi()
 
   // ---------------------------------------------------------------------
@@ -128,6 +139,38 @@ export default function PaperWorkbenchPage() {
   useEffect(() => {
     if (searchParams.get('copilot') === 'open') setCopilotOpen(true)
   }, [searchParams, setCopilotOpen])
+
+  // 切论文时清掉上一篇的论文地图状态，再从 Dexie 载入本篇缓存
+  useEffect(() => {
+    if (!paperId) return
+    setBriefData(null)
+    setBriefUi(null)
+  }, [paperId, setBriefData, setBriefUi])
+
+  useEffect(() => {
+    if (!paper || paper.id !== paperId) return
+    let alive = true
+    void copilotRepo
+      .getBrief(paper.id, briefCacheKey(paper.sha256, DEEPSEEK_V4_PRO.provider, DEEPSEEK_V4_PRO.model))
+      .then((row) => {
+        if (alive && row) setBriefData({ paperId: paper.id, data: row.data as BriefData })
+      })
+      .catch(() => undefined)
+    return () => {
+      alive = false
+    }
+  }, [paper, paperId, copilotRepo, setBriefData])
+
+  const handleToggleSensitive = useCallback(
+    (sensitive: boolean) => {
+      if (!paperId) return
+      void copilotRepo
+        .setSensitive(paperId, sensitive)
+        .then(() => setPaper((p) => (p && p.id === paperId ? { ...p, sensitive } : p)))
+        .catch(() => undefined)
+    },
+    [copilotRepo, paperId],
+  )
 
   // 原版模式按需取原始字节（列表页不会因此把文件读进内存）
   useEffect(() => {
@@ -319,7 +362,7 @@ export default function PaperWorkbenchPage() {
         anchor: anchor ?? { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
       })
       setCopilotOpen(true)
-      setToast('已加入提问（Copilot Phase 3 接入）')
+      setToast('已加入 Copilot 待提问，在右栏点击即可发起')
     },
     [addPendingAsk, paperId, setCopilotOpen],
   )
@@ -422,17 +465,28 @@ export default function PaperWorkbenchPage() {
       searchHits={searchHits}
       searchBusy={searchBusy}
       searchRan={searchRan}
+      brief={briefData && briefData.paperId === paperId ? briefData.data : null}
+      briefUi={briefUi && briefUi.paperId === paperId ? briefUi : null}
+      onGenerateBrief={requestBrief}
     />
   )
 
   const copilotPane = (
-    <CopilotPanel
-      asks={pendingAsks.filter((a) => a.paperId === paperId)}
-      onRemove={removePendingAsk}
-      onClear={clearPendingAsks}
-      onJump={jumpToAnchor}
-      onClose={() => setCopilotOpen(false)}
-    />
+    <Suspense fallback={<p className="text-sm text-dim">正在加载 Copilot…</p>}>
+      <CopilotPanel
+        paper={paper}
+        blocks={blocks}
+        retrieval={retrieval}
+        position={position}
+        sectionTitles={outline.map((o) => o.text)}
+        asks={pendingAsks.filter((a) => a.paperId === paperId)}
+        onRemoveAsk={removePendingAsk}
+        onClearAsks={clearPendingAsks}
+        onJumpAnchor={jumpToAnchor}
+        onClose={() => setCopilotOpen(false)}
+        onToggleSensitive={handleToggleSensitive}
+      />
+    </Suspense>
   )
 
   const showOutlineColumn = isDesktop && outlineOpen
