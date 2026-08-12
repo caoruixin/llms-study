@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import SegmentedTabs from '../components/ui/SegmentedTabs'
 import TransformerDiagram from '../components/TransformerDiagram'
 import ModelEvolution from '../components/ModelEvolution'
@@ -16,7 +16,12 @@ const TABS = [
 type TabId = (typeof TABS)[number]['id']
 
 export default function ArchitecturePage() {
-  const [tab, setTab] = useState<TabId>('transformer')
+  // ?tab= 仅作初值（如 /kda 页返回链接落在「注意力演进」）；切 tab 不写回 URL，保持现有轻量行为
+  const [params] = useSearchParams()
+  const [tab, setTab] = useState<TabId>(() => {
+    const q = params.get('tab')
+    return TABS.some((t) => t.id === q) ? (q as TabId) : 'transformer'
+  })
 
   return (
     <div className="space-y-5">

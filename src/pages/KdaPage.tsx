@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import SegmentedTabs from '../components/ui/SegmentedTabs'
 import KdaDerivation from '../components/kda/KdaDerivation'
 import KdaLab from '../components/kda/KdaLab'
@@ -20,6 +21,10 @@ export default function KdaPage() {
 
   return (
     <div className="space-y-5">
+      {/* 不在顶部导航（入口收纳在注意力演进表），自带返回路径避免迷路 */}
+      <Link to="/architecture?tab=attention" className="inline-block text-sm text-dim hover:text-fg hover:underline">
+        ← 架构演进 · 注意力演进
+      </Link>
       <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
 
       {/* 一句话主线（四 tab 常驻） */}
