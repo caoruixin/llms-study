@@ -92,6 +92,8 @@ export interface TurnState {
   insufficient: boolean
   /** Stop / 中途断流：半截保留并标记「响应中断」 */
   interrupted: boolean
+  /** 深度轮空流后已降级为 thinking off 重试成功（gateway 专项，§5.5） */
+  thinkingDowngraded: boolean
   error: TurnError | null
 }
 
@@ -108,6 +110,7 @@ export const initialTurnState: TurnState = {
   usage: null,
   insufficient: false,
   interrupted: false,
+  thinkingDowngraded: false,
   error: null,
 }
 
@@ -118,7 +121,7 @@ export type TurnEvent =
   | { type: 'reasoning' }
   | { type: 'wait'; ms: number }
   | { type: 'retry' }
-  | { type: 'stream-end'; aborted: boolean; usage: GatewayUsage | null }
+  | { type: 'stream-end'; aborted: boolean; usage: GatewayUsage | null; thinkingDowngraded?: boolean }
   | { type: 'evidence-retry'; citeMap: CiteMapEntry[]; chunks: RetrievedChunk[] }
   | { type: 'finalized'; audit: CitationAudit | null; insufficient: boolean }
   | { type: 'failed'; error: TurnError }
@@ -152,6 +155,7 @@ export function turnReducer(state: TurnState, ev: TurnEvent): TurnState {
         waitMs: null,
         usage: ev.usage ?? state.usage,
         interrupted: state.interrupted || ev.aborted,
+        thinkingDowngraded: state.thinkingDowngraded || (ev.thinkingDowngraded ?? false),
       }
     case 'evidence-retry':
       if (state.phase !== 'finalizing') return state
@@ -336,7 +340,7 @@ export function createTurnRunner(deps: TurnRunnerDeps): TurnRunner {
 
       let result = await streamOnce(retrieval.chunks, [])
       stopped = result.aborted
-      dispatch({ type: 'stream-end', aborted: result.aborted, usage: result })
+      dispatch({ type: 'stream-end', aborted: result.aborted, usage: result, thinkingDowngraded: result.thinkingDowngraded })
 
       // finalize：解析 → evidence 岛自报不足 → 扩检索重试一次（§6.1 唯一自动二次调用之一）
       let citeMap = retrieval.citeMapEntries
@@ -357,7 +361,7 @@ export function createTurnRunner(deps: TurnRunnerDeps): TurnRunner {
         chunks = wider.chunks
         result = await streamOnce(chunks, [EVIDENCE_RETRY_DIRECTIVE])
         stopped = stopped || result.aborted
-        dispatch({ type: 'stream-end', aborted: result.aborted, usage: result })
+        dispatch({ type: 'stream-end', aborted: result.aborted, usage: result, thinkingDowngraded: result.thinkingDowngraded })
         segs = splitCopilotStream(state.text, { open: false })
         insufficient = findIsland<EvidenceIsland>(segs, 'evidence')?.status === 'insufficient'
       }

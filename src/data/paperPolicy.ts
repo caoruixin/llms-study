@@ -67,7 +67,7 @@ export interface PaperCallSpec {
   cap: ModelCapability
   thinking: PaperThinking
   responseFormat?: { type: 'json_object' } | { type: 'json_schema'; name: string; schema: object }
-  maxOutputTokens: number // 1500 普通 / 3000 深度 / brief 单配
+  maxOutputTokens: number // 1500 普通 / 6000 深度（推理+正文共享预算）/ brief 单配
   /** 仅 sampling=tunable 的模型会真正发送；fixed（Kimi）一律省略 */
   temperature?: number
 }
@@ -88,7 +88,10 @@ export const PAPER_TASKS = {
   deep: {
     cap: DEEPSEEK_V4_PRO,
     thinking: 'on-high',
-    maxOutputTokens: 3000,
+    // DeepSeek thinking 模式下 max_tokens 是推理+正文的共享预算：3000 时硬题（跨章节综合/算法拆解）
+    // 推理可独占全额导致正文空流（评测实测 vllm-m5 6/6、attn-c-cross 5/6 失败，asOf 2026-08-13）。
+    // 6000 最坏成本 24K in + 6K out ≈ $0.0157，仍低于 $0.02 确认阈值（§5.4）。
+    maxOutputTokens: 6000,
     temperature: 0.4,
     inputBudgetTokens: 24_000,
   },

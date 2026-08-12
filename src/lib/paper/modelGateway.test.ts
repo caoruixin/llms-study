@@ -162,6 +162,45 @@ describe('modelGateway · streamPaperChat', () => {
     expect(calls).toHaveLength(2)
   })
 
+  // 深度轮空流专项：DeepSeek thinking 模式下推理可耗尽整个 max_tokens 预算，
+  // 正文零 token 即「流式返回为空」；同参重试必然复现（评测 11/12 实证），须降级 thinking off 重试。
+  it('deep 空流：降级 thinking off 重试一次，标记 thinkingDowngraded', async () => {
+    const { calls } = stubFetch((_c, i) => (i === 0 ? sseResponse([DONE]) : sseResponse([dsContent('答案'), DONE])))
+    const gw = makeGateway()
+    const reasons: string[] = []
+    const r = await gw.gateway.streamPaperChat(
+      streamReq(gw, { spec: PAPER_TASKS.deep, onRetry: (why: string) => reasons.push(why) }),
+    )
+    expect(r.text).toBe('答案')
+    expect(r.thinkingDowngraded).toBe(true)
+    expect(reasons).toEqual(['thinking-downgrade'])
+    expect(calls).toHaveLength(2)
+    expect(calls[0].body.thinking).toEqual({ type: 'enabled' })
+    expect(calls[0].body.reasoning_effort).toBe('high')
+    expect(calls[1].body.thinking).toEqual({ type: 'disabled' }) // 降级：关思考
+    expect(calls[1].body.reasoning_effort).toBeUndefined()
+    expect(calls[1].body.max_tokens).toBe(calls[0].body.max_tokens) // 输出预算不变
+  })
+
+  it('deep 空流两次：降级重试仍空 → 抛 bad-response，不无限重试', async () => {
+    const { calls } = stubFetch(() => sseResponse([DONE]))
+    const gw = makeGateway()
+    await expect(gw.gateway.streamPaperChat(streamReq(gw, { spec: PAPER_TASKS.deep }))).rejects.toMatchObject({
+      kind: 'bad-response',
+    })
+    expect(calls).toHaveLength(2)
+  })
+
+  it('chat（thinking 本就 off）空流：同参重试，不标记降级', async () => {
+    const { calls } = stubFetch((_c, i) => (i === 0 ? sseResponse([DONE]) : sseResponse([dsContent('ok'), DONE])))
+    const gw = makeGateway()
+    const r = await gw.gateway.streamPaperChat(streamReq(gw))
+    expect(r.text).toBe('ok')
+    expect(r.thinkingDowngraded).toBeUndefined()
+    expect(calls).toHaveLength(2)
+    expect(calls[1].body.thinking).toEqual(calls[0].body.thinking)
+  })
+
   it('流中错误但已有半截正文：不重试，半截经 onDelta 保留在调用方', async () => {
     const { calls } = stubFetch(() => sseResponse([dsContent('半截'), errorFrame('炸了')]))
     const gw = makeGateway()

@@ -72,7 +72,12 @@ export interface StreamPaperChatRequest {
   onRetry?: (reason: string) => void
 }
 
-export type StreamPaperChatResult = GatewayUsage & { text: string; aborted: boolean }
+export type StreamPaperChatResult = GatewayUsage & {
+  text: string
+  aborted: boolean
+  /** 深度轮空流（推理耗尽输出预算）后已降级为 thinking off 重试成功：UI 标注「快速模式」 */
+  thinkingDowngraded?: boolean
+}
 
 export interface CompletePaperJsonRequest {
   spec: PaperCallSpec
@@ -233,13 +238,14 @@ export function createModelGateway(deps: GatewayDeps): ModelGateway {
 
     const startedAt = now()
     let text = ''
+    let thinkingDowngraded = false
 
-    const attempt = async () => {
+    const attempt = async (s: PaperCallSpec) => {
       await takeToken(req.onWait)
       if (req.signal?.aborted) return { text, aborted: true, usage: null, jsonFallback: false }
       return runPaperStream({
-        url: spec.cap.proxyPrefix + spec.cap.chatPath,
-        body: buildChatBody(spec, req.messages, true),
+        url: s.cap.proxyPrefix + s.cap.chatPath,
+        body: buildChatBody(s, req.messages, true),
         signal: req.signal,
         firstByteTimeoutMs: deps.firstByteTimeoutMs,
         idleTimeoutMs: deps.idleTimeoutMs,
@@ -251,19 +257,39 @@ export function createModelGateway(deps: GatewayDeps): ModelGateway {
       })
     }
 
+    // 深度轮空流专项（评测实测）：thinking on-high 时推理可耗尽整个 max_tokens 预算，
+    // 正文一个 token 未出即「流式返回为空」。同参重试必然复现，改为关思考降级重试一次，
+    // 保住本轮可用性；UI 依据 thinkingDowngraded 标注「快速模式」。
+    const emptyStreamNeedsDowngrade = (e: unknown): boolean =>
+      e instanceof LlmError &&
+      e.kind === 'bad-response' &&
+      e.message.includes('流式返回为空') &&
+      spec.thinking === 'on-high' &&
+      text === ''
+
     let result: Awaited<ReturnType<typeof attempt>>
     try {
       try {
-        result = await attempt()
+        result = await attempt(spec)
       } catch (e) {
-        const delay = retryDelayFor(e, text)
-        if (delay === null) throw e
-        req.onRetry?.(e instanceof LlmError ? e.kind : 'error')
-        await sleep(delay)
-        if (req.signal?.aborted) {
-          result = { text, aborted: true, usage: null, jsonFallback: false }
+        if (emptyStreamNeedsDowngrade(e)) {
+          req.onRetry?.('thinking-downgrade')
+          if (req.signal?.aborted) {
+            result = { text, aborted: true, usage: null, jsonFallback: false }
+          } else {
+            result = await attempt({ ...spec, thinking: 'off' })
+            thinkingDowngraded = true
+          }
         } else {
-          result = await attempt()
+          const delay = retryDelayFor(e, text)
+          if (delay === null) throw e
+          req.onRetry?.(e instanceof LlmError ? e.kind : 'error')
+          await sleep(delay)
+          if (req.signal?.aborted) {
+            result = { text, aborted: true, usage: null, jsonFallback: false }
+          } else {
+            result = await attempt(spec)
+          }
         }
       }
     } catch (e) {
@@ -287,7 +313,7 @@ export function createModelGateway(deps: GatewayDeps): ModelGateway {
       latencyMs: now() - startedAt,
       task: req.task,
     })
-    return { ...usage, text: result.text, aborted: result.aborted }
+    return { ...usage, text: result.text, aborted: result.aborted, ...(thinkingDowngraded ? { thinkingDowngraded } : {}) }
   }
 
   // -------------------------------------------------------------------------

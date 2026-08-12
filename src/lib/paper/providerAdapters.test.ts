@@ -29,7 +29,7 @@ describe('buildChatBody · DeepSeek 契约（逐字段）', () => {
     const body = buildChatBody(PAPER_TASKS.deep, messages, true)
     expect(body.thinking).toEqual({ type: 'enabled' })
     expect(body.reasoning_effort).toBe('high')
-    expect(body.max_tokens).toBe(3000)
+    expect(body.max_tokens).toBe(6000) // 推理+正文共享预算：3000 时硬题推理独占全额致正文空流（评测实证）
     expect(body.stream_options).toEqual({ include_usage: true })
   })
 

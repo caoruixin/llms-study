@@ -186,6 +186,8 @@ export interface CopilotMessage {
   auditBadges?: Record<string, 'ok' | 'weak' | 'missing'>
   /** Stop / 断流：半截保留并标记「响应中断」 */
   interrupted?: boolean
+  /** 深度轮空流后降级为快速模式重试成功（gateway 专项） */
+  thinkingDowngraded?: boolean
   /** 证据不足终态 */
   insufficient?: boolean
   /** 本轮 usage（不含正文） */

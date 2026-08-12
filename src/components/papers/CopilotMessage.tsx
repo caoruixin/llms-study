@@ -37,6 +37,8 @@ interface Props extends BlockInteractions {
   citeMap: readonly StoredCiteEntry[]
   badges: Readonly<Record<string, CiteLevel>> | null
   interrupted?: boolean
+  /** 深度推理耗尽输出预算，本轮已降级为快速模式重答 */
+  thinkingDowngraded?: boolean
   insufficient?: boolean
   onJumpCite: (entry: StoredCiteEntry) => void
 }
@@ -265,6 +267,7 @@ export default function CopilotMessage({
   citeMap,
   badges,
   interrupted,
+  thinkingDowngraded,
   insufficient,
   onJumpCite,
   onEvidence,
@@ -336,6 +339,9 @@ export default function CopilotMessage({
         </p>
       )}
       {interrupted && <p className="text-[0.7rem] text-warn">响应中断（已保留部分内容）</p>}
+      {thinkingDowngraded && (
+        <p className="text-[0.7rem] text-dim">深度推理超出输出预算，本轮已自动降级为快速模式重答</p>
+      )}
       {done && (weakCount > 0 || missingCount > 0) && (
         <p className="text-[0.7rem] text-dim">
           引用体检：

@@ -469,6 +469,7 @@ export default function CopilotPanel({
         citeMap: st.citeMap as StoredCiteEntry[],
         auditBadges: st.audit?.badges,
         interrupted: st.interrupted || st.phase === 'error',
+        thinkingDowngraded: st.thinkingDowngraded || undefined,
         insufficient: st.insufficient,
         sourceLabel: params.sourceLabel,
         usage: st.usage
@@ -1167,6 +1168,7 @@ export default function CopilotPanel({
                 citeMap={m.citeMap ?? []}
                 badges={m.auditBadges ?? null}
                 interrupted={m.interrupted}
+                thinkingDowngraded={m.thinkingDowngraded}
                 insufficient={m.insufficient}
                 onJumpCite={jumpEntry}
                 onEvidence={recordEvidence}
