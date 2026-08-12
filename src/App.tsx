@@ -1,3 +1,4 @@
+import { Suspense, lazy } from 'react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import ArchitecturePage from './pages/ArchitecturePage'
 import InferencePage from './pages/InferencePage'
@@ -8,6 +9,26 @@ import SettingsPage from './pages/SettingsPage'
 import SelectionAsk from './components/ask/SelectionAsk'
 import ErrorBoundary from './components/ErrorBoundary'
 import { NAV } from './nav'
+
+// 论文陪读 build-time flag：与 nav.ts 同一开关，一处关闭即无导航项也无路由（不留死链接）。
+// 关键写法：lazy(...) 必须包在三元里而不是无条件写在模块顶层——flag-off 时 PAPER_ENABLED 被 Vite
+// 内联为 false，整支三元被 Rollup 剪除，动态 import 不发射 chunk；若无条件调用 lazy()，Rollup 会
+// 保守认为该调用有副作用而保留动态 import，flag-off 产物就会多出一份 paper chunk。
+const PAPER_ENABLED = import.meta.env.VITE_ENABLE_PAPER_COPILOT === '1'
+const PapersPage = PAPER_ENABLED ? lazy(() => import('./pages/papers/PapersPage')) : null
+const PaperWorkbenchPage = PAPER_ENABLED ? lazy(() => import('./pages/papers/PaperWorkbenchPage')) : null
+
+// 懒加载路由的 Suspense fallback：骨架卡片，避免切页瞬间的空白抖动
+function PageLoading() {
+  return (
+    <div className="rounded-xl border border-line bg-panel shadow-sm p-6">
+      <div className="mb-3 h-5 w-40 animate-pulse rounded bg-panel-2" />
+      <div className="mb-2 h-4 w-full animate-pulse rounded bg-panel-2" />
+      <div className="h-4 w-2/3 animate-pulse rounded bg-panel-2" />
+      <p className="mt-4 text-sm text-dim">正在加载模块…</p>
+    </div>
+  )
+}
 
 export default function App() {
   return (
@@ -20,7 +41,7 @@ export default function App() {
               L
             </span>
             <span className="shrink-0 text-lg font-bold text-fg">LLM Infra Studio</span>
-            <span className="truncate text-xs text-dim">面试备战台 · Token & 算力售前</span>
+            <span className="truncate text-xs text-dim">AI 学习与实践工作台</span>
           </div>
           <nav className="-mx-1 flex min-w-0 max-w-full flex-1 gap-1 overflow-x-auto px-1">
             {NAV.map((n) => (
@@ -50,6 +71,31 @@ export default function App() {
           <Route path="/agent" element={<ErrorBoundary><AgentPage /></ErrorBoundary>} />
           <Route path="/kda" element={<ErrorBoundary><KdaPage /></ErrorBoundary>} />
           <Route path="/interview" element={<ErrorBoundary><InterviewPage /></ErrorBoundary>} />
+          {/* 懒加载页：Suspense 嵌在 ErrorBoundary 内，chunk 加载失败同样只废该页 */}
+          {PapersPage && (
+            <Route
+              path="/papers"
+              element={
+                <ErrorBoundary>
+                  <Suspense fallback={<PageLoading />}>
+                    <PapersPage />
+                  </Suspense>
+                </ErrorBoundary>
+              }
+            />
+          )}
+          {PaperWorkbenchPage && (
+            <Route
+              path="/papers/:paperId"
+              element={
+                <ErrorBoundary>
+                  <Suspense fallback={<PageLoading />}>
+                    <PaperWorkbenchPage />
+                  </Suspense>
+                </ErrorBoundary>
+              }
+            />
+          )}
           <Route path="/settings" element={<ErrorBoundary><SettingsPage /></ErrorBoundary>} />
         </Routes>
       </main>
