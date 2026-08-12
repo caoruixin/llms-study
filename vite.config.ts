@@ -23,7 +23,11 @@ function paperCopilotOffPlugin(): Plugin {
     apply: 'build',
     enforce: 'pre',
     resolveId(source) {
-      return source.includes('/pages/papers/') || source.includes('/lib/paper/') ? PAPER_VIRTUAL_ID : null
+      return source.includes('/pages/papers/') ||
+        source.includes('/lib/paper/') ||
+        source.includes('/components/papers/')
+        ? PAPER_VIRTUAL_ID
+        : null
     },
     load(id) {
       return id === PAPER_VIRTUAL_ID ? 'export default {}' : null

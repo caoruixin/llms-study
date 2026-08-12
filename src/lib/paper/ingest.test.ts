@@ -241,6 +241,19 @@ describe('importPaper', () => {
     expect(blocks.map((b) => b.text)).toEqual(['第一段', '第二段'])
   })
 
+  it('索引阶段落地：ready 后 chunks 表有内容且带 BM25 词频表', async () => {
+    const repo = freshRepo()
+    const out = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = out.kind === 'ready' ? out.paper.id : ''
+
+    const chunks = await repo.getChunks(paperId)
+    expect(chunks).toHaveLength(1)
+    expect(chunks[0]).toMatchObject({ paperId, order: 0, blockStart: 0, blockEnd: 1 })
+    expect(chunks[0].text).toContain('第一段')
+    expect(chunks[0].len).toBeGreaterThan(0)
+    expect(Object.keys(chunks[0].tf ?? {}).length).toBeGreaterThan(0)
+  })
+
   it('校验不通过的文件根本不写库（不留下永远打不开的记录）', async () => {
     const repo = freshRepo()
     const out = await importPaper(
@@ -329,6 +342,8 @@ describe('reingestPaper', () => {
     expect(after?.status).toBe('ready')
     expect(after?.failure).toBeUndefined()
     expect(await repo.getBlocks(paperId)).toHaveLength(2)
+    // 重试同样重建索引：不会留下与新正文对不上的旧 chunk
+    expect(await repo.getChunks(paperId)).toHaveLength(1)
   })
 
   it('论文已被删除 → 返回 failed 而不是抛错', async () => {

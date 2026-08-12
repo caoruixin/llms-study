@@ -101,6 +101,94 @@ describe('normalizePdf', () => {
     expect(blocks[1].text).toBe('A new paragraph after a blank line')
   })
 
+  it('双栏页：左右栏不再被拼成一行，而是按「先左栏后右栏」还原阅读序', () => {
+    // 版心 60..550：左栏 60..290，分栏槽 290..320，右栏 320..550
+    const rows = 8
+    const items: PdfTextItem[] = []
+    for (let i = 0; i < rows; i++) {
+      const y = 700 - i * 14
+      items.push(item(`left line ${i} of the first column here`, 60, y, 10, 230))
+      items.push(item(`right line ${i} of the second column here`, 320, y, 10, 230))
+    }
+    const text = normalizePdf([{ page: 1, items }])
+      .map((b) => b.text)
+      .join('\n')
+    const at = (s: string) => text.indexOf(s)
+
+    // 关键回归：同一 y 上的左右栏不得被拼进同一行——
+    // 修复前 "left line 0 …" 与 "right line 0 …" 会紧挨着出现
+    expect(text.slice(at('left line 0'), at('left line 1'))).not.toContain('right line')
+    expect(at('left line 0')).toBeLessThan(at('left line 7'))
+    expect(at('left line 7')).toBeLessThan(at('right line 0'))
+    expect(at('right line 0')).toBeLessThan(at('right line 7'))
+  })
+
+  it('双栏页的通栏标题不被拆开，且排在两栏正文之前', () => {
+    const rows = 8
+    const items: PdfTextItem[] = [
+      // 通栏标题：单个文本项横跨分栏槽
+      item('A Full Width Title Across Both Columns', 60, 730, 14, 490),
+    ]
+    for (let i = 0; i < rows; i++) {
+      const y = 700 - i * 14
+      items.push(item(`left body ${i} continues in this column`, 60, y, 10, 230))
+      items.push(item(`right body ${i} continues in this column`, 320, y, 10, 230))
+    }
+    const blocks = normalizePdf([{ page: 1, items }])
+    const texts = blocks.map((b) => b.text)
+    expect(texts[0]).toContain('A Full Width Title Across Both Columns')
+    expect(texts[0]).not.toContain('left body')
+    expect(texts.join('\n').indexOf('left body 0')).toBeLessThan(texts.join('\n').indexOf('right body 0'))
+  })
+
+  it('通栏元素把页面分成带：带内先左后右，带与带之间保持先后', () => {
+    const items: PdfTextItem[] = []
+    for (let i = 0; i < 5; i++) {
+      const y = 700 - i * 14
+      items.push(item(`upper left ${i} text of the column`, 60, y, 10, 230))
+      items.push(item(`upper right ${i} text of the column`, 320, y, 10, 230))
+    }
+    items.push(item('Figure 1: a full width caption spanning the page.', 60, 600, 10, 490))
+    for (let i = 0; i < 5; i++) {
+      const y = 560 - i * 14
+      items.push(item(`lower left ${i} text of the column`, 60, y, 10, 230))
+      items.push(item(`lower right ${i} text of the column`, 320, y, 10, 230))
+    }
+    const text = normalizePdf([{ page: 1, items }])
+      .map((b) => b.text)
+      .join('\n')
+    const at = (s: string) => text.indexOf(s)
+    expect(at('upper left 0')).toBeLessThan(at('upper right 0'))
+    expect(at('upper right 4')).toBeLessThan(at('Figure 1'))
+    expect(at('Figure 1')).toBeLessThan(at('lower left 0'))
+    expect(at('lower left 4')).toBeLessThan(at('lower right 0'))
+  })
+
+  it('单栏页不受双栏逻辑影响：居中短行不会被误判成两栏', () => {
+    const items: PdfTextItem[] = []
+    for (let i = 0; i < 8; i++) {
+      // 每行由两个文本项组成，词间空隙落在版心中部（但远小于分栏槽宽度）
+      const y = 700 - i * 14
+      items.push(item(`single column line ${i}`, 60, y, 10, 240))
+      items.push(item(`continues to the right edge`, 306, y, 10, 240))
+    }
+    const blocks = normalizePdf([{ page: 1, items }])
+    expect(blocks[0].text).toContain('single column line 0 continues to the right edge')
+  })
+
+  it('双栏跨栏续段：左栏末行未收句则与右栏首行并为同一段', () => {
+    const items: PdfTextItem[] = []
+    for (let i = 0; i < 6; i++) {
+      const y = 700 - i * 14
+      items.push(item(i === 5 ? 'the method consists of two stages which' : `left filler line ${i} of column one`, 60, y, 10, 230))
+      items.push(item(i === 0 ? 'are trained jointly.' : `right filler line ${i} of column two`, 320, y, 10, 230))
+    }
+    const text = normalizePdf([{ page: 1, items }])
+      .map((b) => b.text)
+      .join('\n')
+    expect(text).toContain('the method consists of two stages which are trained jointly.')
+  })
+
   it('块序号连续，且 anchor.blockIndex 与 index 一致', () => {
     const blocks = normalizePdf([linesPage(1, ['1 Introduction', 'Body A here.', '', '2 Method', 'Body B here.'])])
     blocks.forEach((b, i) => {

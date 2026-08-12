@@ -1,57 +1,55 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import BlockReader from '../../components/papers/BlockReader'
+import CopilotPanel from '../../components/papers/CopilotPanel'
+import OutlinePane, { buildOutline, type OutlineTab } from '../../components/papers/OutlinePane'
+import PdfViewer from '../../components/papers/PdfViewer'
+import SelectionActions from '../../components/papers/SelectionActions'
+import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
+import SegmentedTabs from '../../components/ui/SegmentedTabs'
+import { buildAnchorContext, resolveAnchor, type ReaderMode, type ScrollTarget } from '../../lib/paper/anchors'
+import { buildPaperIndex } from '../../lib/paper/ingest'
+import { createRetrievalService, type SearchHit } from '../../lib/paper/retrieval'
 import { createPaperRepository } from '../../lib/paper/repo/paperRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
-import type { PaperBlock, PaperRecord } from '../../lib/paper/types'
-import { usePaperUi } from './paperUiStore'
+import type { PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
+import { MAX_ASK_TEXT, PAPER_ASK_ACTIONS, usePaperUi, type PaperAskAction } from './paperUiStore'
 
 /**
- * 阅读工作台（Phase 1 简版）：规范化块只读预览 + 阅读位置持久化 + Copilot 折叠占位。
- * PDF 原版页面渲染、文字层选区、目录树、长文虚拟化与真正的三栏形态见 Phase 2；
- * Copilot 对话能力见 Phase 3。
+ * 阅读工作台（§3.3）：左栏目录/进度/搜索 · 中栏正文阅读器 · 右栏 Copilot（Phase 3 接入）。
+ *
+ * 响应式：桌面三栏（两侧可折叠）· 平板双栏 + 目录抽屉 · 手机单栏 + 目录抽屉 + Copilot 底部面板。
+ * PDF 提供「原版 PDF / 文本视图」双模式，DOCX 只有语义化视图；引用跳转与选区在两种视图都可用。
  */
 
-const BLOCKS_PER_PAGE = 40
-/** 阅读进度节流：翻页频繁时不必每次都写 IndexedDB */
+/** 阅读进度写库节流 */
 const PROGRESS_DEBOUNCE_MS = 600
+const TOAST_MS = 2600
 
-const COPILOT_CAPABILITIES = [
-  '论文地图：一句话结论、研究问题、核心贡献、方法管线、实验与局限',
-  '逐节精读与方法拆解，按你的掌握程度自动调整讲解层次',
-  '公式推导、算法步骤器、对比表与概念关系图',
-  '每条论文事实都带可点击回跳原文的引用，证据不足时明说不编造',
-  '选择题、闪卡与 Teach-back 复述，检查你是否真的理解了',
-]
+const MODE_TABS = [
+  { id: 'original', label: '原版 PDF' },
+  { id: 'text', label: '文本视图' },
+] as const satisfies readonly { readonly id: ReaderMode; readonly label: string }[]
 
-function BlockView({ block }: { block: PaperBlock }) {
-  switch (block.kind) {
-    case 'heading': {
-      const level = block.level ?? 2
-      const size = level <= 1 ? 'text-xl' : level === 2 ? 'text-lg' : 'text-base'
-      return <h3 className={`${size} mt-6 font-semibold text-fg first:mt-0`}>{block.text}</h3>
-    }
-    case 'list':
-      return (
-        <p className="flex gap-2 text-sm leading-relaxed text-fg">
-          <span className="shrink-0 text-dim">·</span>
-          <span>{block.text}</span>
-        </p>
-      )
-    case 'table':
-      return (
-        <pre className="overflow-x-auto rounded-lg border border-line bg-panel-2 p-3 text-xs leading-relaxed text-fg">
-          {block.text}
-        </pre>
-      )
-    case 'code':
-      return (
-        <pre className="overflow-x-auto rounded-lg border border-line bg-panel-2 p-3 font-mono text-xs leading-relaxed text-fg">
-          {block.text}
-        </pre>
-      )
-    default:
-      return <p className="text-sm leading-relaxed text-fg">{block.text}</p>
-  }
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query).matches : false,
+  )
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const mq = window.matchMedia(query)
+    const sync = () => setMatches(mq.matches)
+    sync()
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [query])
+  return matches
+}
+
+interface Position {
+  blockIndex: number
+  page?: number
+  section?: string
 }
 
 export default function PaperWorkbenchPage() {
@@ -59,20 +57,46 @@ export default function PaperWorkbenchPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const repo = useMemo(() => createPaperRepository(getPaperDb()), [])
+  const retrieval = useMemo(() => createRetrievalService({ loadChunks: (id) => repo.getChunks(id) }), [repo])
 
   const [paper, setPaper] = useState<PaperRecord | null>(null)
   const [blocks, setBlocks] = useState<PaperBlock[]>([])
   const [loading, setLoading] = useState(true)
-  const [pageIndex, setPageIndex] = useState(0)
-  // 记住「已经为哪一篇论文恢复过阅读位置」：SPA 内换论文时要重新恢复，同一篇内翻页则不覆盖
+  const [mode, setMode] = useState<ReaderMode>('text')
+  const [bytes, setBytes] = useState<ArrayBuffer | null>(null)
+  const [bytesError, setBytesError] = useState('')
+  const [position, setPosition] = useState<Position>({ blockIndex: 0 })
+  const [maxBlockIndex, setMaxBlockIndex] = useState(0)
+  const [toast, setToast] = useState('')
+  const [outlineTab, setOutlineTab] = useState<OutlineTab>('outline')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchHits, setSearchHits] = useState<SearchHit[]>([])
+  const [searchBusy, setSearchBusy] = useState(false)
+  const [searchRan, setSearchRan] = useState(false)
+
+  const readerRef = useRef<HTMLElement | null>(null)
   const restoredFor = useRef<string | null>(null)
+  const alignedKey = useRef('')
+  // 抽屉与桌面左栏是两件事：桌面左栏默认展开，小屏抽屉默认收起（否则一进页面就被目录盖住）
+  const [drawerOpen, setDrawerOpen] = useState(false)
 
-  const { copilotOpen, setCopilotOpen } = usePaperUi()
+  const isDesktop = useMediaQuery('(min-width: 1280px)')
+  const isTablet = useMediaQuery('(min-width: 768px)')
 
-  // 「启动 Copilot」入口带 ?copilot=open（HashRouter 下 query 在 hash 内，useSearchParams 正常工作）
-  useEffect(() => {
-    setCopilotOpen(searchParams.get('copilot') === 'open')
-  }, [searchParams, setCopilotOpen])
+  const {
+    copilotOpen,
+    outlineOpen,
+    pendingAsks,
+    setCopilotOpen,
+    setOutlineOpen,
+    addPendingAsk,
+    removePendingAsk,
+    clearPendingAsks,
+  } = usePaperUi()
+
+  // ---------------------------------------------------------------------
+  // 数据装载
+  // ---------------------------------------------------------------------
 
   useEffect(() => {
     if (!paperId) return
@@ -83,10 +107,13 @@ export default function PaperWorkbenchPage() {
         if (!alive) return
         setPaper(record ?? null)
         setBlocks(list)
-        // 恢复阅读位置：把上次的 blockIndex 换算回所在页
         if (record && restoredFor.current !== paperId) {
           restoredFor.current = paperId
-          setPageIndex(Math.floor((record.progress?.blockIndex ?? 0) / BLOCKS_PER_PAGE))
+          const p = record.progress
+          setPosition({ blockIndex: p?.blockIndex ?? 0, page: p?.page })
+          setMaxBlockIndex(Math.max(p?.maxBlockIndex ?? 0, p?.blockIndex ?? 0))
+          // DOCX 只有语义化视图；PDF 恢复上次用的视图，默认原版
+          setMode(record.format === 'docx' ? 'text' : (p?.mode ?? 'original'))
         }
       } finally {
         if (alive) setLoading(false)
@@ -97,45 +124,257 @@ export default function PaperWorkbenchPage() {
     }
   }, [paperId, repo])
 
-  const totalPages = Math.max(1, Math.ceil(blocks.length / BLOCKS_PER_PAGE))
-  const safePage = Math.min(pageIndex, totalPages - 1)
-  const start = safePage * BLOCKS_PER_PAGE
-  const shown = blocks.slice(start, start + BLOCKS_PER_PAGE)
-  // 依赖数组里只放原始值：shown 是每次 render 重新 slice 出的新数组，
-  // 直接进依赖会让防抖计时器每次 render 都被重置。
-  const shownCount = shown.length
-  const firstPage = shown[0]?.anchor.page
-  const totalBlocks = blocks.length
+  // 「启动 Copilot」入口带 ?copilot=open（HashRouter 下 query 在 hash 内，useSearchParams 正常工作）
+  useEffect(() => {
+    if (searchParams.get('copilot') === 'open') setCopilotOpen(true)
+  }, [searchParams, setCopilotOpen])
 
-  // 翻页写进度（节流）：ratio 按「已翻过的块 / 总块数」估算
+  // 原版模式按需取原始字节（列表页不会因此把文件读进内存）
+  useEffect(() => {
+    if (mode !== 'original' || !paperId || bytes) return
+    let alive = true
+    void repo
+      .getFileBytes(paperId)
+      .then((file) => {
+        if (!alive) return
+        if (file) setBytes(file.bytes)
+        else setBytesError('原始文件字节已丢失，请用文本视图阅读或重新导入')
+      })
+      .catch(() => alive && setBytesError('读取原始文件失败，请改用文本视图'))
+    return () => {
+      alive = false
+    }
+  }, [mode, paperId, repo, bytes])
+
+  /**
+   * Phase 1 导入的论文没有 chunk（当时索引阶段是占位步）：首次打开时在后台补建，
+   * 用户不必重新导入就能用全文搜索。
+   */
+  useEffect(() => {
+    if (!paperId || !blocks.length) return
+    let alive = true
+    void (async () => {
+      const existing = await repo.getChunks(paperId)
+      if (!alive || existing.length) return
+      await buildPaperIndex(paperId, blocks, repo)
+      if (alive) retrieval.invalidate(paperId)
+    })().catch(() => undefined)
+    return () => {
+      alive = false
+    }
+  }, [paperId, blocks, repo, retrieval])
+
+  // ---------------------------------------------------------------------
+  // 锚点解析与滚动
+  // ---------------------------------------------------------------------
+
+  const anchorCtx = useMemo(() => buildAnchorContext(blocks, paper?.pageCount), [blocks, paper?.pageCount])
+  const blockByIndex = useMemo(() => {
+    const map: PaperBlock[] = []
+    for (const b of blocks) map[b.index] = b
+    return map
+  }, [blocks])
+  const outline = useMemo(() => buildOutline(blocks), [blocks])
+
+  // 事件回调要保持稳定引用（否则会不断重挂 IntersectionObserver），当前值走 ref
+  const anchorCtxRef = useRef(anchorCtx)
+  anchorCtxRef.current = anchorCtx
+  const blockByIndexRef = useRef(blockByIndex)
+  blockByIndexRef.current = blockByIndex
+  const modeRef = useRef(mode)
+  modeRef.current = mode
+  const positionRef = useRef(position)
+  positionRef.current = position
+  const formatRef = useRef(paper?.format ?? 'pdf')
+  formatRef.current = paper?.format ?? 'pdf'
+
+  const scrollToAnchor = useCallback((anchor: Partial<SourceAnchor> | null | undefined): ScrollTarget => {
+    const target = resolveAnchor(anchor, anchorCtxRef.current, modeRef.current)
+    if (target.domId) {
+      const el = document.getElementById(target.domId)
+      if (el) {
+        el.scrollIntoView({ block: 'start', behavior: 'smooth' })
+        flashElement(el)
+      }
+    }
+    return target
+  }, [])
+
+  /** 内容就绪 / 切换视图后，把滚动位置对齐到当前阅读位置（不高亮，避免每次进页面都闪一下） */
+  const alignToPosition = useCallback(() => {
+    const pos = positionRef.current
+    const target = resolveAnchor(
+      { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
+      anchorCtxRef.current,
+      modeRef.current,
+    )
+    if (!target.domId) return
+    const domId = target.domId
+    // 两帧后再滚：等占位页 / content-visibility 块完成首次布局
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => document.getElementById(domId)?.scrollIntoView({ block: 'start' }))
+    })
+  }, [])
+
+  const alignOnce = useCallback(
+    (key: string) => {
+      if (alignedKey.current === key) return
+      alignedKey.current = key
+      alignToPosition()
+    },
+    [alignToPosition],
+  )
+
+  /** 切视图要重新对齐位置：清掉 aligned 标记，让新视图挂载后把阅读位置接上 */
+  const changeMode = useCallback((next: ReaderMode) => {
+    alignedKey.current = ''
+    setMode(next)
+  }, [])
+
+  useEffect(() => {
+    if (mode !== 'text' || !blocks.length || !paperId) return
+    alignOnce(`${paperId}:text`)
+  }, [mode, blocks.length, paperId, alignOnce])
+
+  const handlePdfLoaded = useCallback(() => {
+    if (paperId) alignOnce(`${paperId}:original`)
+  }, [alignOnce, paperId])
+
+  // ---------------------------------------------------------------------
+  // 阅读位置跟踪与持久化
+  // ---------------------------------------------------------------------
+
+  const handleVisibleBlock = useCallback((blockIndex: number) => {
+    const block = blockByIndexRef.current[blockIndex]
+    setPosition((prev) =>
+      prev.blockIndex === blockIndex ? prev : { blockIndex, page: block?.anchor.page, section: block?.anchor.section },
+    )
+    setMaxBlockIndex((m) => (blockIndex > m ? blockIndex : m))
+  }, [])
+
+  const handleVisiblePage = useCallback((page: number) => {
+    const blockIndex = anchorCtxRef.current.firstBlockOfPage[page]
+    setPosition((prev) => {
+      if (prev.page === page) return prev
+      const idx = blockIndex ?? prev.blockIndex
+      return { blockIndex: idx, page, section: blockByIndexRef.current[idx]?.anchor.section }
+    })
+    if (blockIndex !== undefined) setMaxBlockIndex((m) => (blockIndex > m ? blockIndex : m))
+  }, [])
+
+  const totalBlocks = blocks.length
+  const ratio = totalBlocks ? Math.min(1, (maxBlockIndex + 1) / totalBlocks) : 0
+
   useEffect(() => {
     if (!paperId || !totalBlocks || loading) return
     const timer = setTimeout(() => {
       void repo
         .updateProgress(paperId, {
-          blockIndex: start,
-          ratio: Math.min(1, (start + shownCount) / totalBlocks),
-          page: firstPage,
+          blockIndex: position.blockIndex,
+          ratio,
+          page: position.page,
+          maxBlockIndex,
+          mode,
           updatedAt: Date.now(),
         })
         .catch(() => undefined)
     }, PROGRESS_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [paperId, repo, start, shownCount, firstPage, totalBlocks, loading])
+  }, [paperId, repo, loading, totalBlocks, position.blockIndex, position.page, maxBlockIndex, ratio, mode])
 
-  const goto = useCallback(
-    (next: number) => {
-      setPageIndex(Math.max(0, Math.min(totalPages - 1, next)))
-      window.scrollTo({ top: 0, behavior: 'smooth' })
+  // ---------------------------------------------------------------------
+  // 选区快捷操作 / 搜索
+  // ---------------------------------------------------------------------
+
+  const anchorFromElement = useCallback((el: Element): SourceAnchor | null => {
+    const holder = el.closest('[data-block-index], [data-page]')
+    if (!(holder instanceof HTMLElement)) return null
+    const kind = formatRef.current
+    const rawBlock = holder.dataset.blockIndex
+    if (rawBlock !== undefined) {
+      const blockIndex = Number(rawBlock)
+      const block = blockByIndexRef.current[blockIndex]
+      return { kind, blockIndex, page: block?.anchor.page, section: block?.anchor.section }
+    }
+    // 原版 PDF：文字层 span 的最近祖先是页容器，锚点精度只到页
+    const page = Number(holder.dataset.page)
+    const blockIndex = anchorCtxRef.current.firstBlockOfPage[page]
+    return {
+      kind,
+      blockIndex: blockIndex ?? -1,
+      page,
+      section: blockIndex === undefined ? undefined : blockByIndexRef.current[blockIndex]?.anchor.section,
+    }
+  }, [])
+
+  const handleAskAction = useCallback(
+    (action: PaperAskAction, text: string, anchor: SourceAnchor | null) => {
+      if (!paperId) return
+      const pos = positionRef.current
+      addPendingAsk({
+        paperId,
+        action,
+        label: PAPER_ASK_ACTIONS.find((a) => a.id === action)?.label ?? '加入提问',
+        text: text.slice(0, MAX_ASK_TEXT),
+        anchor: anchor ?? { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
+      })
+      setCopilotOpen(true)
+      setToast('已加入提问（Copilot Phase 3 接入）')
     },
-    [totalPages],
+    [addPendingAsk, paperId, setCopilotOpen],
   )
+
+  useEffect(() => {
+    if (!toast) return
+    const timer = setTimeout(() => setToast(''), TOAST_MS)
+    return () => clearTimeout(timer)
+  }, [toast])
+
+  const runSearch = useCallback(() => {
+    if (!paperId || !searchQuery.trim()) return
+    setSearchBusy(true)
+    void retrieval
+      .search(paperId, searchQuery, { limit: 20 })
+      .then((hits) => setSearchHits(hits))
+      .catch(() => setSearchHits([]))
+      .finally(() => {
+        setSearchBusy(false)
+        setSearchRan(true)
+      })
+  }, [paperId, retrieval, searchQuery])
+
+  const jumpToBlock = useCallback(
+    (blockIndex: number) => {
+      const block = blockByIndexRef.current[blockIndex]
+      scrollToAnchor(block?.anchor ?? { kind: formatRef.current, blockIndex })
+      setDrawerOpen(false)
+    },
+    [scrollToAnchor],
+  )
+
+  const jumpToAnchor = useCallback(
+    (anchor: SourceAnchor) => {
+      const target = scrollToAnchor(anchor)
+      setDrawerOpen(false)
+      return target
+    },
+    [scrollToAnchor],
+  )
+
+  const readerApi: ReaderApi = useMemo(
+    () => ({ mode, setMode: changeMode, scrollToAnchor, position }),
+    [mode, changeMode, scrollToAnchor, position],
+  )
+
+  // ---------------------------------------------------------------------
+  // 渲染
+  // ---------------------------------------------------------------------
 
   if (loading) return <p className="text-sm text-dim">正在加载论文…</p>
 
   if (!paper) {
     return (
-      <div className="rounded-xl border border-line bg-panel shadow-sm p-6">
+      <div className="rounded-xl border border-line bg-panel p-6 shadow-sm">
         <p className="mb-3 font-medium text-fg">找不到这篇论文</p>
         <p className="mb-4 text-sm text-dim">它可能已经被删除，或者这个链接来自另一个浏览器的本地论文库。</p>
         <button
@@ -151,7 +390,7 @@ export default function PaperWorkbenchPage() {
 
   if (paper.status !== 'ready') {
     return (
-      <div className="rounded-xl border border-line bg-panel shadow-sm p-6">
+      <div className="rounded-xl border border-line bg-panel p-6 shadow-sm">
         <p className="mb-3 font-medium text-fg">「{paper.title}」还不能阅读</p>
         <p className="mb-4 text-sm text-dim">
           {paper.status === 'failed' ? (paper.failure?.message ?? '解析失败') : '正在解析中，请稍后回到论文库查看进度。'}
@@ -167,100 +406,170 @@ export default function PaperWorkbenchPage() {
     )
   }
 
-  return (
-    <div className="space-y-4">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <button
-            type="button"
-            onClick={() => navigate('/papers')}
-            className="mb-1 text-sm text-dim transition-colors hover:text-fg"
-          >
-            ← 返回论文库
-          </button>
-          <h1 className="truncate text-xl font-bold">{paper.title}</h1>
-          <p className="text-xs text-dim">
-            {paper.format.toUpperCase()}
-            {paper.pageCount ? ` · ${paper.pageCount} 页` : ''} · {blocks.length} 段 · 第 {safePage + 1}/{totalPages} 屏
-          </p>
-        </div>
-        {!copilotOpen && (
-          <button
-            type="button"
-            onClick={() => setCopilotOpen(true)}
-            className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/90"
-          >
-            展开 Copilot
-          </button>
-        )}
-      </header>
+  const outlinePane = (
+    <OutlinePane
+      outline={outline}
+      currentBlockIndex={position.blockIndex}
+      maxBlockIndex={maxBlockIndex}
+      ratio={ratio}
+      tab={outlineTab}
+      onTabChange={setOutlineTab}
+      onJumpBlock={jumpToBlock}
+      onJumpAnchor={jumpToAnchor}
+      searchQuery={searchQuery}
+      onSearchQueryChange={setSearchQuery}
+      onSearch={runSearch}
+      searchHits={searchHits}
+      searchBusy={searchBusy}
+      searchRan={searchRan}
+    />
+  )
 
-      <div className={`grid gap-4 ${copilotOpen ? 'lg:grid-cols-[minmax(0,1fr)_22rem]' : 'grid-cols-1'}`}>
-        {/* 中栏：规范化块只读预览。长文虚拟化与 PDF 原版页面渲染归 Phase 2 */}
-        <article className="space-y-3 rounded-xl border border-line bg-panel shadow-sm p-5">
-          {shown.length === 0 ? (
-            <p className="text-sm text-dim">这篇论文没有可显示的正文块。</p>
-          ) : (
-            shown.map((b) => <BlockView key={b.id} block={b} />)
+  const copilotPane = (
+    <CopilotPanel
+      asks={pendingAsks.filter((a) => a.paperId === paperId)}
+      onRemove={removePendingAsk}
+      onClear={clearPendingAsks}
+      onJump={jumpToAnchor}
+      onClose={() => setCopilotOpen(false)}
+    />
+  )
+
+  const showOutlineColumn = isDesktop && outlineOpen
+  const showCopilotColumn = isTablet && copilotOpen
+  const showOutlineDrawer = !isDesktop && drawerOpen
+  const showCopilotSheet = !isTablet && copilotOpen
+
+  return (
+    <ReaderProvider value={readerApi}>
+      {/* 工作台突破站点 max-w-7xl：以视口为基准全宽居中，减去 2rem 给滚动条留位 */}
+      <div className="relative left-1/2 w-[min(100vw-2rem,110rem)] -translate-x-1/2 space-y-3">
+        <ReaderStyles />
+
+        <header className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <button
+              type="button"
+              onClick={() => navigate('/papers')}
+              className="mb-1 text-sm text-dim transition-colors hover:text-fg"
+            >
+              ← 返回论文库
+            </button>
+            <h1 className="truncate text-xl font-bold">{paper.title}</h1>
+            <p className="text-xs text-dim">
+              {paper.format.toUpperCase()}
+              {paper.pageCount ? ` · ${paper.pageCount} 页` : ''} · {totalBlocks} 段 · 已读 {Math.round(ratio * 100)}%
+              {position.page !== undefined ? ` · 当前第 ${position.page} 页` : ''}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {paper.format === 'pdf' && <SegmentedTabs tabs={MODE_TABS} value={mode} onChange={changeMode} />}
+            {!isDesktop && (
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(!drawerOpen)}
+                className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2"
+              >
+                目录
+              </button>
+            )}
+            {isDesktop && (
+              <button
+                type="button"
+                onClick={() => setOutlineOpen(!outlineOpen)}
+                className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2"
+              >
+                {outlineOpen ? '收起目录' : '展开目录'}
+              </button>
+            )}
+            {!copilotOpen && (
+              <button
+                type="button"
+                onClick={() => setCopilotOpen(true)}
+                className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90"
+              >
+                展开 Copilot
+              </button>
+            )}
+          </div>
+        </header>
+
+        <div className="flex h-[calc(100dvh-14rem)] min-h-[24rem] gap-3">
+          {showOutlineColumn && (
+            <aside className="w-64 shrink-0 overflow-hidden rounded-xl border border-line bg-panel p-4 shadow-sm">
+              {outlinePane}
+            </aside>
           )}
 
-          <nav className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
-            <button
-              type="button"
-              disabled={safePage === 0}
-              onClick={() => goto(safePage - 1)}
-              className="rounded-lg border border-line bg-panel px-4 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 disabled:opacity-40"
-            >
-              上一屏
-            </button>
-            <label className="flex items-center gap-2 text-sm text-dim">
-              跳转
-              <select
-                value={safePage}
-                onChange={(e) => goto(Number(e.target.value))}
-                className="rounded-md border border-line bg-panel-2 px-2 py-1 text-fg"
-              >
-                {Array.from({ length: totalPages }, (_, i) => (
-                  <option key={i} value={i}>
-                    {i + 1} / {totalPages}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              disabled={safePage >= totalPages - 1}
-              onClick={() => goto(safePage + 1)}
-              className="rounded-lg border border-line bg-panel px-4 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 disabled:opacity-40"
-            >
-              下一屏
-            </button>
-          </nav>
-        </article>
+          <main
+            ref={readerRef}
+            className="min-w-0 flex-1 overflow-y-auto rounded-xl border border-line bg-panel p-4 shadow-sm"
+          >
+            {mode === 'original' && paper.format === 'pdf' ? (
+              bytesError ? (
+                <div className="rounded-lg border border-bad/40 p-4 text-sm text-bad">{bytesError}</div>
+              ) : bytes ? (
+                <PdfViewer
+                  bytes={bytes}
+                  containerRef={readerRef}
+                  onVisiblePage={handleVisiblePage}
+                  onLoaded={handlePdfLoaded}
+                />
+              ) : (
+                <p className="text-sm text-dim">正在读取原始文件…</p>
+              )
+            ) : (
+              <BlockReader blocks={blocks} containerRef={readerRef} onVisibleBlock={handleVisibleBlock} />
+            )}
+          </main>
 
-        {/* 右栏：Copilot 占位。窄屏时自然落到正文下方（单列 grid） */}
-        {copilotOpen && (
-          <aside className="h-fit rounded-xl border border-line bg-panel shadow-sm p-5 lg:sticky lg:top-20">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <h2 className="font-semibold text-accent">Paper Copilot</h2>
-              <button type="button" onClick={() => setCopilotOpen(false)} className="text-sm text-dim hover:text-fg">
-                收起
-              </button>
+          {showCopilotColumn && (
+            <aside className="w-80 shrink-0 overflow-hidden rounded-xl border border-line bg-panel p-4 shadow-sm xl:w-88">
+              {copilotPane}
+            </aside>
+          )}
+        </div>
+
+        {/* 平板 / 手机：目录抽屉 */}
+        {showOutlineDrawer && (
+          <div className="fixed inset-0 z-40 flex">
+            <div
+              className="flex-1 bg-ink/60 backdrop-blur-[1px]"
+              role="presentation"
+              onClick={() => setDrawerOpen(false)}
+            />
+            <div className="h-full w-[min(20rem,85vw)] overflow-hidden border-l border-line bg-panel p-4 shadow-lg">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-sm font-semibold text-fg">目录与搜索</span>
+                <button type="button" onClick={() => setDrawerOpen(false)} className="text-sm text-dim hover:text-fg">
+                  关闭
+                </button>
+              </div>
+              <div className="h-[calc(100%-2rem)]">{outlinePane}</div>
             </div>
-            <p className="mb-3 rounded-lg border border-line bg-panel-2 px-3 py-2 text-xs leading-relaxed text-dim">
-              陪读对话将在 Phase 3 接入。届时会先明确告知发送范围并单独征求授权，未授权前论文内容不出本机。
-            </p>
-            <ul className="space-y-2">
-              {COPILOT_CAPABILITIES.map((c) => (
-                <li key={c} className="flex gap-2 text-xs leading-relaxed text-dim">
-                  <span className="shrink-0 text-accent">·</span>
-                  <span>{c}</span>
-                </li>
-              ))}
-            </ul>
-          </aside>
+          </div>
         )}
+
+        {/* 手机：Copilot 底部面板 */}
+        {showCopilotSheet && (
+          <div className="fixed inset-x-0 bottom-0 z-40 max-h-[70dvh] overflow-hidden rounded-t-xl border-t border-line bg-panel p-4 shadow-lg">
+            <div className="h-[min(60dvh,32rem)]">{copilotPane}</div>
+          </div>
+        )}
+
+        {toast && (
+          <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-line bg-panel px-4 py-2 text-sm text-fg shadow-md">
+            {toast}
+          </div>
+        )}
+
+        <SelectionActions
+          containerRef={readerRef}
+          anchorFromElement={anchorFromElement}
+          onAction={handleAskAction}
+        />
       </div>
-    </div>
+    </ReaderProvider>
   )
 }

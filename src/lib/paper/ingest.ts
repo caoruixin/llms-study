@@ -1,3 +1,4 @@
+import { buildChunkRows, chunkBlocks } from './chunking'
 import { MAX_TEXT_CHARS, validateFile } from './validate'
 import type { PaperRepository } from './repo/paperRepo'
 import type {
@@ -5,6 +6,7 @@ import type {
   IngestFailureKind,
   IngestStage,
   NormalizedBlock,
+  PaperChunk,
   PaperFormat,
   PaperRecord,
 } from './types'
@@ -216,6 +218,28 @@ export function countBlockChars(blocks: NormalizedBlock[]): number {
   return n
 }
 
+/** 分词是同步 CPU 工作：每批之后让出事件循环，导入长文时 UI 仍可响应 */
+const INDEX_BATCH = 32
+
+/**
+ * 索引阶段（§4.4）：正文块 → 语义 chunk（连同 BM25 词频表）→ 落库。
+ * 全部本地计算，不发生任何网络请求；索引建好后「模型不可用也能全文搜索」的承诺才成立。
+ */
+export async function buildPaperIndex(
+  paperId: string,
+  blocks: NormalizedBlock[],
+  repo: PaperRepository,
+): Promise<PaperChunk[]> {
+  const drafts = chunkBlocks(blocks)
+  const rows: PaperChunk[] = []
+  for (let i = 0; i < drafts.length; i += INDEX_BATCH) {
+    rows.push(...buildChunkRows(paperId, drafts.slice(i, i + INDEX_BATCH)))
+    if (i + INDEX_BATCH < drafts.length) await new Promise<void>((r) => setTimeout(r, 0))
+  }
+  await repo.saveChunks(paperId, rows)
+  return rows
+}
+
 /**
  * 单文件导入全链路：
  * 校验 → SHA-256 → 去重早退 → 建记录 → 解析 → 落块 → 索引（Phase 1 为 no-op 占位）→ ready。
@@ -272,8 +296,8 @@ export async function importPaper(file: ImportFileInput, deps: IngestDeps): Prom
     await deps.repo.saveBlocks(paper.id, parsed.blocks)
     dispatch({ type: 'normalize:ok' })
 
-    // 索引阶段：Phase 1 为 no-op 占位步，Phase 2 在此建 BM25 索引
     await deps.repo.setStage(paper.id, 'indexing')
+    await buildPaperIndex(paper.id, parsed.blocks, deps.repo)
     dispatch({ type: 'index:ok' })
 
     await deps.repo.markReady(paper.id, {
@@ -342,6 +366,7 @@ export async function reingestPaper(paperId: string, deps: IngestDeps): Promise<
     dispatch({ type: 'normalize:ok' })
 
     await deps.repo.setStage(paperId, 'indexing')
+    await buildPaperIndex(paperId, parsed.blocks, deps.repo)
     dispatch({ type: 'index:ok' })
 
     await deps.repo.markReady(paperId, {

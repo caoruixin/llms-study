@@ -5,6 +5,7 @@ import type {
   IngestionJob,
   NormalizedBlock,
   PaperBlock,
+  PaperChunk,
   PaperFileBytes,
   PaperFormat,
   PaperRecord,
@@ -41,6 +42,8 @@ export interface PaperRepository {
   getFileBytes(paperId: string): Promise<PaperFileBytes | undefined>
   saveBlocks(paperId: string, blocks: NormalizedBlock[]): Promise<void>
   getBlocks(paperId: string): Promise<PaperBlock[]>
+  saveChunks(paperId: string, chunks: PaperChunk[]): Promise<void>
+  getChunks(paperId: string): Promise<PaperChunk[]>
   setStage(paperId: string, stage: IngestStage, patch?: Partial<PaperRecord>): Promise<void>
   markFailed(paperId: string, failure: IngestFailure): Promise<void>
   markReady(paperId: string, stats: ReadyStats): Promise<void>
@@ -151,6 +154,23 @@ export function createPaperRepository(db: PaperDb): PaperRepository {
           if (rows.length) await db.blocks.bulkAdd(rows)
         })
       }),
+
+    // 与 saveBlocks 同样的「先清后写」语义：重建索引不会与上一版 chunk 混叠
+    saveChunks: (paperId, chunks) =>
+      guard(async () => {
+        await db.transaction('rw', [db.chunks], async () => {
+          await db.chunks.where('paperId').equals(paperId).delete()
+          if (chunks.length) await db.chunks.bulkAdd(chunks)
+        })
+      }),
+
+    getChunks: (paperId) =>
+      guard(() =>
+        db.chunks
+          .where('[paperId+order]')
+          .between([paperId, -Infinity], [paperId, Infinity])
+          .toArray(),
+      ),
 
     // [paperId+index] 复合索引天然有序，无需在内存里再 sort
     getBlocks: (paperId) =>

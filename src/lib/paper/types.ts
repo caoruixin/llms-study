@@ -25,6 +25,10 @@ export interface ReadingProgress {
   ratio: number
   page?: number
   updatedAt: number
+  /** 读到过的最深块序号（只增不减）：目录据此标记「已读章节」，回看旧章节不会把进度打回去 */
+  maxBlockIndex?: number
+  /** 上次使用的阅读视图，回到这篇论文时恢复 */
+  mode?: 'original' | 'text'
 }
 
 export interface IngestFailure {
@@ -123,6 +127,15 @@ export interface PaperChunk {
   /** 起止块序号，便于回溯原文 */
   blockStart: number
   blockEnd: number
+  /** chars/3 粗估的 token 数（估算值，全链路标注） */
+  tokenEstimate?: number
+  /**
+   * BM25 词频表与词元总数：索引的持久化形态（见 bm25.ts）。
+   * 存在 chunk 行里而不是单独建索引表——查询时在内存重建倒排表只要毫秒级，
+   * 于是 schema 保持「只加字段、不加 migration」。
+   */
+  tf?: Record<string, number>
+  len?: number
 }
 
 /** Phase 3 落地：论文地图与分层摘要 */

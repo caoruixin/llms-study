@@ -18,6 +18,9 @@ export interface PdfPageText {
   items: PdfTextItem[]
 }
 
+/** 行所属的版面区域：单栏页恒为 full，双栏页分 left / right，跨栏元素（标题、通栏图表）为 span */
+type Column = 'full' | 'left' | 'right' | 'span'
+
 interface Line {
   page: number
   y: number
@@ -25,6 +28,7 @@ interface Line {
   x1: number
   height: number
   text: string
+  col: Column
 }
 
 const xOf = (it: PdfTextItem) => it.transform[4] ?? 0
@@ -80,11 +84,10 @@ function joinLineItems(items: PdfTextItem[]): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
-/** 按 y 值聚类成行（±容差），行序自上而下 */
-function pageToLines(page: PdfPageText): Line[] {
-  const items = page.items.filter((it) => it.str && it.str.trim().length > 0)
-  if (!items.length) return []
+const rightOf = (it: PdfTextItem) => xOf(it) + (it.width || 0)
 
+/** 按 y 值把文本项聚成「行」（±容差），自上而下 */
+function clusterRows(items: PdfTextItem[]): PdfTextItem[][] {
   const sorted = [...items].sort((a, b) => yOf(b) - yOf(a) || xOf(a) - xOf(b))
   const groups: PdfTextItem[][] = []
   let current: PdfTextItem[] = [sorted[0]]
@@ -102,21 +105,148 @@ function pageToLines(page: PdfPageText): Line[] {
     }
   }
   groups.push(current)
+  return groups
+}
+
+function toLine(page: number, items: PdfTextItem[], col: Column): Line | null {
+  const text = joinLineItems(items)
+  if (!text) return null
+  return {
+    page,
+    y: Math.max(...items.map(yOf)),
+    x0: Math.min(...items.map(xOf)),
+    x1: Math.max(...items.map(rightOf)),
+    height: Math.max(...items.map((it) => it.height || 0)),
+    text,
+    col,
+  }
+}
+
+/** 版心中部允许出现分栏槽的横向区间，以及分栏槽的最小宽度（占版心宽度比例） */
+const GUTTER_SEARCH_LO = 0.35
+const GUTTER_SEARCH_HI = 0.65
+const MIN_GUTTER_RATIO = 0.03
+const GUTTER_BINS = 200
+
+/**
+ * 双栏检测：把版心横向分箱统计文本覆盖，在中部找一条足够宽的空白竖槽。
+ *
+ * 为什么按「覆盖直方图」而不是「有没有文本项跨过某条竖线」：pdf.js 的文本项是词级碎片，
+ * 任意一条竖线几乎总能落进某个词间空隙，逐项判定会把单栏页也误判成双栏。
+ * 分箱后要求空白**连续**达到版心宽度的 3%（A4 上约 18pt，远大于词间距 3pt 左右），
+ * 才认定是分栏槽；通栏标题会让中部箱被占满，于是该页自动退回单栏处理。
+ */
+function detectGutter(rows: PdfTextItem[][]): { split: number; width: number } | null {
+  const items = rows.flat()
+  if (items.length < 12 || rows.length < 4) return null
+  const left = Math.min(...items.map(xOf))
+  const right = Math.max(...items.map(rightOf))
+  const width = right - left
+  if (width <= 0) return null
+
+  // 逐**行**统计覆盖（而不是逐项）：通栏标题只贡献 1 次覆盖，
+  // 不会像布尔占用那样让整页的分栏槽被一条标题抹平。
+  const binWidth = width / GUTTER_BINS
+  const counts = new Uint16Array(GUTTER_BINS)
+  const rowBins = new Uint8Array(GUTTER_BINS)
+  for (const row of rows) {
+    rowBins.fill(0)
+    for (const it of row) {
+      const from = Math.max(0, Math.floor((xOf(it) - left) / binWidth))
+      const to = Math.min(GUTTER_BINS - 1, Math.ceil((rightOf(it) - left) / binWidth) - 1)
+      for (let b = from; b <= to; b++) rowBins[b] = 1
+    }
+    for (let b = 0; b < GUTTER_BINS; b++) if (rowBins[b]) counts[b]++
+  }
+  // 允许少量通栏行跨过槽位（标题、通栏图表说明）
+  const tolerance = Math.max(1, Math.floor(rows.length * 0.15))
+
+  const lo = Math.floor(GUTTER_BINS * GUTTER_SEARCH_LO)
+  const hi = Math.ceil(GUTTER_BINS * GUTTER_SEARCH_HI)
+  let best = { from: -1, len: 0 }
+  let runFrom = -1
+  for (let b = lo; b <= hi; b++) {
+    if (counts[b] <= tolerance) {
+      if (runFrom < 0) runFrom = b
+      const len = b - runFrom + 1
+      if (len > best.len) best = { from: runFrom, len }
+    } else {
+      runFrom = -1
+    }
+  }
+  if (best.len * binWidth < width * MIN_GUTTER_RATIO) return null
+
+  const split = left + (best.from + best.len / 2) * binWidth
+  // 两侧都要有足够文本，否则只是居中排版或宽公式留白
+  const leftCount = items.filter((it) => rightOf(it) <= split).length
+  const rightCount = items.filter((it) => xOf(it) >= split).length
+  const minShare = items.length * 0.2
+  if (leftCount < minShare || rightCount < minShare) return null
+  return { split, width: best.len * binWidth }
+}
+
+/**
+ * 双栏页的阅读序：通栏行把页面切成若干「带」，每条带内先读完左栏再读右栏。
+ * 典型论文首页 = 通栏标题/摘要 → 左栏 → 右栏，正好由此还原。
+ */
+function orderColumns(lines: Line[]): Line[] {
+  const byY = (a: Line, b: Line) => b.y - a.y
+  const spans = lines.filter((l) => l.col === 'span').sort(byY)
+  let rest = lines.filter((l) => l.col !== 'span').sort(byY)
+  const out: Line[] = []
+
+  for (const s of spans) {
+    const above = rest.filter((l) => l.y > s.y)
+    out.push(...above.filter((l) => l.col === 'left'), ...above.filter((l) => l.col === 'right'))
+    out.push(s)
+    rest = rest.filter((l) => l.y <= s.y)
+  }
+  out.push(...rest.filter((l) => l.col === 'left'), ...rest.filter((l) => l.col === 'right'))
+  return out
+}
+
+/**
+ * 页 → 有序行。单栏页与 Phase 1 行为完全一致；双栏页先按 y 聚行，
+ * 再把「同一 y 上左右栏被拼在一起」的行按分栏槽拆开，最后按栏重排阅读序。
+ */
+function pageToLines(page: PdfPageText): Line[] {
+  const items = page.items.filter((it) => it.str && it.str.trim().length > 0)
+  if (!items.length) return []
+
+  const rows = clusterRows(items)
+  const gutter = detectGutter(rows)
+  if (!gutter) {
+    return rows.map((g) => toLine(page.page, g, 'full')).filter((l): l is Line => l !== null)
+  }
 
   const lines: Line[] = []
-  for (const g of groups) {
-    const text = joinLineItems(g)
-    if (!text) continue
-    lines.push({
-      page: page.page,
-      y: Math.max(...g.map(yOf)),
-      x0: Math.min(...g.map(xOf)),
-      x1: Math.max(...g.map((it) => xOf(it) + (it.width || 0))),
-      height: Math.max(...g.map((it) => it.height || 0)),
-      text,
-    })
+  for (const row of rows) {
+    const leftItems = row.filter((it) => rightOf(it) <= gutter.split)
+    const rightItems = row.filter((it) => xOf(it) >= gutter.split)
+    const crossing = row.length - leftItems.length - rightItems.length
+
+    if (crossing > 0 || !leftItems.length || !rightItems.length) {
+      const col: Column = crossing > 0 ? 'span' : leftItems.length ? 'left' : 'right'
+      const line = toLine(page.page, row, col)
+      if (line) lines.push(line)
+      continue
+    }
+
+    // 两侧都有文本且无跨槽项：只有当中间空隙确实有分栏槽那么宽时才判定为「两栏被拼成一行」，
+    // 否则是一条恰好在槽位有词间空隙的通栏行（如居中标题）。
+    const gap = Math.min(...rightItems.map(xOf)) - Math.max(...leftItems.map(rightOf))
+    if (gap < gutter.width * 0.6) {
+      const line = toLine(page.page, row, 'span')
+      if (line) lines.push(line)
+      continue
+    }
+    const l = toLine(page.page, leftItems, 'left')
+    const r = toLine(page.page, rightItems, 'right')
+    if (l) lines.push(l)
+    if (r) lines.push(r)
   }
-  return lines
+
+  return orderColumns(lines)
 }
 
 interface HeadingInfo {
@@ -170,13 +300,22 @@ export function normalizePdf(pages: PdfPageText[]): NormalizedBlock[] {
   if (!allLines.length) return []
 
   const bodyHeight = median(allLines.map((l) => l.height).filter((h) => h > 0))
-  // 行间距中位数用于判定「空行断段」：同页相邻行的 y 差值
+  // 行间距中位数用于判定「空行断段」：同页同栏相邻行的 y 差值
+  // （跨栏相邻行的 y 差是「栏底 → 栏顶」的跳变，混进来会把中位数抬高）
   const gaps: number[] = []
   for (const lines of perPage) {
-    for (let i = 1; i < lines.length; i++) gaps.push(Math.abs(lines[i - 1].y - lines[i].y))
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i].col !== lines[i - 1].col) continue
+      gaps.push(Math.abs(lines[i - 1].y - lines[i].y))
+    }
   }
   const bodyGap = median(gaps.filter((g) => g > 0))
-  const maxWidth = Math.max(...allLines.map((l) => l.x1 - l.x0))
+  // 「满行宽」按栏统计：双栏正文只有半页宽，用全页最大宽度会把每一行都判成短行
+  const maxWidthByCol = new Map<Column, number>()
+  for (const l of allLines) {
+    const w = l.x1 - l.x0
+    if (w > (maxWidthByCol.get(l.col) ?? 0)) maxWidthByCol.set(l.col, w)
+  }
 
   const drafts: Draft[] = []
   let section = ''
@@ -203,16 +342,17 @@ export function normalizePdf(pages: PdfPageText[]): NormalizedBlock[] {
         continue
       }
 
-      // 断段判据：同页大行距 → 断；跨页（li === 0）则看上页末行是否已收句，
-      // 未收句就并入同段（跨页段落合并），anchor 保留段落起始页。
+      // 断段判据：同栏大行距 → 断；跨页（li === 0）或换栏则看上一行是否已收句，
+      // 未收句就并入同段（跨页 / 跨栏续段），anchor 保留段落起始页。
+      const prev = li > 0 ? lines[li - 1] : null
       let breakHere: boolean
-      if (li === 0) {
+      if (!prev || prev.col !== line.col) {
         breakHere = ENDS_SENTENCE.test(prevOpen.text.trim())
       } else {
-        const prev = lines[li - 1]
         const gap = Math.abs(prev.y - line.y)
         breakHere = bodyGap > 0 && gap > bodyGap * 1.6
         // 上一行明显不满行宽且已收句 → 段落自然结束
+        const maxWidth = maxWidthByCol.get(prev.col) ?? 0
         if (!breakHere && ENDS_SENTENCE.test(prev.text.trim()) && prev.x1 - prev.x0 < maxWidth * 0.85) {
           breakHere = true
         }
