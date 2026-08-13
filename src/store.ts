@@ -114,11 +114,20 @@ export const useInferenceParams = create<InferenceParamsState>()((set) => ({
 interface HistoryState {
   attempts: AttemptRecord[]
   addAttempt: (a: AttemptRecord) => void
+  removeAttempt: (id: string) => void
+  clearQuestion: (questionId: string) => void
   clear: () => void
 }
 
 // 每题只保留最近 N 次作答：attempts 持久化在 localStorage（含完整回答文本），不设上限会无界膨胀
 const HISTORY_CAP_PER_QUESTION = 20
+
+// 记录 id：优先 crypto.randomUUID，降级为时间戳+随机后缀（与 paperRepo 的 newId 同一惯例）。
+// 纯毫秒时间戳同毫秒会撞车——既是按 id 删除的正确性隐患，也是 React key 冲突隐患。
+export const newAttemptId = () =>
+  typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
 export const useHistory = create<HistoryState>()(
   persist(
@@ -132,8 +141,24 @@ export const useHistory = create<HistoryState>()(
             attempts: next.filter((x) => x.questionId !== a.questionId || ++kept <= HISTORY_CAP_PER_QUESTION),
           }
         }),
+      removeAttempt: (id) => set((s) => ({ attempts: s.attempts.filter((x) => x.id !== id) })),
+      clearQuestion: (questionId) =>
+        set((s) => ({ attempts: s.attempts.filter((x) => x.questionId !== questionId) })),
       clear: () => set({ attempts: [] }),
     }),
-    { name: 'llm-infra-history' },
+    {
+      name: 'llm-infra-history',
+      version: 1, // v1：旧记录 id 为纯毫秒时间戳可能重复，迁移时对重复/缺失 id 重新生成
+      migrate: (persisted: unknown) => {
+        const s = persisted as { attempts?: AttemptRecord[] } | undefined
+        const seen = new Set<string>()
+        const attempts = (s?.attempts ?? []).map((a) => {
+          if (!a.id || seen.has(a.id)) return { ...a, id: newAttemptId() }
+          seen.add(a.id)
+          return a
+        })
+        return { attempts } as HistoryState
+      },
+    },
   ),
 )

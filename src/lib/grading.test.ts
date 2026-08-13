@@ -8,6 +8,7 @@ const valid: ScoreResult = {
   structure: 7,
   business: 6,
   depth: 7,
+  highlights: ['讲清了机制'],
   comments: ['好'],
   missed: [],
 }

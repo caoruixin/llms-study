@@ -111,7 +111,8 @@ export interface ScoreResult {
   structure: number // 结构化表达 1-10
   business: number // 业务与成本视角 1-10
   depth: number // 深度与实战感 1-10
-  comments: string[] // 逐条点评
+  highlights: string[] // 回答中的亮点（答对/答得好的地方）
+  comments: string[] // 逐条改进建议
   missed: string[] // 遗漏的 mustCover 要点
 }
 
