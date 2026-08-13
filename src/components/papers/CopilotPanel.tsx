@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
-  buildKimiStructuredSpec,
+  buildStructuredFallbackSpec,
   COST_CONFIRM_THRESHOLDS,
   DEEPSEEK_V4_PRO,
   PAPER_TASKS,
@@ -13,8 +13,6 @@ import {
   estimateBriefCost,
   runBriefPipeline,
   sectionizeUnits,
-  UNIT_DIGEST_JSON_SCHEMA,
-  BRIEF_JSON_SCHEMA,
 } from '../../lib/paper/briefPipeline'
 import { createModelGateway } from '../../lib/paper/modelGateway'
 import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
@@ -696,7 +694,7 @@ export default function CopilotPanel({
     [recordEvidence, repo],
   )
 
-  /** 「换一种深度解释」：同轮上下文用 kimi-k3 effort high 重发（§5.1），并列展示并标注来源 */
+  /** 「换一种深度解释」：同轮上下文用 deepAlt 档（deepseek-v4-pro 深思考、更高温度）重发，并列展示并标注来源 */
   const deepAlternative = useCallback(
     (msg: StoredMessage) => {
       if (busy) return
@@ -710,7 +708,7 @@ export default function CopilotPanel({
         task: 'deepAlt',
         planIsland: false,
         label: '深度解释',
-        sourceLabel: 'kimi-k3 · 深度解释',
+        sourceLabel: 'deepseek-v4-pro · 深度解释',
         displayText: '【换一种深度解释】',
       })
     },
@@ -913,8 +911,8 @@ export default function CopilotPanel({
               validate: req.validate,
               kimiFallback:
                 req.task === 'brief-synthesis'
-                  ? buildKimiStructuredSpec('paper_brief', BRIEF_JSON_SCHEMA, PAPER_TASKS.briefSynthesis.maxOutputTokens)
-                  : buildKimiStructuredSpec('unit_digest', UNIT_DIGEST_JSON_SCHEMA, digestSpec.maxOutputTokens),
+                  ? buildStructuredFallbackSpec(PAPER_TASKS.briefSynthesis.maxOutputTokens)
+                  : buildStructuredFallbackSpec(digestSpec.maxOutputTokens),
             }),
           loadUnitDigest: (key) => repo.getUnitDigest(p.id, key),
           saveUnitDigest: (key, digest) => repo.saveUnitDigest(p.id, key, digest),

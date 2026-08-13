@@ -112,14 +112,16 @@ export const PAPER_TASKS = {
     inputBudgetTokens: 32_000,
   },
   /**
-   * 显式深度升级（§5.1）：用户点「换一种深度解释」时才走的 kimi-k3 effort high 独立回答。
-   * 永远不自动触发——需 Moonshot 独立授权 + 成本二次确认（Kimi 阈值）。
-   * sampling fixed → 不带 temperature（providerAdapters 会一并省略采样参数）。
+   * 显式深度升级：用户点「换一种深度解释」时的独立深度回答。
+   * 用户决策（2026-08-13）：全任务统一 deepseek-v4-pro，kimi-k3 退出生产路由（capability 保留备用）。
+   * temperature 略高于 deep 的 0.4——「换一种讲法」需要真实的多样性而非同参重放；
+   * 输出上限 6000 与 deep 一致（推理+正文共享预算，防空流）。
    */
   deepAlt: {
-    cap: KIMI_K3,
-    thinking: 'effort-high',
-    maxOutputTokens: 3000,
+    cap: DEEPSEEK_V4_PRO,
+    thinking: 'on-high',
+    maxOutputTokens: 6000,
+    temperature: 0.6,
     inputBudgetTokens: 24_000,
   },
 } as const satisfies Record<string, PaperTaskSpec>
@@ -127,8 +129,22 @@ export const PAPER_TASKS = {
 export type PaperTaskId = keyof typeof PAPER_TASKS
 
 /**
- * Kimi 兜底 spec（§5.5 结构化失败且已授权 Moonshot 时使用）：
- * strict JSON Schema、effort low、省略全部采样参数。
+ * 结构化兜底 spec（§5.5：主调用 + 同模型修复均失败后的第三次尝试）。
+ * 用户决策（2026-08-13）：兜底同样用 deepseek-v4-pro（json_object + 低温），不再跨厂到 Kimi。
+ */
+export function buildStructuredFallbackSpec(maxOutputTokens: number): PaperCallSpec {
+  return {
+    cap: DEEPSEEK_V4_PRO,
+    thinking: 'off',
+    responseFormat: { type: 'json_object' },
+    maxOutputTokens,
+    temperature: 0.2,
+  }
+}
+
+/**
+ * Kimi strict-schema spec：生产路由已不使用（用户决策改全 DeepSeek）；
+ * 保留供 gateway 跨厂回退机制的契约测试与将来重启用。
  */
 export function buildKimiStructuredSpec(name: string, schema: object, maxOutputTokens: number): PaperCallSpec {
   return {

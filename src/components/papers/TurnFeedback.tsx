@@ -2,7 +2,7 @@ import type { DepthFeedback } from '../../lib/paper/learnerProfile'
 
 /**
  * 每条回答尾部的轻量反馈条（§6.2 L1 显式证据 + §5.1 Kimi 深度升级入口）：
- * 「太浅 / 刚好 / 太深」→ 画像证据（0 调用）；「换一种深度解释」→ kimi-k3 effort high 独立回答。
+ * 「太浅 / 刚好 / 太深」→ 画像证据（0 调用）；「换一种深度解释」→ deepAlt 档独立深度回答（deepseek-v4-pro）。
  * 朗读按钮同排（浏览器不支持时由父组件隐藏）。
  */
 
