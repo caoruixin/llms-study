@@ -11,6 +11,7 @@
 > - **部署**：PR #7 合并 main（756d81c）后，先 flag-off 部署（携带站点定位更新与 KDA 导航收纳），再按用户确认 `VITE_ENABLE_PAPER_COPILOT=1` 构建二次部署；懒加载分包与 pdf.worker/KaTeX 资产线上验证 200。回滚备份 `/var/www/llms-study.old-20260813-0922`（flag-off 版）与 `-0931`（上一版）。
 > - **nginx Kimi 接入**：moonshot 上游由 `api.moonshot.cn` 切换为 `api.moonshot.ai`（key 属国际站，站点不匹配是最初 401 的根因）；auth map default 注入服务端 `KIMI_API_KEY`（注入过程零回显）；`nginx -t` 后热重载，公网代理实测 kimi-k3 200。conf 备份 `llms-study.conf.bak-20260813-1124-kimikey`。「换一种深度解释」线上可用（授权 + $0.15 成本确认链路）。本地 `.env.local` 的 `KIMI_BASE_URL` 同步修正为不带 `/v1` 的域名，与代理拼接约定一致。
 > - **接受的敞口（明示）**：无鉴权公共代理现在同时承载 DeepSeek 与 Kimi 服务端 key（Kimi 单价约为 DeepSeek 7–17 倍），缓解仅靠 6r/m/IP 限流与应用内成本确认；附录 A 双限流区与按 provider 用户 key 仍为后续加固项。异常消耗时以备份目录原子回滚。
+> - **路由调整（2026-08-13，用户决策）**：Paper 全部任务统一 `deepseek-v4-pro`——「换一种深度解释」（deepAlt）与结构化兜底不再走 `kimi-k3`（deepAlt 改 DS 深思考 + temperature 0.6 + 输出上限 6K；兜底改 DS json_object 低温三次尝试）。`KIMI_K3` capability、adapter 与跨厂回退机制的契约测试保留备用；nginx 的 moonshot 路由与服务端 Kimi key 保留无害（应用不再调用）。§5.1 分工表中 Kimi 相关行以本条为准。
 
 > 更新日期：2026-08-12（v2）。本版在 v1 草案基础上完成代码库对齐 review 与三项决策定稿：①每轮单调用拓扑与流式线协议（§6.1/§7）；②ModelPolicy 修正为客户端类型化常量（§5.3）；③讲解渲染选定 react-markdown + KaTeX 完整管线（§7.6）；④评测右尺寸化（§11.3）；⑤v1 以本地 flag-off 方式交付，二阶段上生产方案见附录 A。模型选型沿用 v1 已验证的 DeepSeek、Kimi 与 Jina 配置；未记录任何 API key 内容。
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import {
-  buildKimiStructuredSpec,
+  buildStructuredFallbackSpec,
   COST_CONFIRM_THRESHOLDS,
   DEEPSEEK_V4_PRO,
   PAPER_TASKS,
@@ -13,8 +13,6 @@ import {
   estimateBriefCost,
   runBriefPipeline,
   sectionizeUnits,
-  UNIT_DIGEST_JSON_SCHEMA,
-  BRIEF_JSON_SCHEMA,
 } from '../../lib/paper/briefPipeline'
 import { createModelGateway } from '../../lib/paper/modelGateway'
 import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
@@ -98,7 +96,7 @@ interface Props {
   onToggleSensitive: (sensitive: boolean) => void
 }
 
-/** 本轮任务档位：chat/deep 走 DeepSeek，deepAlt 是用户显式点击的 Kimi 深度升级（§5.1） */
+/** 本轮任务档位：chat/deep/deepAlt 均走 DeepSeek（用户决策 2026-08-13）；deepAlt 为显式点击的深度解释重发 */
 type TurnTask = 'chat' | 'deep' | 'deepAlt'
 
 interface SendParams {
@@ -114,7 +112,7 @@ interface SendParams {
   extraDirectives?: readonly string[]
   /** teach-back 轮：verdict 岛回写画像时的概念 */
   teachBackConcept?: string
-  /** 回答来源标注（并列展示 Kimi 深度解释时） */
+  /** 回答来源标注（并列展示深度解释时，如 deepseek-v4-pro · 深度解释） */
   sourceLabel?: string
   /** 问题由用户自己写（不是脚本/模板）：只有这种问题才做抽象度启发式画像 */
   userAuthored?: boolean
@@ -626,7 +624,7 @@ export default function CopilotPanel({
   }, [busy, guidedCtx, runGuidedStep])
 
   // -----------------------------------------------------------------------
-  // teach-back / 深度反馈 / Kimi 深度升级
+  // teach-back / 深度反馈 / 深度解释（deepAlt）
   // -----------------------------------------------------------------------
   const sendTeachBack = useCallback(
     (payload: { prompt: string; answer: string; concept?: string }) => {
@@ -696,7 +694,7 @@ export default function CopilotPanel({
     [recordEvidence, repo],
   )
 
-  /** 「换一种深度解释」：同轮上下文用 kimi-k3 effort high 重发（§5.1），并列展示并标注来源 */
+  /** 「换一种深度解释」：同轮上下文用 deepAlt 档（deepseek-v4-pro 深思考、更高温度）重发，并列展示并标注来源 */
   const deepAlternative = useCallback(
     (msg: StoredMessage) => {
       if (busy) return
@@ -710,7 +708,7 @@ export default function CopilotPanel({
         task: 'deepAlt',
         planIsland: false,
         label: '深度解释',
-        sourceLabel: 'kimi-k3 · 深度解释',
+        sourceLabel: 'deepseek-v4-pro · 深度解释',
         displayText: '【换一种深度解释】',
       })
     },
@@ -911,10 +909,10 @@ export default function CopilotPanel({
               signal: ctrl.signal,
               task: req.task,
               validate: req.validate,
-              kimiFallback:
+              structuredFallback:
                 req.task === 'brief-synthesis'
-                  ? buildKimiStructuredSpec('paper_brief', BRIEF_JSON_SCHEMA, PAPER_TASKS.briefSynthesis.maxOutputTokens)
-                  : buildKimiStructuredSpec('unit_digest', UNIT_DIGEST_JSON_SCHEMA, digestSpec.maxOutputTokens),
+                  ? buildStructuredFallbackSpec(PAPER_TASKS.briefSynthesis.maxOutputTokens)
+                  : buildStructuredFallbackSpec(digestSpec.maxOutputTokens),
             }),
           loadUnitDigest: (key) => repo.getUnitDigest(p.id, key),
           saveUnitDigest: (key, digest) => repo.saveUnitDigest(p.id, key, digest),
@@ -1003,8 +1001,10 @@ export default function CopilotPanel({
   // -----------------------------------------------------------------------
   // 渲染
   // -----------------------------------------------------------------------
+  // 根节点带 @container：面板宽度有三档（标准/加宽/超宽）外加专注陪读整列，
+  // 块级组件必须按**容器**宽度自适应——视口断点在这里是错的（同一视口下面板可宽可窄）
   return (
-    <div className="flex h-full flex-col" data-paper-selection-ui="">
+    <div className="@container flex h-full flex-col" data-paper-selection-ui="">
       <div className="mb-2 flex items-center justify-between gap-2">
         <h2 className="font-semibold text-accent">Paper Copilot</h2>
         <div className="flex items-center gap-2">
@@ -1138,7 +1138,8 @@ export default function CopilotPanel({
         {messages.map((m) =>
           m.role === 'user' ? (
             <div key={m.id} className="flex flex-col items-end">
-              <div className="max-w-[92%] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
+              {/* 超宽档下 92% 会拉出一条极长的单行气泡，再加 36rem 绝对上限保住可读行长 */}
+              <div className="max-w-[min(92%,36rem)] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
                 {m.content}
               </div>
               {orphanIds.has(m.id) && (
