@@ -6,7 +6,7 @@ import type { ChatMessage } from '../lib/llmClient'
 import { buildGradingMessages, parseScoreJson, toGrade, weightedScore } from '../lib/grading'
 import { isSpeechSupported, startDictation } from '../lib/speech'
 import type { DictationSession } from '../lib/speech'
-import { useHistory, useSettings } from '../store'
+import { newAttemptId, useHistory, useSettings } from '../store'
 import MasteryDashboard from '../components/MasteryDashboard'
 
 const GRADE_STYLE: Record<Grade, string> = {
@@ -25,6 +25,9 @@ const DIMENSIONS: { key: keyof Pick<ScoreResult, 'accuracy' | 'structure' | 'bus
 
 type Phase = 'idle' | 'grading' | 'done' | 'error'
 
+// 三个删除动作（清空全部/清空本题/删单条）共用一个待确认目标：同一时刻只有一个按钮处于确认态
+type ConfirmTarget = { kind: 'all' } | { kind: 'question' } | { kind: 'one'; id: string }
+
 export default function InterviewPage() {
   const [selectedId, setSelectedId] = useState(QUESTIONS[0].id)
   const [answer, setAnswer] = useState('')
@@ -34,13 +37,14 @@ export default function InterviewPage() {
   const [error, setError] = useState('')
   const [result, setResult] = useState<{ score: ScoreResult; grade: Grade } | null>(null)
   const [showRef, setShowRef] = useState(false)
-  const [confirmClear, setConfirmClear] = useState(false)
+  const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null)
+  const [showAllHistory, setShowAllHistory] = useState(false)
   const dictationRef = useRef<DictationSession | null>(null)
   const wantDictationRef = useRef(false)
   const restartTimesRef = useRef<number[]>([]) // 自动续录的时间戳窗口，防止立即结束的浏览器无限重启
 
   const settings = useSettings()
-  const { attempts, addAttempt, clear } = useHistory()
+  const { attempts, addAttempt, clear, clearQuestion, removeAttempt } = useHistory()
 
   const question = useMemo(() => QUESTIONS.find((q) => q.id === selectedId)!, [selectedId])
   const pastAttempts = attempts.filter((a) => a.questionId === selectedId)
@@ -64,6 +68,21 @@ export default function InterviewPage() {
     setResult(null)
     setError('')
     setShowRef(false)
+    setConfirmTarget(null)
+    setShowAllHistory(false)
+  }
+
+  // 两段式确认：首次点击进入确认态，再点同一目标执行；点其他目标则切换确认态，onBlur 复原
+  function confirmThen(target: ConfirmTarget, run: () => void) {
+    const same =
+      confirmTarget?.kind === target.kind &&
+      (target.kind !== 'one' || (confirmTarget as { id?: string }).id === target.id)
+    if (same) {
+      run()
+      setConfirmTarget(null)
+    } else {
+      setConfirmTarget(target)
+    }
   }
 
   function stopDictation() {
@@ -135,7 +154,7 @@ export default function InterviewPage() {
       setResult({ score, grade })
       setPhase('done')
       addAttempt({
-        id: `${Date.now()}`,
+        id: newAttemptId(),
         questionId: question.id,
         answer,
         score,
@@ -287,7 +306,7 @@ export default function InterviewPage() {
                 ))}
               </ul>
             </div>
-            <p className="border-t border-line pt-3 text-dim">{question.referenceNotes}</p>
+            <p className="whitespace-pre-line border-t border-line pt-3 text-dim">{question.referenceNotes}</p>
           </div>
         )}
 
@@ -315,6 +334,16 @@ export default function InterviewPage() {
                 </div>
               ))}
             </div>
+            {result.score.highlights.length > 0 && (
+              <div className="mb-3">
+                <div className="mb-1 text-xs text-ok">回答亮点</div>
+                <ul className="list-inside list-disc space-y-1 text-sm leading-relaxed text-ok/90">
+                  {result.score.highlights.map((h, i) => (
+                    <li key={i}>{h}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {result.score.comments.length > 0 && (
               <div className="mb-3">
                 <div className="mb-1 text-xs text-dim">面试官点评</div>
@@ -338,38 +367,74 @@ export default function InterviewPage() {
           </div>
         )}
 
-        {pastAttempts.length > 0 && (
+        {attempts.length > 0 && (
           <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
             <div className="mb-2 flex items-center justify-between gap-3">
               <h3 className="text-sm font-semibold text-dim">本题历史（{pastAttempts.length} 次）</h3>
-              <button
-                onClick={() => {
-                  if (confirmClear) {
-                    clear()
-                    setConfirmClear(false)
-                  } else {
-                    setConfirmClear(true)
-                  }
-                }}
-                onBlur={() => setConfirmClear(false)}
-                className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
-                  confirmClear
-                    ? 'border-bad/60 bg-bad/10 font-semibold text-bad'
-                    : 'border-line bg-panel text-dim hover:text-bad'
-                }`}
-              >
-                {confirmClear ? '确认清空？（全部题目）' : '清空练习历史'}
-              </button>
+              <div className="flex items-center gap-2">
+                {pastAttempts.length > 0 && (
+                  <button
+                    onClick={() => confirmThen({ kind: 'question' }, () => clearQuestion(selectedId))}
+                    onBlur={() => setConfirmTarget(null)}
+                    className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+                      confirmTarget?.kind === 'question'
+                        ? 'border-bad/60 bg-bad/10 font-semibold text-bad'
+                        : 'border-line bg-panel text-dim hover:text-bad'
+                    }`}
+                  >
+                    {confirmTarget?.kind === 'question' ? '确认清空本题？' : '清空本题'}
+                  </button>
+                )}
+                <button
+                  onClick={() => confirmThen({ kind: 'all' }, clear)}
+                  onBlur={() => setConfirmTarget(null)}
+                  className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+                    confirmTarget?.kind === 'all'
+                      ? 'border-bad/60 bg-bad/10 font-semibold text-bad'
+                      : 'border-line bg-panel text-dim hover:text-bad'
+                  }`}
+                >
+                  {confirmTarget?.kind === 'all' ? '确认清空？（全部题目）' : '清空全部题目'}
+                </button>
+              </div>
             </div>
-            <div className="space-y-2">
-              {pastAttempts.slice(0, 5).map((a) => (
-                <div key={a.id} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">
-                  {a.grade && <span className={`rounded px-1.5 font-bold ${GRADE_STYLE[a.grade]}`}>{a.grade}</span>}
-                  <span className="flex-1 truncate text-dim">{a.answer}</span>
-                  <span className="text-xs text-dim">{new Date(a.createdAt).toLocaleString('zh-CN')}</span>
+            {pastAttempts.length === 0 ? (
+              <p className="rounded-lg bg-panel-2 px-3 py-2 text-sm text-dim">
+                本题暂无历史记录（其他题目共 {attempts.length} 条）
+              </p>
+            ) : (
+              <>
+                <div className="space-y-2">
+                  {(showAllHistory ? pastAttempts : pastAttempts.slice(0, 5)).map((a) => (
+                    <div key={a.id} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">
+                      {a.grade && <span className={`rounded px-1.5 font-bold ${GRADE_STYLE[a.grade]}`}>{a.grade}</span>}
+                      <span className="flex-1 truncate text-dim">{a.answer}</span>
+                      <span className="text-xs text-dim">{new Date(a.createdAt).toLocaleString('zh-CN')}</span>
+                      <button
+                        onClick={() => confirmThen({ kind: 'one', id: a.id }, () => removeAttempt(a.id))}
+                        onBlur={() => setConfirmTarget(null)}
+                        aria-label="删除本条记录"
+                        className={`shrink-0 transition-colors ${
+                          confirmTarget?.kind === 'one' && confirmTarget.id === a.id
+                            ? 'rounded-full border border-bad/60 bg-bad/10 px-2 py-0.5 text-xs font-semibold text-bad'
+                            : 'px-1 text-dim hover:text-bad'
+                        }`}
+                      >
+                        {confirmTarget?.kind === 'one' && confirmTarget.id === a.id ? '确认删除？' : '✕'}
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+                {pastAttempts.length > 5 && (
+                  <button
+                    onClick={() => setShowAllHistory((v) => !v)}
+                    className="mt-2 text-xs text-dim transition-colors hover:text-fg"
+                  >
+                    {showAllHistory ? '收起' : `展开全部 ${pastAttempts.length} 条`}
+                  </button>
+                )}
+              </>
+            )}
           </div>
         )}
       </section>
