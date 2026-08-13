@@ -62,11 +62,14 @@ const COPILOT_WIDTH_LABEL: Record<CopilotWidth, string> = {
 }
 
 /**
- * 正文最小宽度兜底：窗口再窄也给正文留 ≥360px。
- * 纯 CSS 连续钳位（无 JS 测量）——工作台宽度是 100vw-2rem，减掉目录列/列间距/正文下限即上限。
+ * 正文最小宽度兜底：窗口再窄也给正文留 ≥360px 的**内容区**（clientWidth，已扣掉 1px×2 边框
+ * 与 8px 滚动条，见 index.css 的 `::-webkit-scrollbar`）——即边框盒 ≥ 370px ≈ 23.125rem。
+ * 纯 CSS 连续钳位（无 JS 测量）——工作台宽度是 100vw-2rem，减掉目录列/列间距/正文下限即上限：
+ * - 有目录：100vw-2rem-16rem(w-64)-0.75rem×2(gap-3)-23.25rem = 100vw-42.75rem → 正文 372px，内容区 362px
+ * - 无目录：100vw-2rem-0.75rem(gap-3)-23.5rem = 100vw-26.25rem → 正文 376px，内容区 366px
  */
-const COPILOT_CLAMP_WITH_OUTLINE = 'max-w-[calc(100vw-42rem)]'
-const COPILOT_CLAMP_NO_OUTLINE = 'max-w-[calc(100vw-25.5rem)]'
+const COPILOT_CLAMP_WITH_OUTLINE = 'max-w-[calc(100vw-42.75rem)]'
+const COPILOT_CLAMP_NO_OUTLINE = 'max-w-[calc(100vw-26.25rem)]'
 
 function scrollAndFlash(domId: string): void {
   const el = document.getElementById(domId)

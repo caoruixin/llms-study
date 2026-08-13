@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from 'react'
 import type * as Pdfjs from 'pdfjs-dist'
-import { pageDomId } from '../../lib/paper/anchors'
+import { pageDomId, pickCurrentPage } from '../../lib/paper/anchors'
 
 /**
  * 原版 PDF 预览：pdf.js 页面渲染（canvas）+ 可选择文字层（textLayer），带视口虚拟化。
@@ -10,6 +10,9 @@ import { pageDomId } from '../../lib/paper/anchors'
  * - 只渲染视口前后 ±2 页，离开窗口立即 `canvas.width = 0` 释放位图内存——
  *   150 页 A4 若全部保留位图约需 3GB，必须及时释放；
  * - 渲染任务在页面卸载时 `cancel()`，快速滚动不会堆积任务。
+ *
+ * 「渲染窗口」与「当前第几页」是两件事，用两套判定：前者是 IntersectionObserver（要往外扩，
+ * 提前渲染），后者是滚动时的纯几何判定（要贴着容器顶边，见 `pickCurrentPage`）。
  */
 
 type PdfjsModule = typeof import('pdfjs-dist')
@@ -233,7 +236,11 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
 
   const pages = useMemo(() => (doc ? Array.from({ length: doc.numPages }, (_, i) => i + 1) : []), [doc])
 
-  // 可见页窗口：只观察占位容器，渲染与否由 active 决定
+  /**
+   * 渲染窗口：只观察占位容器，渲染与否由 active 决定。
+   * `rootMargin: '20% 0px'` 是**预渲染**语义（视口上下各多算 20% 视口高），
+   * 与「当前第几页」无关——后者见下一个 effect（QA P1：两件事共用这个可见集会累积回退一页）。
+   */
   useEffect(() => {
     const root = containerRef.current
     const el = wrapRef.current
@@ -251,13 +258,53 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
         const min = Math.min(...visible)
         const max = Math.max(...visible)
         setRange((prev) => (prev && prev.min === min && prev.max === max ? prev : { min, max }))
-        onVisiblePage(min)
       },
       { root, rootMargin: '20% 0px', threshold: 0 },
     )
     for (const node of el.querySelectorAll('[data-page]')) io.observe(node)
     return () => io.disconnect()
-  }, [containerRef, onVisiblePage, pages.length])
+  }, [containerRef, pages.length])
+
+  /**
+   * 当前页：纯几何判定——盖住滚动容器顶边的那一页（`pickCurrentPage`）。
+   * 用滚动事件 + rAF 节流而不是第二个 IntersectionObserver：一帧最多算一次，
+   * 且读数与「这一帧的滚动位置」严格对应，没有 IO 回调的时序歧义。
+   */
+  useEffect(() => {
+    const root = containerRef.current
+    const el = wrapRef.current
+    if (!root || !el || !pages.length) return
+    const nodes = Array.from(el.querySelectorAll<HTMLElement>('[data-page]'))
+    if (!nodes.length) return
+    let frame = 0
+    let reported = 0
+    const measure = () => {
+      frame = 0
+      // 专注陪读把正文整列 display:none：矩形全塌成 0，这时的读数没有意义
+      if (!root.clientHeight) return
+      // clientTop = 上边框宽度：容器的滚动视口从边框内侧开始
+      const viewportTop = root.getBoundingClientRect().top + root.clientTop
+      const edges = nodes.map((node) => {
+        const r = node.getBoundingClientRect()
+        return { page: Number(node.dataset.page), top: r.top, bottom: r.bottom }
+      })
+      const page = pickCurrentPage(edges, viewportTop)
+      if (page === undefined || page === reported) return
+      reported = page
+      onVisiblePage(page)
+    }
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(measure)
+    }
+    root.addEventListener('scroll', schedule, { passive: true })
+    // scrollTop 为 0 时不主动结算：PDF 刚挂载、alignToPosition 还没把恢复的阅读位置滚上去，
+    // 此时结算只会把「当前页」冲成第 1 页。真正需要重算的场景（宽度变化改了页高）scrollTop 都不为 0。
+    if (root.scrollTop > 0) schedule()
+    return () => {
+      root.removeEventListener('scroll', schedule)
+      if (frame) cancelAnimationFrame(frame)
+    }
+  }, [containerRef, onVisiblePage, pages.length, layoutTick])
 
   if (error) {
     return (

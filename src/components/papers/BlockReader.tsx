@@ -1,5 +1,5 @@
 import { useEffect, type RefObject } from 'react'
-import { blockDomId } from '../../lib/paper/anchors'
+import { CURRENT_PAGE_EPSILON, blockDomId } from '../../lib/paper/anchors'
 import { sanitizeDocxHtml } from '../../lib/paper/sanitize'
 import type { PaperBlock } from '../../lib/paper/types'
 
@@ -62,7 +62,10 @@ export default function BlockReader({ blocks, containerRef, onVisibleBlock }: Pr
   useEffect(() => {
     const root = containerRef.current
     if (!root || !blocks.length) return
-    // 只统计「视口上 1/4 区域」内的块：翻页时当前位置的判定不会来回跳
+    // 只统计「视口上 1/4 区域」内的块：翻页时当前位置的判定不会来回跳。
+    // 顶边再内缩 CURRENT_PAGE_EPSILON：跳转/切视图对齐后（scroll-mt-4）上一个块的底边会在
+    // 顶边下方残留几个像素（实测 4px），不内缩就会被 min 取走，位置倒退一个块——
+    // 若那个块正好跨页，页码就整整退一页（与 PdfViewer 的当前页判定同一个口径）。
     const visible = new Set<number>()
     const io = new IntersectionObserver(
       (entries) => {
@@ -74,7 +77,7 @@ export default function BlockReader({ blocks, containerRef, onVisibleBlock }: Pr
         }
         if (visible.size) onVisibleBlock(Math.min(...visible))
       },
-      { root, rootMargin: '0px 0px -75% 0px', threshold: 0 },
+      { root, rootMargin: `-${CURRENT_PAGE_EPSILON}px 0px -75% 0px`, threshold: 0 },
     )
     for (const el of root.querySelectorAll('[data-block-index]')) io.observe(el)
     return () => io.disconnect()
