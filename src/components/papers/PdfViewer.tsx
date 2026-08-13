@@ -203,6 +203,10 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
     let timer = 0
     let lastWidth = el.clientWidth
     const apply = (w: number) => {
+      // 专注陪读把正文整列 display:none：RO 会报 0 宽，若照单全收就会以 scale 下限重绘一遍，
+      // 恢复正文时再重绘回来。短路掉这种「不可能是真实排版宽度」的读数，lastWidth 保持不变，
+      // 恢复后同宽 → 零重绘。
+      if (w < 50) return
       // 只认宽度变化：被观察元素的高度会随页面渲染不断增长，若一并触发就成了自激重绘
       if (Math.abs(w - lastWidth) < 1) return
       lastWidth = w

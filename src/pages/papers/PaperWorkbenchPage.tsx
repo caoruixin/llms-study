@@ -15,7 +15,16 @@ import { createPaperRepository } from '../../lib/paper/repo/paperRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
 import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
 import type { PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
-import { MAX_ASK_TEXT, PAPER_ASK_ACTIONS, usePaperUi, type PaperAskAction } from './paperUiStore'
+import {
+  MAX_ASK_TEXT,
+  PAPER_ASK_ACTIONS,
+  allowedCopilotWidths,
+  effectiveCopilotWidth,
+  nextCopilotWidth,
+  usePaperUi,
+  type CopilotWidth,
+  type PaperAskAction,
+} from './paperUiStore'
 
 /**
  * 阅读工作台（§3.3）：左栏目录/进度/搜索 · 中栏正文阅读器 · 右栏 Copilot（Phase 3 接入）。
@@ -35,6 +44,36 @@ const MODE_TABS = [
   { id: 'original', label: '原版 PDF' },
   { id: 'text', label: '文本视图' },
 ] as const satisfies readonly { readonly id: ReaderMode; readonly label: string }[]
+
+/**
+ * Copilot 宽度档位 → 类名。必须是完整字面量（Tailwind 只扫描源码里出现的完整类名，
+ * 拼接出来的 `w-${x}` 不会被生成），沿 TransformerDiagram.tsx:41 的映射表先例。
+ */
+const COPILOT_WIDTH_CLASS: Record<CopilotWidth, string> = {
+  standard: 'w-80 xl:w-88',
+  wide: 'w-[30rem]',
+  max: 'w-[40rem]',
+}
+
+const COPILOT_WIDTH_LABEL: Record<CopilotWidth, string> = {
+  standard: '标准',
+  wide: '加宽',
+  max: '超宽',
+}
+
+/**
+ * 正文最小宽度兜底：窗口再窄也给正文留 ≥360px。
+ * 纯 CSS 连续钳位（无 JS 测量）——工作台宽度是 100vw-2rem，减掉目录列/列间距/正文下限即上限。
+ */
+const COPILOT_CLAMP_WITH_OUTLINE = 'max-w-[calc(100vw-42rem)]'
+const COPILOT_CLAMP_NO_OUTLINE = 'max-w-[calc(100vw-25.5rem)]'
+
+function scrollAndFlash(domId: string): void {
+  const el = document.getElementById(domId)
+  if (!el) return
+  el.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  flashElement(el)
+}
 
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(() =>
@@ -94,11 +133,15 @@ export default function PaperWorkbenchPage() {
   const {
     copilotOpen,
     outlineOpen,
+    copilotWidth,
+    readerCollapsed,
     pendingAsks,
     briefUi,
     briefData,
     setCopilotOpen,
     setOutlineOpen,
+    setCopilotWidth,
+    setReaderCollapsed,
     addPendingAsk,
     removePendingAsk,
     clearPendingAsks,
@@ -106,6 +149,17 @@ export default function PaperWorkbenchPage() {
     setBriefUi,
     requestBrief,
   } = usePaperUi()
+
+  // 平板没有超宽档：偏好留在 store 不动，只在渲染层钳位（回到桌面仍是超宽）
+  const allowedWidths = useMemo(() => allowedCopilotWidths(isDesktop), [isDesktop])
+  const widthTier = effectiveCopilotWidth(copilotWidth, allowedWidths)
+  /** 专注陪读只在双栏及以上成立：手机是底部面板，正文永远在 */
+  const readerHidden = isTablet && copilotOpen && readerCollapsed
+  /** 首次展开才挂载 Copilot（保 §4.7 懒加载）；此后收起只是 display:none——输入/选区/流式全部留着 */
+  const [copilotEverOpened, setCopilotEverOpened] = useState(false)
+  useEffect(() => {
+    if (copilotOpen) setCopilotEverOpened(true)
+  }, [copilotOpen])
 
   // ---------------------------------------------------------------------
   // 数据装载
@@ -137,8 +191,12 @@ export default function PaperWorkbenchPage() {
     }
   }, [paperId, repo])
 
-  // 「启动 Copilot」入口带 ?copilot=open（HashRouter 下 query 在 hash 内，useSearchParams 正常工作）
+  // 「启动 Copilot」入口带 ?copilot=open（HashRouter 下 query 在 hash 内，useSearchParams 正常工作）。
+  // 只在首次挂载生效一次：否则用户手动收起后，任何一次 searchParams 变化都会把面板重新弹开。
+  const copilotParamRef = useRef(false)
   useEffect(() => {
+    if (copilotParamRef.current) return
+    copilotParamRef.current = true
     if (searchParams.get('copilot') === 'open') setCopilotOpen(true)
   }, [searchParams, setCopilotOpen])
 
@@ -232,15 +290,23 @@ export default function PaperWorkbenchPage() {
   positionRef.current = position
   const formatRef = useRef(paper?.format ?? 'pdf')
   formatRef.current = paper?.format ?? 'pdf'
+  const readerHiddenRef = useRef(readerHidden)
+  readerHiddenRef.current = readerHidden
+  /** 跳转触发的展开由 scrollToAnchor 自己接管滚动，别让「手动恢复正文」的重对齐再抢一次 */
+  const jumpExpandRef = useRef(false)
 
   const scrollToAnchor = useCallback((anchor: Partial<SourceAnchor> | null | undefined): ScrollTarget => {
     const target = resolveAnchor(anchor, anchorCtxRef.current, modeRef.current)
-    if (target.domId) {
-      const el = document.getElementById(target.domId)
-      if (el) {
-        el.scrollIntoView({ block: 'start', behavior: 'smooth' })
-        flashElement(el)
-      }
+    const domId = target.domId
+    // 专注陪读下正文是 display:none：目标元素没有布局，必须先展开、等两帧排版完成再滚
+    const expanding = readerHiddenRef.current
+    if (expanding) {
+      jumpExpandRef.current = true
+      setReaderCollapsed(false)
+    }
+    if (domId) {
+      if (expanding) requestAnimationFrame(() => requestAnimationFrame(() => scrollAndFlash(domId)))
+      else scrollAndFlash(domId)
     }
     // 程序化跳转（引用回跳 / 目录）立刻把「当前第 N 页」推到目标位置：
     // 平滑滚动期间 IntersectionObserver 要几百毫秒才结算，等它会让指示器长时间停在旧页
@@ -260,7 +326,7 @@ export default function PaperWorkbenchPage() {
       }
     }
     return target
-  }, [])
+  }, [setReaderCollapsed])
 
   /** 内容就绪 / 切换视图后，把滚动位置对齐到当前阅读位置（不高亮，避免每次进页面都闪一下） */
   const alignToPosition = useCallback(() => {
@@ -297,6 +363,20 @@ export default function PaperWorkbenchPage() {
     if (mode !== 'text' || !blocks.length || !paperId) return
     alignOnce(`${paperId}:text`)
   }, [mode, blocks.length, paperId, alignOnce])
+
+  /**
+   * 退出专注陪读要重对齐：display:none 期间滚动容器的 scrollTop 被清空，
+   * 而阅读位置活在 React state 里，按它滚回去即可。
+   * 跳转触发的展开除外——那条路径自己会滚到目标，两股滚动会打架。
+   */
+  const wasReaderHidden = useRef(false)
+  useEffect(() => {
+    if (wasReaderHidden.current && !readerHidden) {
+      if (jumpExpandRef.current) jumpExpandRef.current = false
+      else alignToPosition()
+    }
+    wasReaderHidden.current = readerHidden
+  }, [readerHidden, alignToPosition])
 
   const handlePdfLoaded = useCallback(() => {
     if (paperId) alignOnce(`${paperId}:original`)
@@ -512,9 +592,20 @@ export default function PaperWorkbenchPage() {
   )
 
   const showOutlineColumn = isDesktop && outlineOpen
-  const showCopilotColumn = isTablet && copilotOpen
   const showOutlineDrawer = !isDesktop && drawerOpen
+  /**
+   * copilotPane 只会被挂载一次：列（isTablet）与手机底部面板（!isTablet）互斥，
+   * 同一时刻只有一个分支进树，复用这个变量不会出现两份 CopilotPanel 抢同一个会话。
+   * 列一旦首开就常驻（收起=hidden），底部面板沿用收起即卸载（手机内存优先，且无多列可占）。
+   */
+  const showCopilotColumn = isTablet && copilotEverOpened
   const showCopilotSheet = !isTablet && copilotOpen
+  // 专注陪读下宽度档失效：Copilot 直接吃掉正文让出的整列
+  const copilotColumnClass = !copilotOpen
+    ? 'hidden'
+    : readerHidden
+      ? 'min-w-0 flex-1'
+      : `shrink-0 ${COPILOT_WIDTH_CLASS[widthTier]} ${showOutlineColumn ? COPILOT_CLAMP_WITH_OUTLINE : COPILOT_CLAMP_NO_OUTLINE}`
 
   return (
     <ReaderProvider value={readerApi}>
@@ -559,6 +650,28 @@ export default function PaperWorkbenchPage() {
                 {outlineOpen ? '收起目录' : '展开目录'}
               </button>
             )}
+            {/* 布局控件放 header：与「收起目录」同列，不动 CopilotPanel 内部，也不污染手机端 */}
+            {isTablet && copilotOpen && (
+              <>
+                <button
+                  type="button"
+                  disabled={readerCollapsed}
+                  onClick={() => setCopilotWidth(nextCopilotWidth(widthTier, allowedWidths))}
+                  title="切换 Copilot 面板宽度"
+                  className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-panel"
+                >
+                  宽度：{COPILOT_WIDTH_LABEL[widthTier]}
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={readerCollapsed}
+                  onClick={() => setReaderCollapsed(!readerCollapsed)}
+                  className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 aria-pressed:border-accent/60 aria-pressed:text-accent"
+                >
+                  {readerCollapsed ? '恢复正文' : '专注陪读'}
+                </button>
+              </>
+            )}
             {!copilotOpen && (
               <button
                 type="button"
@@ -578,9 +691,22 @@ export default function PaperWorkbenchPage() {
             </aside>
           )}
 
+          {/* 专注陪读：正文隐藏但不卸载（PDF 位图/文本视图布局都留着），留一条竖排细条随时回来 */}
+          {readerHidden && (
+            <button
+              type="button"
+              onClick={() => setReaderCollapsed(false)}
+              className="w-10 shrink-0 rounded-xl border border-line bg-panel py-3 text-xs text-dim shadow-sm transition-colors hover:bg-panel-2 hover:text-fg"
+            >
+              <span className="[writing-mode:vertical-rl] whitespace-nowrap">
+                展开正文{position.page !== undefined ? ` · 第 ${position.page} 页` : ''}
+              </span>
+            </button>
+          )}
+
           <main
             ref={readerRef}
-            className="min-w-0 flex-1 overflow-y-auto rounded-xl border border-line bg-panel p-4 shadow-sm"
+            className={`${readerHidden ? 'hidden' : 'min-w-0 flex-1'} overflow-y-auto rounded-xl border border-line bg-panel p-4 shadow-sm`}
           >
             {mode === 'original' && paper.format === 'pdf' ? (
               bytesError ? (
@@ -601,7 +727,7 @@ export default function PaperWorkbenchPage() {
           </main>
 
           {showCopilotColumn && (
-            <aside className="w-80 shrink-0 overflow-hidden rounded-xl border border-line bg-panel p-4 shadow-sm xl:w-88">
+            <aside className={`${copilotColumnClass} overflow-hidden rounded-xl border border-line bg-panel p-4 shadow-sm`}>
               {copilotPane}
             </aside>
           )}

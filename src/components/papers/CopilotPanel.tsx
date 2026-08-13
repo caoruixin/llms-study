@@ -1003,8 +1003,10 @@ export default function CopilotPanel({
   // -----------------------------------------------------------------------
   // 渲染
   // -----------------------------------------------------------------------
+  // 根节点带 @container：面板宽度有三档（标准/加宽/超宽）外加专注陪读整列，
+  // 块级组件必须按**容器**宽度自适应——视口断点在这里是错的（同一视口下面板可宽可窄）
   return (
-    <div className="flex h-full flex-col" data-paper-selection-ui="">
+    <div className="@container flex h-full flex-col" data-paper-selection-ui="">
       <div className="mb-2 flex items-center justify-between gap-2">
         <h2 className="font-semibold text-accent">Paper Copilot</h2>
         <div className="flex items-center gap-2">
@@ -1138,7 +1140,8 @@ export default function CopilotPanel({
         {messages.map((m) =>
           m.role === 'user' ? (
             <div key={m.id} className="flex flex-col items-end">
-              <div className="max-w-[92%] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
+              {/* 超宽档下 92% 会拉出一条极长的单行气泡，再加 36rem 绝对上限保住可读行长 */}
+              <div className="max-w-[min(92%,36rem)] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
                 {m.content}
               </div>
               {orphanIds.has(m.id) && (

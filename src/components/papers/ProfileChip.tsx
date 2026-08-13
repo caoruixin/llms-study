@@ -5,12 +5,13 @@ import { LEARNER_LEVELS, type LearnerLevel, type ProfileSummary } from '../../li
  * 学习画像层级 chip（§6.2 UI）：展示当前生效层级与来源（自动/手动），
  * 点开可 pin 到指定层级、恢复自动，或重置画像（清 conceptStates + evidence）。
  *
- * 定位（§3.3 响应式）：popover 必须**向右**展开并把宽度压在面板内宽以内——
- * Copilot 面板容器是 `w-80 overflow-hidden`，向左展开（right-0）会被整片裁掉，
+ * 定位（§3.3 响应式）：popover 必须**向右**展开并把宽度压在**最窄**面板的内宽以内——
+ * Copilot 面板容器是 `overflow-hidden`，宽度最窄一档是 w-80（标准档；加宽 30rem / 超宽 40rem /
+ * 专注陪读整列都更宽），向左展开（right-0）会被整片裁掉，
  * 「入门」按钮与「重置画像」在桌面与 390px 下都点不到。
  */
 
-/** popover 宽度上限：≤ 面板内宽（w-80 减 p-4 两侧 = 288px），390px 手机面板同样容得下 */
+/** popover 宽度上限：≤ 最窄档面板内宽（w-80 减 p-4 两侧 = 288px），390px 手机面板同样容得下 */
 const POPOVER_CLASS = 'w-56 max-w-[min(14rem,calc(100vw-3rem))]'
 
 interface Props {
