@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createSseParser, extractStreamDelta, extractStreamError } from './sse'
+import { createSseParser, extractStreamDelta, extractStreamError, extractStreamUsage } from './sse'
 
 describe('createSseParser（事件级解析）', () => {
   it('单事件单 data 行', () => {
@@ -101,5 +101,62 @@ describe('extractStreamError', () => {
     expect(extractStreamError({ choices: [{ delta: { content: 'hi' } }] })).toBeNull()
     expect(extractStreamError(null)).toBeNull()
     expect(extractStreamError({ error: { code: 500 } })).toBeNull()
+  })
+})
+
+describe('extractStreamUsage（Phase 3 加法）', () => {
+  it('DeepSeek 形：choices 空数组 + 顶层 usage', () => {
+    expect(
+      extractStreamUsage({ choices: [], usage: { prompt_tokens: 120, completion_tokens: 45, total_tokens: 165 } }),
+    ).toEqual({ inputTokens: 120, outputTokens: 45 })
+  })
+
+  it('choices 缺失 + 顶层 usage 也识别', () => {
+    expect(extractStreamUsage({ usage: { prompt_tokens: 8, completion_tokens: 2 } })).toEqual({
+      inputTokens: 8,
+      outputTokens: 2,
+    })
+  })
+
+  it('Kimi 形：usage 挂在 choices[0] 内（finish_reason 帧）', () => {
+    expect(
+      extractStreamUsage({
+        choices: [
+          { index: 0, delta: {}, finish_reason: 'stop', usage: { prompt_tokens: 300, completion_tokens: 77 } },
+        ],
+      }),
+    ).toEqual({ inputTokens: 300, outputTokens: 77 })
+  })
+
+  it('普通 delta 帧（无 usage）→ null', () => {
+    expect(extractStreamUsage({ choices: [{ delta: { content: '你好' } }] })).toBeNull()
+  })
+
+  it('usage 字段残缺 / 非数值 → null', () => {
+    expect(extractStreamUsage({ choices: [], usage: { prompt_tokens: 12 } })).toBeNull()
+    expect(extractStreamUsage({ choices: [], usage: { prompt_tokens: '12', completion_tokens: 3 } })).toBeNull()
+    expect(extractStreamUsage({ choices: [], usage: { prompt_tokens: NaN, completion_tokens: 3 } })).toBeNull()
+    expect(extractStreamUsage(null)).toBeNull()
+    expect(extractStreamUsage('[DONE]')).toBeNull()
+    expect(extractStreamUsage({})).toBeNull()
+    expect(extractStreamUsage({ choices: [null] })).toBeNull()
+  })
+
+  it('顶层 usage 优先于 choice 内 usage', () => {
+    expect(
+      extractStreamUsage({
+        choices: [{ usage: { prompt_tokens: 1, completion_tokens: 1 } }],
+        usage: { prompt_tokens: 9, completion_tokens: 9 },
+      }),
+    ).toEqual({ inputTokens: 9, outputTokens: 9 })
+  })
+
+  it('DeepSeek v4-pro 实测形：finish 帧 choices 非空 + 顶层 usage（2026-08-12 冒烟录得）', () => {
+    expect(
+      extractStreamUsage({
+        choices: [{ index: 0, delta: { content: '' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 5, total_tokens: 12 },
+      }),
+    ).toEqual({ inputTokens: 7, outputTokens: 5 })
   })
 })

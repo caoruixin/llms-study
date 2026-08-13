@@ -86,8 +86,13 @@ export default function SelectionAsk() {
       return inAskUi(el) || el.closest('textarea, input') !== null
     }
 
+    // 论文工作区自带选区快捷条（PLAN §3.3 选区冲突机制）：/papers 内全局 Ask 让位早退。
+    // 用 pathnameRef 而非 pathname：本 effect 空依赖，当前路由由渲染期同步进 ref。
+    const inPaperWorkspace = () => pathnameRef.current.startsWith('/papers')
+
     const onPointerUp = (e: PointerEvent) => {
       clear()
+      if (inPaperWorkspace()) return
       if (excluded(e.target)) return
       // 延后一拍读选区：pointerup 当帧 selection 还可能是旧值
       timer = setTimeout(() => {
@@ -107,6 +112,7 @@ export default function SelectionAsk() {
 
     // 点他处 / Esc / 路由跳转导致选区塌陷 → 收起按钮
     const onSelectionChange = () => {
+      if (inPaperWorkspace()) return // 同上：论文选区不归全局 Ask 管
       const sel = window.getSelection()
       if (!sel || sel.isCollapsed || sel.toString().trim() === '') {
         clear()
