@@ -88,8 +88,8 @@ export interface CompletePaperJsonRequest {
   task?: string
   /** 返回 null 表示结构不合法（触发修复阶梯）；不传则不校验 */
   validate?: (raw: string) => unknown | null
-  /** §5.5：结构化失败且已授权 Moonshot 时的跨厂兜底 spec；未授权时静默跳过 */
-  kimiFallback?: PaperCallSpec | null
+  /** §5.5：主调用+同模型修复均失败后的兜底 spec（按其 provider 检查授权，未授权静默跳过）；生产现喂 DeepSeek（用户决策 2026-08-13），机制保持 provider 通用 */
+  structuredFallback?: PaperCallSpec | null
   onWait?: (waitMs: number) => void
 }
 
@@ -463,12 +463,12 @@ export function createModelGateway(deps: GatewayDeps): ModelGateway {
     }
 
     // 已授权才切 Kimi strict schema（未授权禁跨厂回退）
-    if (req.kimiFallback && !req.signal?.aborted) {
-      const fbProvider = req.kimiFallback.cap.provider
+    if (req.structuredFallback && !req.signal?.aborted) {
+      const fbProvider = req.structuredFallback.cap.provider
       if (await deps.hasConsent(fbProvider)) {
         try {
           checkBreaker(fbProvider)
-          const fb = await callJsonWithRetry(req.kimiFallback, req.messages, req)
+          const fb = await callJsonWithRetry(req.structuredFallback, req.messages, req)
           track(fb.usage)
           lastRaw = fb.raw
           lastUsage = fb.usage

@@ -96,7 +96,7 @@ interface Props {
   onToggleSensitive: (sensitive: boolean) => void
 }
 
-/** 本轮任务档位：chat/deep 走 DeepSeek，deepAlt 是用户显式点击的 Kimi 深度升级（§5.1） */
+/** 本轮任务档位：chat/deep/deepAlt 均走 DeepSeek（用户决策 2026-08-13）；deepAlt 为显式点击的深度解释重发 */
 type TurnTask = 'chat' | 'deep' | 'deepAlt'
 
 interface SendParams {
@@ -112,7 +112,7 @@ interface SendParams {
   extraDirectives?: readonly string[]
   /** teach-back 轮：verdict 岛回写画像时的概念 */
   teachBackConcept?: string
-  /** 回答来源标注（并列展示 Kimi 深度解释时） */
+  /** 回答来源标注（并列展示深度解释时，如 deepseek-v4-pro · 深度解释） */
   sourceLabel?: string
   /** 问题由用户自己写（不是脚本/模板）：只有这种问题才做抽象度启发式画像 */
   userAuthored?: boolean
@@ -624,7 +624,7 @@ export default function CopilotPanel({
   }, [busy, guidedCtx, runGuidedStep])
 
   // -----------------------------------------------------------------------
-  // teach-back / 深度反馈 / Kimi 深度升级
+  // teach-back / 深度反馈 / 深度解释（deepAlt）
   // -----------------------------------------------------------------------
   const sendTeachBack = useCallback(
     (payload: { prompt: string; answer: string; concept?: string }) => {
@@ -909,7 +909,7 @@ export default function CopilotPanel({
               signal: ctrl.signal,
               task: req.task,
               validate: req.validate,
-              kimiFallback:
+              structuredFallback:
                 req.task === 'brief-synthesis'
                   ? buildStructuredFallbackSpec(PAPER_TASKS.briefSynthesis.maxOutputTokens)
                   : buildStructuredFallbackSpec(digestSpec.maxOutputTokens),

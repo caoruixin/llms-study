@@ -335,7 +335,7 @@ describe('modelGateway · completePaperJson（修复阶梯）', () => {
     const { calls } = stubFetch((c) => (c.url.startsWith('/api/moonshot') ? goodJson : badJson))
     const gw = makeGateway()
     const r = await gw.gateway.completePaperJson(
-      jsonReq({ kimiFallback: buildKimiStructuredSpec('digest', { type: 'object' }, 900) }),
+      jsonReq({ structuredFallback: buildKimiStructuredSpec('digest', { type: 'object' }, 900) }),
     )
     expect(r.parsed).toEqual({ v: 1 })
     expect(r.usedFallbackModel).toBe(true)
@@ -350,7 +350,7 @@ describe('modelGateway · completePaperJson（修复阶梯）', () => {
     const { calls } = stubFetch(() => badJson)
     const gw = makeGateway({ hasConsent: (p) => p === 'deepseek' })
     const r = await gw.gateway.completePaperJson(
-      jsonReq({ kimiFallback: buildKimiStructuredSpec('digest', { type: 'object' }, 900) }),
+      jsonReq({ structuredFallback: buildKimiStructuredSpec('digest', { type: 'object' }, 900) }),
     )
     expect(r.parsed).toBeNull()
     expect(r.raw).toBe('不是 JSON')
