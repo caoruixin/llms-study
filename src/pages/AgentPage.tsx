@@ -1,9 +1,17 @@
 import { useState } from 'react'
 import { AGENT_ELEMENTS, AGENT_PITFALLS, FC_LOOP, GRAPH_NODES } from '../data/agent'
 
-function Box({ title, sub, tone = 'default' }: { title: string; sub?: string; tone?: 'default' | 'accent' | 'ok' | 'warn' }) {
+function Box({ title, sub, tone = 'default' }: { title: string; sub?: string; tone?: 'default' | 'accent' | 'ok' | 'warn' | 'model' }) {
   const border =
-    tone === 'accent' ? 'border-accent/60 bg-accent/10' : tone === 'ok' ? 'border-ok/50 bg-ok/10' : tone === 'warn' ? 'border-warn/50 bg-warn/10' : 'border-line bg-panel-2'
+    tone === 'accent'
+      ? 'border-accent/60 bg-accent/10'
+      : tone === 'ok'
+        ? 'border-ok/50 bg-ok/10'
+        : tone === 'warn'
+          ? 'border-warn/50 bg-warn/10'
+          : tone === 'model'
+            ? 'border-accent-2/60 bg-accent-2/10'
+            : 'border-line bg-panel-2'
   return (
     <div className={`rounded-lg border px-3 py-2 text-center ${border}`}>
       <div className="text-sm font-medium">{title}</div>
@@ -58,25 +66,41 @@ export default function AgentPage() {
           <div className="mx-auto max-w-3xl">
             <Box title="用户请求" tone="accent" />
             <V />
-            <Box title="入口 / 路由" sub="鉴权 · 会话加载 · 简单问题直答分流" />
-            <V />
-            <div className="rounded-xl border-2 border-dashed border-accent-2/50 p-4">
-              <div className="mb-2 text-center text-xs font-semibold text-accent-2">Agent 循环（直到任务完成）</div>
-              <div className="grid gap-2 sm:grid-cols-3">
-                <Box title="规划" sub="拆解 · 更新计划" />
-                <Box title="工具调用" sub="模型提议 → 运行时执行" />
-                <Box title="观察" sub="结果回填 · 校验 · 反思" />
+            <div className="rounded-xl border-2 border-dim/50 p-3 sm:p-4">
+              <div className="flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 text-xs font-semibold">
+                <span>Agent =</span>
+                <span className="rounded bg-accent-2/20 px-1.5 py-0.5 text-accent-2">基础模型（LLM）</span>
+                <span>+</span>
+                <span className="rounded border border-line bg-panel-2 px-1.5 py-0.5 text-dim">Harness（运行时脚手架）</span>
               </div>
-              <div className="my-2 text-center text-xs text-dim">工具层（按需调用）↓</div>
-              <div className="grid gap-2 sm:grid-cols-3">
-                <Box title="检索工具（RAG 管线）" sub="查询改写 → 向量召回 → 重排 → 注入" tone="ok" />
-                <Box title="业务 API" sub="查订单 / 下工单（鉴权+幂等）" />
-                <Box title="代码执行" sub="计算 / 数据分析（沙箱）" />
+              <div className="mb-2 mt-1 text-center text-[11px] text-dim">紫色框 = 模型职责；其余组件均在应用侧（Harness）</div>
+              <Box title="入口 / 路由" sub="鉴权 · 会话加载 · 简单问题直答分流" />
+              <V />
+              <div className="rounded-xl border-2 border-dashed border-dim/40 p-3 sm:p-4">
+                <div className="mb-2 text-center text-xs font-semibold text-dim">Agent 循环（Harness 编排 · 直到任务完成）</div>
+                <div className="mx-auto max-w-sm">
+                  <Box title="基础模型（LLM）" sub="每轮：读上下文 → 推理规划 → 提议 tool_call 或产出回答" tone="model" />
+                </div>
+                <div className="my-1.5 flex flex-wrap justify-center gap-x-4 gap-y-0.5 text-center text-[11px] text-dim">
+                  <span>↓ 提议（tool_call / 最终回答）</span>
+                  <span>↑ 上下文组装 · 观察回填</span>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <Box title="规划" sub="拆解 · 更新计划" tone="model" />
+                  <Box title="工具调用" sub="模型提议 → Harness 执行" />
+                  <Box title="观察" sub="结果回填 · 校验 · 反思" />
+                </div>
+                <div className="my-2 text-center text-xs text-dim">工具层（Harness 执行 · 按需调用）↓</div>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <Box title="检索工具（RAG 管线）" sub="查询改写 → 向量召回 → 重排 → 注入" tone="ok" />
+                  <Box title="业务 API" sub="查订单 / 下工单（鉴权+幂等）" />
+                  <Box title="代码执行" sub="计算 / 数据分析（沙箱）" />
+                </div>
               </div>
-            </div>
-            <div className="my-2 grid grid-cols-2 gap-2">
-              <Box title="记忆层" sub="会话 scratchpad / 用户画像 / 知识库写回" tone="warn" />
-              <Box title="观测与评估" sub="全链路 tracing · 任务级成功率" tone="warn" />
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <Box title="记忆层" sub="会话 scratchpad / 用户画像 / 知识库写回" tone="warn" />
+                <Box title="观测与评估" sub="全链路 tracing · 任务级成功率" tone="warn" />
+              </div>
             </div>
             <V />
             <Box title="生成回答 + 引用溯源" sub="toB 场景 citations 几乎是硬需求" tone="accent" />
