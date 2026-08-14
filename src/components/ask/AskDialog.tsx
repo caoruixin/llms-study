@@ -230,7 +230,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
             {busy ? (
               <button
                 onClick={onStop}
-                className="rounded-lg border border-line bg-panel px-4 py-1.5 text-sm font-medium text-bad transition-colors hover:bg-panel-2"
+                className="min-h-10 rounded-lg border border-line bg-panel px-4 py-1.5 text-sm font-medium text-bad transition-colors hover:bg-panel-2 md:min-h-0"
               >
                 ■ 停止
               </button>
@@ -238,7 +238,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
               <button
                 onClick={submit}
                 disabled={busy || !text.trim()}
-                className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
+                className="min-h-10 rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40 md:min-h-0"
               >
                 发送
               </button>

@@ -19,7 +19,12 @@ export default function Drawer({ open, onClose, title, children, widthClass = 'w
       <div className={`h-full ${widthClass} overflow-hidden border-l border-line bg-panel p-4 shadow-lg`}>
         <div className="mb-2 flex items-center justify-between">
           <span className="text-sm font-semibold text-fg">{title}</span>
-          <button type="button" onClick={onClose} className="text-sm text-dim hover:text-fg">
+          {/* -my-2.5 抵消 py-2.5：拿到 40px 高的触控热区，同时标题行高度与抽屉体 h-[calc(100%-2rem)] 的假设不变 */}
+          <button
+            type="button"
+            onClick={onClose}
+            className="-my-2.5 -mr-3 rounded px-3 py-2.5 text-sm text-dim hover:text-fg"
+          >
             关闭
           </button>
         </div>

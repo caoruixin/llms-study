@@ -401,14 +401,14 @@ export default function PapersPage() {
                       <button
                         type="button"
                         onClick={() => navigate(`/papers/${p.id}`)}
-                        className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2"
+                        className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
                       >
                         预览
                       </button>
                       <button
                         type="button"
                         onClick={() => navigate(`/papers/${p.id}?copilot=open`)}
-                        className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90"
+                        className="min-h-10 rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90 md:min-h-0"
                       >
                         启动 Copilot
                       </button>
@@ -418,7 +418,7 @@ export default function PapersPage() {
                     <button
                       type="button"
                       onClick={() => retry(p)}
-                      className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2"
+                      className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
                     >
                       重试
                     </button>
@@ -428,14 +428,14 @@ export default function PapersPage() {
                       <button
                         type="button"
                         onClick={() => void remove(p.id)}
-                        className="rounded-lg border border-bad/50 bg-panel px-3 py-1.5 text-sm text-bad transition-colors hover:bg-panel-2"
+                        className="min-h-10 rounded-lg border border-bad/50 bg-panel px-3 py-1.5 text-sm text-bad transition-colors hover:bg-panel-2 md:min-h-0"
                       >
                         确认删除
                       </button>
                       <button
                         type="button"
                         onClick={() => setConfirmDeleteId(null)}
-                        className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2"
+                        className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:min-h-0"
                       >
                         取消
                       </button>
@@ -444,7 +444,7 @@ export default function PapersPage() {
                     <button
                       type="button"
                       onClick={() => setConfirmDeleteId(p.id)}
-                      className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2"
+                      className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:min-h-0"
                     >
                       删除
                     </button>
