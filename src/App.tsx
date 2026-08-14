@@ -1,5 +1,5 @@
 import { Suspense, lazy } from 'react'
-import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
+import { NavLink, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import ArchitecturePage from './pages/ArchitecturePage'
 import InferencePage from './pages/InferencePage'
 import AgentPage from './pages/AgentPage'
@@ -8,6 +8,7 @@ import InterviewPage from './pages/InterviewPage'
 import SettingsPage from './pages/SettingsPage'
 import SelectionAsk from './components/ask/SelectionAsk'
 import ErrorBoundary from './components/ErrorBoundary'
+import MobileTabBar from './components/ui/MobileTabBar'
 import { NAV } from './nav'
 
 // 论文陪读 build-time flag：与 nav.ts 同一开关，一处关闭即无导航项也无路由（不留死链接）。
@@ -31,8 +32,11 @@ function PageLoading() {
 }
 
 export default function App() {
+  const { pathname } = useLocation()
+  // 工作台是沉浸态，自带 z-40 底部 Copilot 面板：/papers/:id 下不与底部 Tab Bar 共存
+  const hideTabBar = /^\/papers\/./.test(pathname)
   return (
-    <div className="min-h-screen">
+    <div className="min-h-dvh">
       <header className="sticky top-0 z-40 border-b border-line bg-ink/90 backdrop-blur">
         {/* 窄屏（~390px）导航横向溢出：整行允许换行，导航自身可横滚且不换行竖排 */}
         <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
@@ -40,10 +44,10 @@ export default function App() {
             <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent text-xs font-bold text-white">
               L
             </span>
-            <span className="shrink-0 text-lg font-bold text-fg">LLM Infra Studio</span>
-            <span className="truncate text-xs text-dim">AI 学习与实践工作台</span>
+            <span className="shrink-0 text-base font-bold text-fg md:text-lg">LLM Infra Studio</span>
+            <span className="hidden truncate text-xs text-dim md:inline">AI 学习与实践工作台</span>
           </div>
-          <nav className="-mx-1 flex min-w-0 max-w-full flex-1 gap-1 overflow-x-auto px-1">
+          <nav className="-mx-1 hidden min-w-0 max-w-full flex-1 gap-1 overflow-x-auto px-1 md:flex">
             {NAV.map((n) => (
               <NavLink
                 key={n.to}
@@ -62,7 +66,13 @@ export default function App() {
           </nav>
         </div>
       </header>
-      <main className="mx-auto max-w-7xl px-4 py-6">
+      <main
+        className={
+          hideTabBar
+            ? 'mx-auto max-w-7xl px-4 py-6'
+            : 'mx-auto max-w-7xl px-4 pt-6 pb-[calc(4.5rem+env(safe-area-inset-bottom))] md:pb-6'
+        }
+      >
         {/* 每个页面各包一层 ErrorBoundary：单页 render 期 throw 只废该页，不白屏整站 */}
         <Routes>
           <Route path="/" element={<Navigate to="/architecture" replace />} />
@@ -99,6 +109,7 @@ export default function App() {
           <Route path="/settings" element={<ErrorBoundary><SettingsPage /></ErrorBoundary>} />
         </Routes>
       </main>
+      {!hideTabBar && <MobileTabBar />}
       <SelectionAsk />
     </div>
   )

@@ -127,7 +127,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
         role="dialog"
         aria-labelledby="ask-title"
         aria-modal="false"
-        className="pointer-events-auto absolute right-6 bottom-6 flex max-h-[70vh] w-[min(560px,calc(100vw-2rem))] flex-col rounded-xl border border-line bg-panel shadow-xl"
+        className="pointer-events-auto absolute right-6 bottom-6 flex max-h-[70dvh] w-[min(560px,calc(100vw-2rem))] flex-col rounded-xl border border-line bg-panel shadow-xl"
       >
         {/* 仅标题栏可拖 */}
         <div

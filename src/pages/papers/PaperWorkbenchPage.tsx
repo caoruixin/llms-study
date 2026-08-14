@@ -13,6 +13,7 @@ import { createRetrievalService, type SearchHit } from '../../lib/paper/retrieva
 import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
 import { createPaperRepository } from '../../lib/paper/repo/paperRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
+import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
 import type { PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
@@ -78,21 +79,6 @@ function scrollAndFlash(domId: string): void {
   flashElement(el)
 }
 
-function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState(() =>
-    typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query).matches : false,
-  )
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
-    const mq = window.matchMedia(query)
-    const sync = () => setMatches(mq.matches)
-    sync()
-    mq.addEventListener('change', sync)
-    return () => mq.removeEventListener('change', sync)
-  }, [query])
-  return matches
-}
-
 interface Position {
   blockIndex: number
   page?: number
@@ -130,8 +116,8 @@ export default function PaperWorkbenchPage() {
   // 手机：Copilot 底部面板可切全屏（长回答 + 交互块在 390px 下需要整屏）
   const [sheetFull, setSheetFull] = useState(false)
 
-  const isDesktop = useMediaQuery('(min-width: 1280px)')
-  const isTablet = useMediaQuery('(min-width: 768px)')
+  const isDesktop = useMediaQuery(MQ.xl)
+  const isTablet = useMediaQuery(MQ.md)
 
   const {
     copilotOpen,
