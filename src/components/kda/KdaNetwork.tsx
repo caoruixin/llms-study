@@ -146,7 +146,7 @@ export default function KdaNetwork() {
 
       {/* 右：讲解面板 */}
       <div className="min-w-0 flex-1">
-        <div className="sticky top-20 rounded-xl border border-line bg-panel shadow-sm p-6">
+        <div className="lg:sticky lg:top-20 rounded-xl border border-line bg-panel shadow-sm p-6">
           <h3 className="text-xl font-bold">
             {selected.name} <span className="ml-2 text-sm font-normal text-dim">{selected.enName}</span>
           </h3>

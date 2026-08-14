@@ -24,7 +24,7 @@ export default function StackExplorer() {
                 <button
                   key={c.id}
                   onClick={() => setSel({ layer: l.id, comp: c.id })}
-                  className={`rounded-lg border px-3 py-1.5 text-sm transition-colors ${
+                  className={`rounded-lg border px-3 py-2 md:py-1.5 text-sm transition-colors ${
                     sel.layer === l.id && sel.comp === c.id
                       ? 'border-accent bg-accent/10'
                       : 'border-line bg-panel-2 hover:border-accent/50'
@@ -46,7 +46,7 @@ export default function StackExplorer() {
       </div>
 
       <div className="w-full shrink-0 lg:w-96">
-        <div className="sticky top-20 rounded-xl border border-line bg-panel shadow-sm p-5">
+        <div className="lg:sticky lg:top-20 rounded-xl border border-line bg-panel shadow-sm p-5">
           <div className={`mb-1 text-xs font-semibold ${layer.color}`}>{layer.name}</div>
           <h3 className="text-lg font-bold">{comp.name}</h3>
           <p className="mt-3 text-sm leading-relaxed">{comp.what}</p>

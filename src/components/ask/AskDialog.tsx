@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { motion, useDragControls } from 'framer-motion'
 import { splitFences } from '../../lib/liteMd'
 import type { LlmErrorKind } from '../../lib/llmClient'
+import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 
 export interface AskMsg {
   id: number
@@ -93,6 +94,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
   const listRef = useRef<HTMLDivElement>(null)
   const stickRef = useRef(true) // 粘底状态：用户上翻后不再抢滚动
   const controls = useDragControls()
+  const isMd = useMediaQuery(MQ.md) // <md：底部面板形态，关拖拽（触屏拖拽/滚动手势冲突）；md+ 桌面右下浮窗保持现状
 
   useEffect(() => {
     const el = listRef.current
@@ -117,7 +119,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
       className="pointer-events-none fixed inset-0 z-50"
     >
       <motion.div
-        drag
+        drag={isMd}
         dragListener={false}
         dragControls={controls}
         dragMomentum={false}
@@ -127,12 +129,20 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
         role="dialog"
         aria-labelledby="ask-title"
         aria-modal="false"
-        className="pointer-events-auto absolute right-6 bottom-6 flex max-h-[70dvh] w-[min(560px,calc(100vw-2rem))] flex-col rounded-xl border border-line bg-panel shadow-xl"
+        className={
+          isMd
+            ? 'pointer-events-auto absolute right-6 bottom-6 flex max-h-[70dvh] w-[min(560px,calc(100vw-2rem))] flex-col rounded-xl border border-line bg-panel shadow-xl'
+            : 'pointer-events-auto absolute inset-x-0 bottom-0 flex max-h-[70dvh] w-full flex-col rounded-t-xl border border-line bg-panel shadow-xl pb-[env(safe-area-inset-bottom)]'
+        }
       >
-        {/* 仅标题栏可拖 */}
+        {/* 仅标题栏可拖（仅桌面：md 以下 drag 已关，拖拽手势会与触屏滚动冲突） */}
         <div
-          onPointerDown={(e) => controls.start(e)}
-          className="flex cursor-move touch-none items-center gap-2 border-b border-line px-4 py-2.5 select-none"
+          onPointerDown={(e) => isMd && controls.start(e)}
+          className={
+            isMd
+              ? 'flex cursor-move touch-none items-center gap-2 border-b border-line px-4 py-2.5 select-none'
+              : 'flex items-center gap-2 border-b border-line px-4 py-2.5 select-none'
+          }
         >
           <span id="ask-title" className="text-sm font-semibold text-accent">
             Ask LLM
@@ -150,7 +160,7 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
             onPointerDown={(e) => e.stopPropagation()}
             onClick={onClose}
             aria-label="关闭对话"
-            className="rounded px-1.5 text-lg leading-none text-dim transition-colors hover:text-fg"
+            className="flex min-h-10 min-w-10 items-center justify-center rounded px-1.5 text-lg leading-none text-dim transition-colors hover:text-fg md:min-h-0 md:min-w-0"
           >
             ×
           </button>
