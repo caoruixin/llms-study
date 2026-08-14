@@ -105,7 +105,7 @@ export default function EconomicsPanel() {
   return (
     <div className="space-y-4">
       {/* 参数区 */}
-      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 md:grid-cols-3 lg:grid-cols-7">
+      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-7">
         <label className="block text-xs text-dim">
           API 价目（USD）
           <select value={priceKey} onChange={(e) => setPriceKey(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">

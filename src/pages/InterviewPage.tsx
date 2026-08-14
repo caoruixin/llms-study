@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CATEGORY_LABELS, QUESTIONS, QUESTIONS_BY_CATEGORY } from '../data/questions'
 import type { Grade, ScoreResult } from '../data/types'
 import { chatComplete } from '../lib/llmClient'
@@ -8,13 +8,9 @@ import { isSpeechSupported, startDictation } from '../lib/speech'
 import type { DictationSession } from '../lib/speech'
 import { newAttemptId, useHistory, useSettings } from '../store'
 import MasteryDashboard from '../components/MasteryDashboard'
-
-const GRADE_STYLE: Record<Grade, string> = {
-  A: 'bg-ok text-white',
-  B: 'bg-accent text-white',
-  C: 'bg-warn text-white',
-  D: 'bg-bad text-white',
-}
+import Drawer from '../components/ui/Drawer'
+import QuestionList, { GRADE_STYLE } from '../components/interview/QuestionList'
+import { MQ, useMediaQuery } from '../lib/useMediaQuery'
 
 const DIMENSIONS: { key: keyof Pick<ScoreResult, 'accuracy' | 'structure' | 'business' | 'depth'>; label: string }[] = [
   { key: 'accuracy', label: '技术准确性' },
@@ -39,6 +35,8 @@ export default function InterviewPage() {
   const [showRef, setShowRef] = useState(false)
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null)
   const [showAllHistory, setShowAllHistory] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const isDesktop = useMediaQuery(MQ.lg)
   const dictationRef = useRef<DictationSession | null>(null)
   const wantDictationRef = useRef(false)
   const restartTimesRef = useRef<number[]>([]) // 自动续录的时间戳窗口，防止立即结束的浏览器无限重启
@@ -71,6 +69,16 @@ export default function InterviewPage() {
     setConfirmTarget(null)
     setShowAllHistory(false)
   }
+
+  // iOS Safari 按钮 tap 不触发 focus，onBlur 复原不生效；补 document pointerdown 外点复原（保留 onBlur 路径）
+  useEffect(() => {
+    if (!confirmTarget) return
+    const onPointerDown = (e: PointerEvent) => {
+      if (!(e.target instanceof Element) || !e.target.closest('[data-confirm]')) setConfirmTarget(null)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [confirmTarget])
 
   // 两段式确认：首次点击进入确认态，再点同一目标执行；点其他目标则切换确认态，onBlur 复原
   function confirmThen(target: ConfirmTarget, run: () => void) {
@@ -196,37 +204,34 @@ export default function InterviewPage() {
     }
   }
 
+  const currentBest = bestGradeByQuestion.get(selectedId)
+
   return (
     <div>
       <MasteryDashboard />
+
+      {/* <lg 当前题切换条：☰ 开题库抽屉 + 当前题干 + 最佳等级 */}
+      <button
+        type="button"
+        onClick={() => setDrawerOpen(true)}
+        className="mb-4 flex min-h-12 w-full items-center gap-2 rounded-xl border border-line bg-panel px-4 text-left lg:hidden"
+      >
+        <span className="shrink-0 text-sm text-dim">☰ 题库</span>
+        <span className="min-w-0 flex-1 truncate text-sm">{question.prompt}</span>
+        {currentBest && (
+          <span className={`shrink-0 rounded px-1.5 text-xs font-bold ${GRADE_STYLE[currentBest]}`}>{currentBest}</span>
+        )}
+      </button>
+
       <div className="flex gap-6">
-        {/* 左侧题目列表 */}
-      <aside className="w-80 shrink-0 space-y-4">
-        {QUESTIONS_BY_CATEGORY.map((g) => (
-          <div key={g.category}>
-            <div className="mb-1 px-1 text-xs font-semibold tracking-wide text-dim">{g.label}</div>
-            <div className="space-y-1">
-              {g.questions.map((q) => {
-                const best = bestGradeByQuestion.get(q.id)
-                return (
-                  <button
-                    key={q.id}
-                    onClick={() => selectQuestion(q.id)}
-                    className={`flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-sm transition-colors ${
-                      q.id === selectedId
-                        ? 'border-accent/60 bg-accent/10'
-                        : 'border-line bg-panel hover:bg-panel-2'
-                    }`}
-                  >
-                    <span className="flex-1 truncate">{q.prompt}</span>
-                    {q.lang === 'en' && <span className="rounded bg-accent-2/20 px-1 text-[10px] text-accent-2">EN</span>}
-                    {best && <span className={`rounded px-1.5 text-xs font-bold ${GRADE_STYLE[best]}`}>{best}</span>}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        ))}
+        {/* 左侧题目列表（lg+ 常驻；<lg 收进 Drawer） */}
+      <aside className="hidden lg:block w-80 shrink-0 space-y-4">
+        <QuestionList
+          groups={QUESTIONS_BY_CATEGORY}
+          selectedId={selectedId}
+          bestGradeByQuestion={bestGradeByQuestion}
+          onSelect={selectQuestion}
+        />
       </aside>
 
       {/* 右侧答题区 */}
@@ -254,12 +259,12 @@ export default function InterviewPage() {
               识别中…{interim}
             </p>
           )}
-          <div className="mt-3 flex items-center gap-3">
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <button
               onClick={toggleDictation}
               disabled={!isSpeechSupported()}
               title={isSpeechSupported() ? '' : '当前浏览器不支持语音识别（请用 Chrome）'}
-              className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-40 ${
+              className={`min-h-11 rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-40 md:min-h-0 ${
                 dictating ? 'bg-bad text-white' : 'border border-line bg-panel text-fg hover:bg-panel-2'
               }`}
             >
@@ -268,11 +273,11 @@ export default function InterviewPage() {
             <button
               onClick={grade}
               disabled={phase === 'grading' || !answer.trim()}
-              className="rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
+              className="min-h-11 rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40 md:min-h-0"
             >
               {phase === 'grading' ? '评分中…' : '提交评分'}
             </button>
-            <button onClick={() => setShowRef((v) => !v)} className="text-sm text-dim hover:text-fg">
+            <button onClick={() => setShowRef((v) => !v)} className="min-h-11 text-sm text-dim hover:text-fg md:min-h-0">
               {showRef ? '隐藏参考要点' : '查看参考要点'}
             </button>
           </div>
@@ -374,9 +379,10 @@ export default function InterviewPage() {
               <div className="flex items-center gap-2">
                 {pastAttempts.length > 0 && (
                   <button
+                    data-confirm
                     onClick={() => confirmThen({ kind: 'question' }, () => clearQuestion(selectedId))}
                     onBlur={() => setConfirmTarget(null)}
-                    className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+                    className={`min-h-11 rounded-lg border px-3 text-xs transition-colors md:min-h-0 md:py-1 ${
                       confirmTarget?.kind === 'question'
                         ? 'border-bad/60 bg-bad/10 font-semibold text-bad'
                         : 'border-line bg-panel text-dim hover:text-bad'
@@ -386,9 +392,10 @@ export default function InterviewPage() {
                   </button>
                 )}
                 <button
+                  data-confirm
                   onClick={() => confirmThen({ kind: 'all' }, clear)}
                   onBlur={() => setConfirmTarget(null)}
-                  className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+                  className={`min-h-11 rounded-lg border px-3 text-xs transition-colors md:min-h-0 md:py-1 ${
                     confirmTarget?.kind === 'all'
                       ? 'border-bad/60 bg-bad/10 font-semibold text-bad'
                       : 'border-line bg-panel text-dim hover:text-bad'
@@ -406,15 +413,16 @@ export default function InterviewPage() {
               <>
                 <div className="space-y-2">
                   {(showAllHistory ? pastAttempts : pastAttempts.slice(0, 5)).map((a) => (
-                    <div key={a.id} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">
+                    <div key={a.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-panel-2 px-3 py-2 text-sm">
                       {a.grade && <span className={`rounded px-1.5 font-bold ${GRADE_STYLE[a.grade]}`}>{a.grade}</span>}
                       <span className="flex-1 truncate text-dim">{a.answer}</span>
                       <span className="text-xs text-dim">{new Date(a.createdAt).toLocaleString('zh-CN')}</span>
                       <button
+                        data-confirm
                         onClick={() => confirmThen({ kind: 'one', id: a.id }, () => removeAttempt(a.id))}
                         onBlur={() => setConfirmTarget(null)}
                         aria-label="删除本条记录"
-                        className={`shrink-0 transition-colors ${
+                        className={`flex min-h-11 min-w-11 shrink-0 items-center justify-center transition-colors md:min-h-0 md:min-w-0 ${
                           confirmTarget?.kind === 'one' && confirmTarget.id === a.id
                             ? 'rounded-full border border-bad/60 bg-bad/10 px-2 py-0.5 text-xs font-semibold text-bad'
                             : 'px-1 text-dim hover:text-bad'
@@ -428,7 +436,7 @@ export default function InterviewPage() {
                 {pastAttempts.length > 5 && (
                   <button
                     onClick={() => setShowAllHistory((v) => !v)}
-                    className="mt-2 text-xs text-dim transition-colors hover:text-fg"
+                    className="mt-2 min-h-11 text-xs text-dim transition-colors hover:text-fg md:min-h-0"
                   >
                     {showAllHistory ? '收起' : `展开全部 ${pastAttempts.length} 条`}
                   </button>
@@ -439,6 +447,22 @@ export default function InterviewPage() {
         )}
       </section>
       </div>
+
+      {!isDesktop && (
+        <Drawer open={drawerOpen} onClose={() => setDrawerOpen(false)} title="题库">
+          <div className="h-full overflow-y-auto">
+            <QuestionList
+              groups={QUESTIONS_BY_CATEGORY}
+              selectedId={selectedId}
+              bestGradeByQuestion={bestGradeByQuestion}
+              onSelect={(id) => {
+                selectQuestion(id)
+                setDrawerOpen(false)
+              }}
+            />
+          </div>
+        </Drawer>
+      )}
     </div>
   )
 }

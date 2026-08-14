@@ -15,6 +15,18 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]['id']
 
+// 价目表数字格式化：表格行与卡片共用，避免公式双份
+function fmtPrice(currency: 'USD' | 'RMB', v: number | null) {
+  const cur = currency === 'USD' ? '$' : '¥'
+  return v === null ? 'N/A' : `${cur}${v}`
+}
+function fmtContextK(k: number | null) {
+  return k === null ? 'N/A' : k >= 1000 ? `${Math.round(k / 1000)}M` : `${k}K`
+}
+function fmtMaxOutputK(k: number | null) {
+  return k === null ? 'N/A' : `${k}K`
+}
+
 export default function ArchitecturePage() {
   // ?tab= 仅作初值（如 /kda 页返回链接落在「注意力演进」）；切 tab 不写回 URL，保持现有轻量行为
   const [params] = useSearchParams()
@@ -35,7 +47,7 @@ export default function ArchitecturePage() {
           <div className="rounded-xl border border-accent/40 bg-accent/10 p-4 text-sm leading-relaxed">
             {ATTENTION_SUMMARY}
           </div>
-          <div className="overflow-x-auto rounded-xl border border-line bg-panel shadow-sm">
+          <div className="hidden overflow-x-auto rounded-xl border border-line bg-panel shadow-sm md:block">
             <table className="w-full min-w-[900px] text-sm">
               <thead className="bg-panel-2 text-left text-xs text-dim">
                 <tr>
@@ -65,12 +77,41 @@ export default function ArchitecturePage() {
               </tbody>
             </table>
           </div>
+          <div className="space-y-3 md:hidden">
+            {ATTENTION_EVOLUTION.map((a) => (
+              <div key={a.id} className="rounded-xl border border-line bg-panel p-4">
+                <div className="font-semibold text-accent">
+                  {a.id === 'kda' ? (
+                    <Link to="/kda" className="hover:underline">
+                      {a.name} <span className="text-xs font-normal">→ 交互式拆解</span>
+                    </Link>
+                  ) : (
+                    a.name
+                  )}
+                </div>
+                <div className="mt-3 space-y-2">
+                  <div>
+                    <div className="text-xs text-dim">原理一句话</div>
+                    <p className="leading-relaxed">{a.mechanism}</p>
+                  </div>
+                  <div>
+                    <div className="text-xs text-dim">KV cache 代价</div>
+                    <p className="leading-relaxed text-dim">{a.kvCost}</p>
+                  </div>
+                  <div>
+                    <div className="text-xs text-dim">代表模型</div>
+                    <p className="text-dim">{a.models}</p>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
       {tab === 'pricing' && (
         <div className="space-y-4">
-          <div className="overflow-x-auto rounded-xl border border-line bg-panel shadow-sm">
+          <div className="hidden overflow-x-auto rounded-xl border border-line bg-panel shadow-sm md:block">
             <table className="w-full min-w-[1100px] text-sm">
               <thead className="bg-panel-2 text-left text-xs text-dim">
                 <tr>
@@ -86,37 +127,79 @@ export default function ArchitecturePage() {
                 </tr>
               </thead>
               <tbody>
-                {PRICING.map((p, i) => {
-                  const cur = p.currency === 'USD' ? '$' : '¥'
-                  const fmt = (v: number | null) => (v === null ? 'N/A' : `${cur}${v}`)
-                  return (
-                    <tr key={`${p.provider}-${p.modelId}-${i}`} className={i % 2 ? '' : 'bg-panel-2/60'}>
-                      <td className="px-3 py-3 whitespace-nowrap">
-                        <div className="text-xs text-dim">{p.provider}</div>
-                        <a href={p.sourceUrl} target="_blank" rel="noreferrer" className="font-mono font-semibold text-accent hover:underline">
-                          {p.modelId}
-                        </a>
-                      </td>
-                      <td className="px-3 py-3 text-right font-mono">{fmt(p.inputPerMTok)}</td>
-                      <td className="px-3 py-3 text-right font-mono">{fmt(p.outputPerMTok)}</td>
-                      <td className="px-3 py-3 text-right font-mono text-ok">{fmt(p.cachedInputPerMTok)}</td>
-                      <td className="px-3 py-3 text-right">
-                        {p.contextK === null ? 'N/A' : p.contextK >= 1000 ? `${Math.round(p.contextK / 1000)}M` : `${p.contextK}K`}
-                      </td>
-                      <td className="px-3 py-3 text-right">{p.maxOutputK === null ? 'N/A' : `${p.maxOutputK}K`}</td>
-                      <td className="px-3 py-3 text-xs text-dim">{p.practicalContextNote ?? 'N/A'}</td>
-                      <td className="px-3 py-3">{p.openWeights ? <span className="text-ok">✓</span> : <span className="text-dim">—</span>}</td>
-                      <td className="max-w-64 px-3 py-3 text-xs leading-relaxed text-dim">
-                        {p.notes}
-                        {isPromoExpired(p.validUntil) && (
-                          <span className="ml-1 font-semibold text-warn">限时价已过期，现价见来源 ↗</span>
-                        )}
-                      </td>
-                    </tr>
-                  )
-                })}
+                {PRICING.map((p, i) => (
+                  <tr key={`${p.provider}-${p.modelId}-${i}`} className={i % 2 ? '' : 'bg-panel-2/60'}>
+                    <td className="px-3 py-3 whitespace-nowrap">
+                      <div className="text-xs text-dim">{p.provider}</div>
+                      <a href={p.sourceUrl} target="_blank" rel="noreferrer" className="font-mono font-semibold text-accent hover:underline">
+                        {p.modelId}
+                      </a>
+                    </td>
+                    <td className="px-3 py-3 text-right font-mono">{fmtPrice(p.currency, p.inputPerMTok)}</td>
+                    <td className="px-3 py-3 text-right font-mono">{fmtPrice(p.currency, p.outputPerMTok)}</td>
+                    <td className="px-3 py-3 text-right font-mono text-ok">{fmtPrice(p.currency, p.cachedInputPerMTok)}</td>
+                    <td className="px-3 py-3 text-right">{fmtContextK(p.contextK)}</td>
+                    <td className="px-3 py-3 text-right">{fmtMaxOutputK(p.maxOutputK)}</td>
+                    <td className="px-3 py-3 text-xs text-dim">{p.practicalContextNote ?? 'N/A'}</td>
+                    <td className="px-3 py-3">{p.openWeights ? <span className="text-ok">✓</span> : <span className="text-dim">—</span>}</td>
+                    <td className="max-w-64 px-3 py-3 text-xs leading-relaxed text-dim">
+                      {p.notes}
+                      {isPromoExpired(p.validUntil) && (
+                        <span className="ml-1 font-semibold text-warn">限时价已过期，现价见来源 ↗</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
+          </div>
+          <div className="space-y-3 md:hidden">
+            {PRICING.map((p, i) => (
+              <div key={`${p.provider}-${p.modelId}-${i}`} className="rounded-xl border border-line bg-panel p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-xs text-dim">{p.provider}</div>
+                    <a href={p.sourceUrl} target="_blank" rel="noreferrer" className="font-mono font-semibold text-accent hover:underline">
+                      {p.modelId}
+                    </a>
+                  </div>
+                  {p.openWeights && (
+                    <span className="shrink-0 rounded bg-ok/15 px-1.5 py-0.5 text-xs font-semibold text-ok">开源 ✓</span>
+                  )}
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                  <div>
+                    <div className="text-xs text-dim">输入 /MTok</div>
+                    <div className="font-mono">{fmtPrice(p.currency, p.inputPerMTok)}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-dim">输出 /MTok</div>
+                    <div className="font-mono">{fmtPrice(p.currency, p.outputPerMTok)}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-dim">缓存命中</div>
+                    <div className="font-mono text-ok">{fmtPrice(p.currency, p.cachedInputPerMTok)}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-dim">上下文</div>
+                    <div className="font-mono">{fmtContextK(p.contextK)}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-dim">最大输出</div>
+                    <div className="font-mono">{fmtMaxOutputK(p.maxOutputK)}</div>
+                  </div>
+                </div>
+                <div className="mt-3 space-y-1 text-xs text-dim">
+                  <p>实用上下文：{p.practicalContextNote ?? 'N/A'}</p>
+                  <p className="leading-relaxed">
+                    {p.notes}
+                    {isPromoExpired(p.validUntil) && (
+                      <span className="ml-1 font-semibold text-warn">限时价已过期，现价见来源 ↗</span>
+                    )}
+                  </p>
+                </div>
+              </div>
+            ))}
           </div>
           <div className="rounded-xl border border-line bg-panel shadow-sm p-5">
             <h3 className="mb-2 text-sm font-semibold text-warn">售前速记（长上下文 / Batch / 缓存）</h3>

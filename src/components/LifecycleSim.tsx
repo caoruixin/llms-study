@@ -185,7 +185,7 @@ export default function LifecycleSim() {
       {/* prompt 输入 */}
       <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
         <div className="flex flex-wrap items-end gap-3">
-          <label className="block min-w-64 flex-1 text-xs text-dim">
+          <label className="block basis-full sm:basis-auto sm:min-w-64 flex-1 text-xs text-dim">
             用户 Prompt（模拟，不调真实模型）
             <textarea value={prompt} onChange={(e) => { setPrompt(e.target.value); setTokenOverride(null) }} rows={2} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-3 py-2 text-sm text-fg" />
           </label>
@@ -201,7 +201,7 @@ export default function LifecycleSim() {
           <button
             onClick={run}
             disabled={running}
-            className="rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40"
+            className="min-h-11 md:min-h-0 rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-white hover:bg-accent/90 disabled:opacity-40"
           >
             {running ? '模拟中…' : '▶ 发起请求'}
           </button>

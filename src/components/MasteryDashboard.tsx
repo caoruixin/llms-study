@@ -68,7 +68,8 @@ export default function MasteryDashboard() {
           </div>
         ))}
       </div>
-      <p className="mt-3 text-[11px] text-dim">掌握度 = 各题最佳等级得分（A=4 … D=1）÷ 板块满分；低分题会显示在左侧列表供重练。</p>
+      {/* 文案不写「左侧列表」：<lg 题库收进抽屉，没有左侧栏 */}
+      <p className="mt-3 text-[11px] text-dim">掌握度 = 各题最佳等级得分（A=4 … D=1）÷ 板块满分；低分题在题库列表里带等级徽章，可挑出来重练。</p>
     </div>
   )
 }

@@ -5,6 +5,7 @@ import OutlinePane, { buildOutline, type OutlineTab } from '../../components/pap
 import PdfViewer from '../../components/papers/PdfViewer'
 import SelectionActions from '../../components/papers/SelectionActions'
 import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
+import Drawer from '../../components/ui/Drawer'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
 import { buildAnchorContext, resolveAnchor, type ReaderMode, type ScrollTarget } from '../../lib/paper/anchors'
 import { briefCacheKey, type BriefData } from '../../lib/paper/briefPipeline'
@@ -13,6 +14,7 @@ import { createRetrievalService, type SearchHit } from '../../lib/paper/retrieva
 import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
 import { createPaperRepository } from '../../lib/paper/repo/paperRepo'
 import { getPaperDb } from '../../lib/paper/repo/db'
+import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
 import type { PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
@@ -78,21 +80,6 @@ function scrollAndFlash(domId: string): void {
   flashElement(el)
 }
 
-function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState(() =>
-    typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(query).matches : false,
-  )
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
-    const mq = window.matchMedia(query)
-    const sync = () => setMatches(mq.matches)
-    sync()
-    mq.addEventListener('change', sync)
-    return () => mq.removeEventListener('change', sync)
-  }, [query])
-  return matches
-}
-
 interface Position {
   blockIndex: number
   page?: number
@@ -130,8 +117,8 @@ export default function PaperWorkbenchPage() {
   // 手机：Copilot 底部面板可切全屏（长回答 + 交互块在 390px 下需要整屏）
   const [sheetFull, setSheetFull] = useState(false)
 
-  const isDesktop = useMediaQuery('(min-width: 1280px)')
-  const isTablet = useMediaQuery('(min-width: 768px)')
+  const isDesktop = useMediaQuery(MQ.xl)
+  const isTablet = useMediaQuery(MQ.md)
 
   const {
     copilotOpen,
@@ -739,22 +726,9 @@ export default function PaperWorkbenchPage() {
         {/* 平板 / 手机：目录抽屉（z-50 必须高于 Copilot 底部面板的 z-40——
             同层且 DOM 靠后时，手机上抽屉会被面板整片盖住） */}
         {showOutlineDrawer && (
-          <div className="fixed inset-0 z-50 flex">
-            <div
-              className="flex-1 bg-ink/60 backdrop-blur-[1px]"
-              role="presentation"
-              onClick={() => setDrawerOpen(false)}
-            />
-            <div className="h-full w-[min(20rem,85vw)] overflow-hidden border-l border-line bg-panel p-4 shadow-lg">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-sm font-semibold text-fg">目录与搜索</span>
-                <button type="button" onClick={() => setDrawerOpen(false)} className="text-sm text-dim hover:text-fg">
-                  关闭
-                </button>
-              </div>
-              <div className="h-[calc(100%-2rem)]">{outlinePane}</div>
-            </div>
-          </div>
+          <Drawer open={showOutlineDrawer} onClose={() => setDrawerOpen(false)} title="目录与搜索">
+            {outlinePane}
+          </Drawer>
         )}
 
         {/* 手机：Copilot 底部面板（可切全屏） */}
@@ -768,7 +742,7 @@ export default function PaperWorkbenchPage() {
               <button
                 type="button"
                 onClick={() => setSheetFull((f) => !f)}
-                className="rounded border border-line px-2 py-0.5 text-[0.7rem] text-dim transition-colors hover:text-fg"
+                className="min-h-10 rounded border border-line px-3 py-0.5 text-[0.7rem] text-dim transition-colors hover:text-fg md:min-h-0"
               >
                 {sheetFull ? '退出全屏' : '全屏'}
               </button>

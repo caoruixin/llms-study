@@ -3,11 +3,11 @@
 const PAPER_ENABLED = import.meta.env.VITE_ENABLE_PAPER_COPILOT === '1'
 
 export const NAV = [
-  { to: '/architecture', label: '架构演进' },
-  { to: '/inference', label: '推理链路' },
-  { to: '/agent', label: 'Agent 架构' },
+  { to: '/architecture', label: '架构演进', short: '架构' },
+  { to: '/inference', label: '推理链路', short: '推理' },
+  { to: '/agent', label: 'Agent 架构', short: 'Agent' },
   // /kda 不在顶部导航：入口收纳在 架构演进 → 注意力演进 → KDA/GDN 行的「交互式拆解」链接
-  { to: '/interview', label: '面试陪练' },
-  ...(PAPER_ENABLED ? [{ to: '/papers', label: '论文陪读' }] : []),
-  { to: '/settings', label: '设置' },
+  { to: '/interview', label: '面试陪练', short: '面试' },
+  ...(PAPER_ENABLED ? [{ to: '/papers', label: '论文陪读', short: '论文' }] : []),
+  { to: '/settings', label: '设置', short: '设置' },
 ]

@@ -75,6 +75,15 @@ export default function SelectionAsk() {
         timer = null
       }
     }
+    // 触屏（coarse pointer）单独一条防抖 timer：与 fine pointer 的 pointerup timer 分开管理，
+    // 两条路径互斥挂载（见下方 isCoarse 分支），互不干扰
+    let coarseTimer: ReturnType<typeof setTimeout> | null = null
+    const clearCoarse = () => {
+      if (coarseTimer !== null) {
+        clearTimeout(coarseTimer)
+        coarseTimer = null
+      }
+    }
     const inAskUi = (node: EventTarget | null): boolean => {
       const el = node instanceof Element ? node : node instanceof Node ? node.parentElement : null
       return el !== null && el.closest('[data-ask-ui]') !== null
@@ -90,6 +99,24 @@ export default function SelectionAsk() {
     // 用 pathnameRef 而非 pathname：本 effect 空依赖，当前路由由渲染期同步进 ref。
     const inPaperWorkspace = () => pathnameRef.current.startsWith('/papers')
 
+    // 触屏：长按选词 / 拖选区把手不产生可靠的 pointerup（把手拖拽时 pointerup 目标常落在把手层，
+    // 或触屏浏览器干脆不派发），改走 selectionchange 判定；fine pointer（鼠标）路径完全不变。
+    const isCoarse = typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches
+
+    // 按当前选区定位并显示按钮：fine 路径（pointerup 延后一拍）与 coarse 路径（selectionchange 防抖后）共用
+    const showFromSelection = () => {
+      const sel = window.getSelection()
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
+      const snippet = sel.toString().trim()
+      if (snippet.length < 2) return
+      if (excluded(sel.anchorNode)) return
+      const r = sel.getRangeAt(0).getBoundingClientRect()
+      const x = Math.min(Math.max(r.left + r.width / 2 - 44, 8), window.innerWidth - 96)
+      const y = r.top > 96 ? r.top - 38 : r.bottom + 8 // 顶部空间不够就翻到选区下方
+      const path = pathnameRef.current
+      setBtn({ x, y, snippet, pageLabel: NAV.find((n) => n.to === path)?.label ?? path })
+    }
+
     const onPointerUp = (e: PointerEvent) => {
       clear()
       if (inPaperWorkspace()) return
@@ -97,20 +124,11 @@ export default function SelectionAsk() {
       // 延后一拍读选区：pointerup 当帧 selection 还可能是旧值
       timer = setTimeout(() => {
         timer = null
-        const sel = window.getSelection()
-        if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
-        const snippet = sel.toString().trim()
-        if (snippet.length < 2) return
-        if (excluded(sel.anchorNode)) return
-        const r = sel.getRangeAt(0).getBoundingClientRect()
-        const x = Math.min(Math.max(r.left + r.width / 2 - 44, 8), window.innerWidth - 96)
-        const y = r.top > 96 ? r.top - 38 : r.bottom + 8 // 顶部空间不够就翻到选区下方
-        const path = pathnameRef.current
-        setBtn({ x, y, snippet, pageLabel: NAV.find((n) => n.to === path)?.label ?? path })
+        showFromSelection()
       }, 0)
     }
 
-    // 点他处 / Esc / 路由跳转导致选区塌陷 → 收起按钮
+    // 点他处 / Esc / 路由跳转导致选区塌陷 → 收起按钮（fine / coarse 共用同一条隐藏判定）
     const onSelectionChange = () => {
       if (inPaperWorkspace()) return // 同上：论文选区不归全局 Ask 管
       const sel = window.getSelection()
@@ -120,20 +138,38 @@ export default function SelectionAsk() {
       }
     }
 
+    // coarse 专属：非空选区防抖 350ms 后再定位显示——长按选词 / 拖把手过程中 selectionchange
+    // 会连续密集触发，防抖到手势停顿再取一次最终选区，避免按钮跟手抖动或取到中间态选区
+    const onSelectionChangeCoarse = () => {
+      if (inPaperWorkspace()) return
+      const sel = window.getSelection()
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0 || sel.toString().trim() === '') return
+      if (excluded(sel.anchorNode)) return
+      clearCoarse()
+      coarseTimer = setTimeout(() => {
+        coarseTimer = null
+        showFromSelection()
+      }, 350)
+    }
+
     // capture 阶段能听到任意后代滚动：对话框自己的消息列表（流式自动滚底/滚轮）不算页面滚动，放行
     const onScroll = (e: Event) => {
       if (inAskUi(e.target)) return
       clear()
+      clearCoarse()
       setBtn(null)
     }
 
-    document.addEventListener('pointerup', onPointerUp)
+    if (!isCoarse) document.addEventListener('pointerup', onPointerUp)
     document.addEventListener('selectionchange', onSelectionChange)
+    if (isCoarse) document.addEventListener('selectionchange', onSelectionChangeCoarse)
     window.addEventListener('scroll', onScroll, { capture: true, passive: true })
     return () => {
       clear()
-      document.removeEventListener('pointerup', onPointerUp)
+      clearCoarse()
+      if (!isCoarse) document.removeEventListener('pointerup', onPointerUp)
       document.removeEventListener('selectionchange', onSelectionChange)
+      if (isCoarse) document.removeEventListener('selectionchange', onSelectionChangeCoarse)
       window.removeEventListener('scroll', onScroll, { capture: true })
     }
   }, [])
@@ -237,7 +273,7 @@ export default function SelectionAsk() {
           onPointerDown={(e) => e.preventDefault()} // 防选区塌陷 / 抢焦点
           onClick={onAsk}
           style={{ left: btn.x, top: btn.y }}
-          className="fixed z-50 rounded-md border border-line bg-panel px-2.5 py-1 text-xs text-accent shadow-md"
+          className="fixed z-50 inline-flex min-h-10 items-center justify-center rounded-md border border-line bg-panel px-3 py-1 text-xs text-accent shadow-md"
         >
           Ask LLM
         </button>

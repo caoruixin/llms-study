@@ -62,13 +62,13 @@ export default function AgentPage() {
             <V />
             <div className="rounded-xl border-2 border-dashed border-accent-2/50 p-4">
               <div className="mb-2 text-center text-xs font-semibold text-accent-2">Agent 循环（直到任务完成）</div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid gap-2 sm:grid-cols-3">
                 <Box title="规划" sub="拆解 · 更新计划" />
                 <Box title="工具调用" sub="模型提议 → 运行时执行" />
                 <Box title="观察" sub="结果回填 · 校验 · 反思" />
               </div>
               <div className="my-2 text-center text-xs text-dim">工具层（按需调用）↓</div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid gap-2 sm:grid-cols-3">
                 <Box title="检索工具（RAG 管线）" sub="查询改写 → 向量召回 → 重排 → 注入" tone="ok" />
                 <Box title="业务 API" sub="查订单 / 下工单（鉴权+幂等）" />
                 <Box title="代码执行" sub="计算 / 数据分析（沙箱）" />
@@ -90,12 +90,12 @@ export default function AgentPage() {
           <h3 className="mb-3 font-bold">编排流程 ①：Function Calling 循环</h3>
           <div className="space-y-2">
             {FC_LOOP.map((s) => (
-              <div key={s.step} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">
+              <div key={s.step} className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded-lg bg-panel-2 px-3 py-2 text-sm">
                 <span className={`shrink-0 rounded px-2 py-0.5 text-xs font-semibold ${s.actor === 'model' ? 'bg-accent-2/20 text-accent-2' : 'bg-accent/20 text-accent'}`}>
                   {s.actor === 'model' ? '模型' : '应用'}
                 </span>
-                <span className="font-medium whitespace-nowrap">{s.step}</span>
-                <span className="text-dim">{s.desc}</span>
+                <span className="font-medium">{s.step}</span>
+                <span className="basis-full text-dim sm:basis-auto">{s.desc}</span>
               </div>
             ))}
           </div>
@@ -108,10 +108,10 @@ export default function AgentPage() {
           <h3 className="mb-3 font-bold">编排流程 ②：LangGraph 式状态机</h3>
           <div className="space-y-2">
             {GRAPH_NODES.map((n) => (
-              <div key={n.id} className="flex items-center gap-3 rounded-lg bg-panel-2 px-3 py-2 text-sm">
+              <div key={n.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded-lg bg-panel-2 px-3 py-2 text-sm">
                 <span className="shrink-0 rounded bg-ok/20 px-2 py-0.5 text-xs font-semibold text-ok">{n.kind === 'edge' ? '条件边' : '节点'}</span>
-                <span className="font-medium whitespace-nowrap">{n.name}</span>
-                <span className="text-dim">{n.desc}</span>
+                <span className="font-medium">{n.name}</span>
+                <span className="basis-full text-dim sm:basis-auto">{n.desc}</span>
               </div>
             ))}
           </div>
