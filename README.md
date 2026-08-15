@@ -2,11 +2,11 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-An interactive, visual learning app for **LLM infrastructure** — model architecture evolution, the inference serving pipeline, agent architecture, graded pre-sales interview drills, and an AI paper-reading copilot. Built for people selling, operating, or just seriously learning large-model infrastructure.
+An interactive, visual **AI learning & coaching companion** for LLM infrastructure — model architecture evolution, the inference serving pipeline, agent architecture, graded pre-sales practice drills, and an AI paper-reading copilot. Built for people selling, operating, or just seriously learning large-model infrastructure.
 
 **Live site: [llm-pro.cn](https://llm-pro.cn)**
 
-Everything runs local-first: your notes, papers, and interview history stay in your browser (IndexedDB) unless you sign in, in which case they sync to your account across devices.
+Everything runs local-first: your notes, papers, and practice history stay in your browser (IndexedDB) unless you sign in, in which case they sync to your account across devices.
 
 ## Modules
 
