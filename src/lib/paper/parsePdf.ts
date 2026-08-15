@@ -1,5 +1,7 @@
 import { IngestError, type ParseResult } from './ingest'
 import { countChars, normalizePdf, type PdfPageText, type PdfTextItem } from './normalizePdf'
+import { ensurePdfCompat } from './pdfCompat'
+import pdfWorkerUrl from './pdfWorkerEntry?worker&url'
 import { MAX_PDF_PAGES, MAX_TEXT_CHARS } from './validate'
 
 /**
@@ -45,10 +47,12 @@ function classify(e: unknown): IngestError {
 }
 
 export async function parsePdfBytes(bytes: ArrayBuffer): Promise<ParseResult> {
+  // WebKit 缺 ReadableStream 异步迭代,getTextContent 会整体抛错(见 pdfCompat.ts)
+  ensurePdfCompat()
   const pdfjs = await import('pdfjs-dist')
-  // worker 脚本由 Vite 作为独立资产发射（裸包路径经 vite:asset-import-meta-url 解析），
-  // 解析在 Worker 线程进行，主线程不阻塞。
-  pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
+  // worker 用 pdfWorkerEntry 包装（官方脚本前先装 WebKit shim），Vite 打成独立 chunk，
+  // 解析仍在 Worker 线程进行，主线程不阻塞。
+  pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
   // 关键坑：必须传字节副本 bytes.slice(0)。pdf.js 会把传入的 ArrayBuffer transfer 进 worker
   // 并 detach 原对象（byteLength 归零）——直接传会毁掉我们要写进 IndexedDB 的那一份原始字节。

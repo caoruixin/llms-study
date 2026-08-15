@@ -1,9 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import ClaimBanner from '../../components/papers/ClaimBanner'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
+import { useAuthStore } from '../../lib/auth/authStore'
 import { createSerialQueue, importPaper, isRetryable, reingestPaper, type IngestDeps, type ParseResult } from '../../lib/paper/ingest'
-import { createPaperRepository } from '../../lib/paper/repo/paperRepo'
-import { getPaperDb } from '../../lib/paper/repo/db'
+import { getPaperDb, type SyncMetaRow } from '../../lib/paper/repo/db'
+import { getRepos } from '../../lib/paper/repo/repos'
+import {
+  bootstrapSyncEngine,
+  claimGuestPapers,
+  getSyncEngine,
+  scanClaimables,
+  setClaimDismissed,
+  type ClaimScanResult,
+} from '../../lib/paper/sync/syncEngine'
 import { ensureStorageFor } from '../../lib/paper/storage'
 import { MAX_FILE_BYTES, MAX_PDF_PAGES, sha256Hex } from '../../lib/paper/validate'
 import type { IngestStage, PaperFormat, PaperRecord } from '../../lib/paper/types'
@@ -56,9 +66,20 @@ interface ActiveJob {
   stage: IngestStage
 }
 
+/** 同步徽标：按登录态与 syncMeta 推导；处理中的论文不显示（状态列已足够） */
+function syncBadge(paper: PaperRecord, meta: SyncMetaRow | undefined, authed: boolean): string | null {
+  if (paper.status !== 'ready') return null
+  if (!authed) return '仅本地'
+  if (meta?.artifactsPushed) return '已同步'
+  return '同步中'
+}
+
 export default function PapersPage() {
   const navigate = useNavigate()
-  const repo = useMemo(() => createPaperRepository(getPaperDb()), [])
+  // 门面引用永不变（repos.ts 单例工厂），方法体内按登录态路由到游客库/账号库
+  const repo = getRepos().paper
+  const authStatus = useAuthStore((s) => s.status)
+  const userId = useAuthStore((s) => s.user?.id ?? null)
   const queueRef = useRef(createSerialQueue())
   const inputRef = useRef<HTMLInputElement>(null)
   // 重复导入时暂存原 File，供「替换导入」重跑；串行队列保证同时只有一个待决项
@@ -70,30 +91,90 @@ export default function PapersPage() {
   const [jobs, setJobs] = useState<ActiveJob[]>([])
   const [notice, setNotice] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
+  const [syncMetas, setSyncMetas] = useState<Record<string, SyncMetaRow>>({})
+  const [claimScan, setClaimScan] = useState<ClaimScanResult | null>(null)
 
   const { sortBy, filter, pendingDuplicate, confirmDeleteId, setSortBy, setFilter, setPendingDuplicate, setConfirmDeleteId } =
     usePaperUi()
 
   const refresh = useCallback(async () => {
     setPapers(await repo.listPapers())
+    // syncMeta 直接读活跃库：徽标是纯展示，不值得为它扩仓储接口
+    try {
+      const metas = await getPaperDb().syncMeta.toArray()
+      setSyncMetas(Object.fromEntries(metas.map((m) => [m.paperId, m])))
+    } catch {
+      setSyncMetas({})
+    }
   }, [repo])
 
+  // 同步引擎 bootstrap 放页面挂载而非 App.tsx：flag-off 构建把 lib/paper 虚模块化，
+  // App 层引用会破坏 flag-off 产物
+  useEffect(() => {
+    bootstrapSyncEngine()
+  }, [])
+
+  const rescanClaim = useCallback(async () => {
+    const scan = await scanClaimables().catch(() => null)
+    setClaimScan(scan && !scan.dismissed ? scan : null)
+  }, [])
+
+  // 账号切换（登录/登出/换号）→ 活跃库变了：重读列表；已登录再拉一轮增量 + 认领扫描
   useEffect(() => {
     let alive = true
     void (async () => {
       try {
-        const list = await repo.listPapers()
-        if (alive) setPapers(list)
+        await refresh()
       } catch (e) {
         if (alive) setNotice(e instanceof Error ? e.message : '读取本地论文库失败')
       } finally {
         if (alive) setLoading(false)
       }
+      if (!alive) return
+      if (authStatus === 'authed') {
+        // 拉取失败静默（断网属常态）：本地优先，列表照常可用，回前台/下次进页自然重试
+        try {
+          await getSyncEngine()?.pullSince()
+          if (!alive) return
+          await refresh()
+          await rescanClaim()
+        } catch {
+          /* 静默 */
+        }
+      } else {
+        setClaimScan(null)
+      }
     })()
     return () => {
       alive = false
     }
-  }, [repo])
+  }, [authStatus, userId, refresh, rescanClaim])
+
+  // 同步引擎每推完一批就重读徽标(syncMeta)——否则「同步中」要停到下次手动刷新才变「已同步」
+  useEffect(() => {
+    const onFlushed = () => void refresh()
+    window.addEventListener('paper-sync-flushed', onFlushed)
+    return () => window.removeEventListener('paper-sync-flushed', onFlushed)
+  }, [refresh])
+
+  // 回前台补拉一轮增量:页面常驻(移动端 webview 常见)时,另一设备新传的论文要能自动出现,
+  // 而不是等用户手动刷新(工作台已有同款,列表页此前只在挂载时拉一次)
+  useEffect(() => {
+    if (authStatus !== 'authed') return
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      void (async () => {
+        try {
+          await getSyncEngine()?.pullSince()
+          await refresh()
+        } catch {
+          /* 断网属常态,静默;下次回前台自然重试 */
+        }
+      })()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [authStatus, refresh])
 
   const depsFor = useCallback(
     (jobId: string): IngestDeps => ({
@@ -138,8 +219,13 @@ export default function PapersPage() {
 
   const handleFiles = useCallback(
     async (files: FileList | File[]) => {
+      // 必须在任何 await 之前快照：onChange 会同步清 input.value（live FileList 随之被清空），
+      // onDrop 的 dataTransfer 在事件处理器返回后进入 protected mode——await 之后再读就全没了
+      const picked = Array.from(files)
+      // 上传拦截：未登录先弹登录（取消即放弃导入）——导入必须落进账号库才能同步
+      if (!(await useAuthStore.getState().requireLogin('upload'))) return
       setNotice(null)
-      for (const file of Array.from(files)) {
+      for (const file of picked) {
         // 配额预检只看 size，不必先把文件读进内存
         const check = await ensureStorageFor(file.size)
         if (!check.ok) {
@@ -184,6 +270,7 @@ export default function PapersPage() {
   )
 
   const replaceDuplicate = useCallback(async () => {
+    if (!(await useAuthStore.getState().requireLogin('upload'))) return
     const file = duplicateFileRef.current
     const existing = pendingDuplicate?.existing
     setPendingDuplicate(null)
@@ -218,9 +305,35 @@ export default function PapersPage() {
       <header className="space-y-1">
         <h1 className="text-2xl font-bold">论文陪读</h1>
         <p className="text-sm text-dim">
-          文档与阅读记录只保存在当前浏览器（IndexedDB），不会自动外发；向模型发送内容前会单独征求授权。
+          {authStatus === 'authed'
+            ? '已登录：文档与阅读记录会自动同步到你的账号，换设备打开即得；向模型发送内容前会单独征求授权。'
+            : '文档与阅读记录只保存在当前浏览器（IndexedDB），不会自动外发；登录后可自动同步到账号。'}
         </p>
       </header>
+
+      {claimScan && (
+        <ClaimBanner
+          scan={claimScan}
+          onClaim={async () => {
+            try {
+              const { claimed, merged } = await claimGuestPapers()
+              setClaimScan(null)
+              setNotice(
+                merged > 0
+                  ? `已开始同步 ${claimed} 篇；另有 ${merged} 篇账号已有同篇，仅合并了阅读进度`
+                  : `已开始同步 ${claimed} 篇，制品将在后台推送到账号`,
+              )
+              await refresh()
+            } catch (e) {
+              setNotice(e instanceof Error ? e.message : '认领失败，请稍后重试')
+            }
+          }}
+          onDismiss={() => {
+            setClaimScan(null)
+            void setClaimDismissed(true)
+          }}
+        />
+      )}
 
       {/* 导入区：拖放 + 文件选择 */}
       <section
@@ -354,7 +467,10 @@ export default function PapersPage() {
             ))}
           </select>
         </label>
-        <span className="text-sm text-dim">共 {papers.length} 篇</span>
+        {/* 非「全部」时展示筛选后数量:曾有用户在「处理中」tab 下看到「共 1 篇 + 空列表」误判同步失败 */}
+        <span className="text-sm text-dim">
+          {filter === 'all' ? `共 ${papers.length} 篇` : `筛选后 ${visible.length} / 共 ${papers.length} 篇`}
+        </span>
       </div>
 
       {loading ? (
@@ -367,13 +483,25 @@ export default function PapersPage() {
             <br />
             暂不支持旧版 .doc 与纯扫描件（无文字层，首版不做 OCR）。
           </p>
+          {papers.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setFilter('all')}
+              className="mt-4 min-h-11 rounded-lg border border-line bg-panel-2 px-4 py-1.5 text-sm text-fg transition hover:bg-panel md:min-h-0"
+            >
+              显示全部 {papers.length} 篇
+            </button>
+          )}
         </div>
       ) : (
         <ul className="space-y-3">
           {visible.map((p) => (
             <li key={p.id} className="rounded-xl border border-line bg-panel shadow-sm p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
+                {/* 手机:basis-full 让标题块独占整行,按钮组自动折到第二行;md+:grow+basis-0 与原 flex-1
+                    (flex:1 1 0%) 布局等效。不用 flex-1 是因为它是 shorthand,与 basis-* 的生成顺序
+                    有覆盖歧义 */}
+                <div className="min-w-0 grow basis-full md:basis-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="truncate font-semibold text-fg">{p.title}</h2>
                     <span className="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs text-dim uppercase">
@@ -386,6 +514,18 @@ export default function PapersPage() {
                     >
                       {STAGE_LABEL[p.status]}
                     </span>
+                    {(() => {
+                      const badge = syncBadge(p, syncMetas[p.id], authStatus === 'authed')
+                      return badge ? (
+                        <span
+                          className={`shrink-0 rounded border px-1.5 py-0.5 text-[0.65rem] ${
+                            badge === '已同步' ? 'border-ok/40 text-ok' : 'border-line text-dim'
+                          }`}
+                        >
+                          {badge}
+                        </span>
+                      ) : null
+                    })()}
                   </div>
                   <p className="mt-1 truncate text-xs text-dim">{p.fileName}</p>
                   <p className="mt-1 text-xs text-dim">
@@ -401,14 +541,14 @@ export default function PapersPage() {
                       <button
                         type="button"
                         onClick={() => navigate(`/papers/${p.id}`)}
-                        className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
+                        className="min-h-11 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
                       >
                         预览
                       </button>
                       <button
                         type="button"
                         onClick={() => navigate(`/papers/${p.id}?copilot=open`)}
-                        className="min-h-10 rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90 md:min-h-0"
+                        className="min-h-11 rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90 md:min-h-0"
                       >
                         启动 Copilot
                       </button>
@@ -418,7 +558,7 @@ export default function PapersPage() {
                     <button
                       type="button"
                       onClick={() => retry(p)}
-                      className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
+                      className="min-h-11 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
                     >
                       重试
                     </button>
@@ -428,14 +568,14 @@ export default function PapersPage() {
                       <button
                         type="button"
                         onClick={() => void remove(p.id)}
-                        className="min-h-10 rounded-lg border border-bad/50 bg-panel px-3 py-1.5 text-sm text-bad transition-colors hover:bg-panel-2 md:min-h-0"
+                        className="min-h-11 rounded-lg border border-bad/50 bg-panel px-3 py-1.5 text-sm text-bad transition-colors hover:bg-panel-2 md:min-h-0"
                       >
                         确认删除
                       </button>
                       <button
                         type="button"
                         onClick={() => setConfirmDeleteId(null)}
-                        className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:min-h-0"
+                        className="min-h-11 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:min-h-0"
                       >
                         取消
                       </button>
@@ -444,7 +584,7 @@ export default function PapersPage() {
                     <button
                       type="button"
                       onClick={() => setConfirmDeleteId(p.id)}
-                      className="min-h-10 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:min-h-0"
+                      className="min-h-11 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:min-h-0"
                     >
                       删除
                     </button>

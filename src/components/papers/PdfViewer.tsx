@@ -1,6 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from 'react'
 import type * as Pdfjs from 'pdfjs-dist'
-import { pageDomId, pickCurrentPage } from '../../lib/paper/anchors'
+import { isPageActive, pageDomId, pickCurrentPage } from '../../lib/paper/anchors'
+import { ensurePdfCompat } from '../../lib/paper/pdfCompat'
+import pdfWorkerUrl from '../../lib/paper/pdfWorkerEntry?worker&url'
+import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 
 /**
  * 原版 PDF 预览：pdf.js 页面渲染（canvas）+ 可选择文字层（textLayer），带视口虚拟化。
@@ -26,8 +29,6 @@ interface Props {
   onLoaded?: (pageCount: number) => void
 }
 
-/** 视口前后各多渲染几页 */
-const WINDOW_PAGES = 2
 /** 位图倍率上限：高 DPI 屏上 3x 只带来内存压力，看不出差别 */
 const MAX_DPR = 2
 /** 容器宽度变化 → 重绘的防抖窗口：面板收起/展开动画与拖拽期间只重渲一次 */
@@ -43,13 +44,24 @@ interface PageProps {
   active: boolean
   /** 容器宽度变化计数：进 effect 依赖，宽度变了就主动重跑渲染（scale 被钳位时也生效） */
   layoutTick: number
+  /** 位图渲染失败上报：viewer 级错误条靠它显示首个真实报错（真机用户截图即可远程定位） */
+  onRenderError: (message: string) => void
 }
 
 /** memo 是必需的：滚动时 range 每变一次，父组件都会重渲染全部页占位（150 页文档尤其明显） */
-const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, height, active, layoutTick }: PageProps) {
+const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, height, active, layoutTick, onRenderError }: PageProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const textRef = useRef<HTMLDivElement>(null)
   const [rendered, setRendered] = useState(false)
+  /** 位图渲染失败（非取消）：占位符换成「点按重试」按钮——此前所有失败都被静默吞掉，页面永远空白 */
+  const [renderError, setRenderError] = useState(false)
+  /** 点按重试计数：进 effect 依赖，递增即重跑同一条渲染路径 */
+  const [retryTick, setRetryTick] = useState(0)
+  /** 重试进行中：effect 重跑期间 renderError 已被幂等清掉，占位符要显示「重试中…」而不是页码 */
+  const [retrying, setRetrying] = useState(false)
+  /** 连续失败次数（成功清零）：≥2 次说明重试无望，追加真实报错 + 引导切文本视图 */
+  const [failCount, setFailCount] = useState(0)
+  const [failMessage, setFailMessage] = useState('')
   /**
    * 上一次渲染任务的 promise。pdf.js 不允许同一 canvas 上并发 render()——
    * 面板收起/展开改变容器宽度时 effect 会紧接着重跑，不等上一次任务落地就调 render()
@@ -59,10 +71,14 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
   const inflightRef = useRef<Promise<unknown> | null>(null)
 
   useEffect(() => {
+    // 幂等清错：每次重跑（滚回窗口/宽度变化/点按重试）都从干净状态开始，错误态绝不粘滞
+    setRenderError(false)
     if (!active) return
     let cancelled = false
     let renderTask: { cancel: () => void } | null = null
     let textLayer: { cancel: () => void } | null = null
+    // 位图是否已落地：用于把「文字层失败」与「位图失败」分开——前者不遮内容，后者才该报错
+    let canvasDone = false
 
     const done = (async () => {
       // 先等上一轮（可能刚被 cancel）彻底结束，再开始新一轮
@@ -86,8 +102,11 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
       })
       renderTask = task
       await task.promise
+      canvasDone = true
       if (cancelled) return
       setRendered(true)
+      setRetrying(false)
+      setFailCount(0)
 
       const holder = textRef.current
       if (holder) {
@@ -99,8 +118,23 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
         await layer.render()
       }
       page.cleanup()
-    })().catch(() => {
-      // 渲染被取消（快速滚动）或单页损坏：不影响其他页，占位继续显示
+    })().catch((e: unknown) => {
+      // 三类分诊——此前一律静默，单页损坏/低内存渲染失败在用户眼里就是「永远的空白占位符」：
+      // 1) 取消（快速滚动/宽度变化重跑/卸载）：正常路径，保持静默
+      if (cancelled || (e instanceof Error && e.name === 'RenderingCancelledException')) return
+      // 2) 位图已落地、只是文字层失败：内容看得见（仅选字不可用），只记日志不遮页面
+      if (canvasDone) {
+        console.error(`[pdf] 第 ${pageNumber} 页文字层失败`, e)
+        return
+      }
+      // 3) 位图失败：这一页确实什么都没画上，必须让用户看见并能重试
+      console.error(`[pdf] 第 ${pageNumber} 页渲染失败`, e)
+      const message = e instanceof Error ? e.message : String(e)
+      setRenderError(true)
+      setRetrying(false)
+      setFailCount((c) => c + 1)
+      setFailMessage(message)
+      onRenderError(message)
     })
     inflightRef.current = done
 
@@ -117,8 +151,9 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
       }
       setRendered(false)
     }
-    // layoutTick：容器宽度变化后强制重跑（与滚动触发同一条渲染路径）
-  }, [active, doc, lib, pageNumber, scale, layoutTick])
+    // layoutTick：容器宽度变化后强制重跑；retryTick：渲染失败后点按重试（同一条渲染路径）
+    // onRenderError 是 viewer 的 useCallback（空依赖），引用恒定，不会额外触发重跑
+  }, [active, doc, lib, pageNumber, scale, layoutTick, retryTick, onRenderError])
 
   return (
     <div
@@ -138,9 +173,32 @@ const PdfPage = memo(function PdfPage({ lib, doc, pageNumber, scale, width, heig
     >
       <canvas ref={canvasRef} className="block" />
       <div ref={textRef} className="paper-textlayer" />
-      {!rendered && (
-        <div className="absolute inset-0 flex items-center justify-center text-xs text-dim">第 {pageNumber} 页</div>
-      )}
+      {/* 占位三态：渲染失败 → 可重试按钮；未渲染 → 页码占位（重试中要有反馈）；已渲染 → 无覆盖层 */}
+      {renderError ? (
+        <button
+          type="button"
+          onClick={() => {
+            setRetrying(true)
+            setRetryTick((t) => t + 1)
+          }}
+          className="absolute inset-0 flex min-h-11 flex-col items-center justify-center gap-1 bg-white/80 px-4 text-xs text-dim"
+        >
+          <span>本页渲染失败 · 点按重试</span>
+          {/* 连续失败 ≥2 次：重试大概率无望，把真实报错亮出来（截图即可远程定位）并引导切文本视图 */}
+          {failCount >= 2 && (
+            <>
+              <span className="max-w-full break-all text-[0.65rem] text-bad">
+                {failMessage.length > 120 ? `${failMessage.slice(0, 120)}…` : failMessage}
+              </span>
+              <span className="text-[0.65rem]">可切换「文本视图」继续阅读</span>
+            </>
+          )}
+        </button>
+      ) : !rendered ? (
+        <div className="absolute inset-0 flex items-center justify-center text-xs text-dim">
+          {retrying ? '重试中…' : `第 ${pageNumber} 页`}
+        </div>
+      ) : null}
     </div>
   )
 })
@@ -154,16 +212,37 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
   const wrapRef = useRef<HTMLDivElement>(null)
   const [boxWidth, setBoxWidth] = useState(0)
   const [layoutTick, setLayoutTick] = useState(0)
+  /** 「IO 首批全部不可见」只警告一次：这是环境指纹不是每帧事件，刷屏只会淹没真正的错误 */
+  const ioEmptyWarnedRef = useRef(false)
+  /**
+   * viewer 级错误条：只记「首个」页渲染失败的报错（同一根因会逐页重复），可手动关闭。
+   * 用户手机截不了 console——这条真实 e.message 是远程定位引擎级兼容问题的唯一线索。
+   */
+  const [engineError, setEngineError] = useState<string | null>(null)
+  const [engineErrorDismissed, setEngineErrorDismissed] = useState(false)
+  const handleRenderError = useCallback((message: string) => {
+    setEngineError((prev) => prev ?? message)
+  }, [])
 
   useEffect(() => {
+    // pdf.js v4+ 依赖 Promise.withResolvers（iOS Safari ≥ 17.4）：旧内核会在 worker 深处抛
+    // ReferenceError 且不走我们的 catch（发生在独立线程），表现就是无限「正在加载」。
+    // 提前探测并给出明确的降级出路，而不是让用户对着白屏猜。
+    if (!('withResolvers' in Promise)) {
+      setError('当前浏览器版本过低（iOS 需 ≥ 17.4），无法渲染原版 PDF，请切换「文本视图」阅读')
+      return
+    }
     let cancelled = false
     let task: { destroy: () => Promise<void> } | null = null
 
     void (async () => {
       try {
+        // WebKit 缺 ReadableStream 异步迭代:不补齐的话 getTextContent(文字层)整体抛错
+        ensurePdfCompat()
         const pdfjs = await import('pdfjs-dist')
         if (cancelled) return
-        pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
+        // 官方 worker 换成 pdfWorkerEntry 包装:worker 线程也要装 WebKit 兼容 shim
+        pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
         // 必须传副本：pdf.js 会把 ArrayBuffer transfer 进 worker 并 detach 原对象，
         // 而这份字节是我们从 IndexedDB 取出的唯一实例，切模式回来还要用。
         const loading = pdfjs.getDocument({ data: bytes.slice(0) })
@@ -183,6 +262,8 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
         setDoc(document_)
         onLoaded?.(document_.numPages)
       } catch (e) {
+        // 统一 [pdf] 前缀：远端排查（用户手机截不了 console）靠这条日志区分「打不开」与「渲染失败」
+        console.error('[pdf] 打开 PDF 失败', e)
         if (!cancelled) setError(e instanceof Error ? e.message : '无法打开原始 PDF')
       }
     })()
@@ -229,10 +310,13 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
     }
   }, [])
 
+  // 手机余量收窄到 8px：阅读列 padding 已从 p-4 降为 p-2，页面能多吃回 8px 宽度
+  //（390 设备页宽 308 → 364px 的一部分来自这里，另一部分来自布局改造）
+  const isTablet = useMediaQuery(MQ.md)
   const scale = useMemo(() => {
     if (!base || !boxWidth) return 1
-    return Math.min(2, Math.max(0.3, (boxWidth - 16) / base.width))
-  }, [base, boxWidth])
+    return Math.min(2, Math.max(0.3, (boxWidth - (isTablet ? 16 : 8)) / base.width))
+  }, [base, boxWidth, isTablet])
 
   const pages = useMemo(() => (doc ? Array.from({ length: doc.numPages }, (_, i) => i + 1) : []), [doc])
 
@@ -254,7 +338,16 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
           if (e.isIntersecting) visible.add(p)
           else visible.delete(p)
         }
-        if (!visible.size) return
+        if (!visible.size) {
+          // 可见集为空时保持现有 range 不动（滚动过程中的瞬时空批是常态）。
+          // 但「首批就全不可见」值得留痕：那是移动端 WebView 懒布局/后台挂起的指纹，
+          // 没有 range 兜底（isPageActive 的 null 分支）时整篇 PDF 会全白。只警一次防刷屏。
+          if (!ioEmptyWarnedRef.current) {
+            ioEmptyWarnedRef.current = true
+            console.warn('[pdf] IO 首批全部不可见')
+          }
+          return
+        }
         const min = Math.min(...visible)
         const max = Math.max(...visible)
         setRange((prev) => (prev && prev.min === min && prev.max === max ? prev : { min, max }))
@@ -289,7 +382,11 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
         return { page: Number(node.dataset.page), top: r.top, bottom: r.bottom }
       })
       const page = pickCurrentPage(edges, viewportTop)
-      if (page === undefined || page === reported) return
+      if (page === undefined) return
+      // 几何补种：IO 首批全不可见时 range 停在 null，首次滚动结算就把当前页种进渲染窗口。
+      // 只填 null 不覆盖已有值——IO 正常工作时这里永远是 no-op，两套判定不打架
+      setRange((prev) => prev ?? { min: page, max: page })
+      if (page === reported) return
       reported = page
       onVisiblePage(page)
     }
@@ -317,6 +414,21 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
 
   return (
     <div ref={wrapRef} className="pb-24">
+      {engineError && !engineErrorDismissed && (
+        <div className="mb-3 flex items-start justify-between gap-3 rounded-lg border border-bad/40 bg-panel px-3 py-2">
+          <p className="min-w-0 break-all text-xs text-bad">
+            PDF 渲染引擎报错：{engineError.length > 200 ? `${engineError.slice(0, 200)}…` : engineError}
+            <span className="text-dim">（可切换「文本视图」继续阅读）</span>
+          </p>
+          <button
+            type="button"
+            onClick={() => setEngineErrorDismissed(true)}
+            className="shrink-0 text-xs text-dim hover:text-fg"
+          >
+            关闭
+          </button>
+        </div>
+      )}
       {!doc || !base || !lib ? (
         <p className="p-4 text-sm text-dim">正在加载原版 PDF…</p>
       ) : (
@@ -330,7 +442,9 @@ export default function PdfViewer({ bytes, containerRef, onVisiblePage, onLoaded
             width={base.width * scale}
             height={base.height * scale}
             layoutTick={layoutTick}
-            active={range !== null && p >= range.min - WINDOW_PAGES && p <= range.max + WINDOW_PAGES}
+            // range=null 时 isPageActive 兜底 {1,1}：首屏 1-3 页无条件渲染（手机全白修复的核心）
+            active={isPageActive(p, range)}
+            onRenderError={handleRenderError}
           />
         ))
       )}
