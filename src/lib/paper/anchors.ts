@@ -135,6 +135,44 @@ export function resolveAnchor(
   return { mode, precision: 'none', section }
 }
 
+/** 原版 PDF 渲染窗口：可见页前后各多渲染几页（预渲染，滚动到时位图已就绪） */
+export const RENDER_WINDOW_PAGES = 2
+
+export interface PageRange {
+  min: number
+  max: number
+}
+
+/**
+ * 一页是否落在渲染窗口内（PdfViewer 用它决定该页画位图还是留占位符）。
+ *
+ * range 为 null（IntersectionObserver 还没结算出可见集）时兜底为 `{min:1,max:1}`：
+ * 首屏前 1+window 页无条件渲染——否则任何让 IO 首批回调全部「不可见」的时序
+ * （移动端 WebView 懒布局、后台标签挂起等）都会让整篇 PDF 永远停在占位符上，
+ * 这是手机端「原版 PDF 全白」的根因之一。
+ */
+export function isPageActive(page: number, range: PageRange | null, window: number = RENDER_WINDOW_PAGES): boolean {
+  const r = range ?? { min: 1, max: 1 }
+  return page >= r.min - window && page <= r.max + window
+}
+
+/**
+ * 容器内滚动定位：把目标元素顶边对齐到滚动容器视口顶边下 margin 处，返回容器应设的 scrollTop。
+ *
+ * 与 `scrollIntoView({block:'start'})` 数学等价（margin 对应目标元素的 `scroll-mt-4` = 16px，
+ * PDF 页与文本块都用这个值），区别在于**只滚阅读容器自己**——scrollIntoView 会把所有可滚祖先
+ * 连文档一起滚，手机上（文档本不该滚）会把工作台 header 顶出屏幕。
+ *
+ * @param scrollTop 容器当前 scrollTop
+ * @param elTop 目标元素顶边（视口坐标，getBoundingClientRect().top）
+ * @param viewportTop 容器滚动视口顶边（视口坐标，含 clientTop 边框修正）
+ * @param margin 顶部留白，默认 16 = scroll-mt-4
+ */
+export function readerScrollTop(scrollTop: number, elTop: number, viewportTop: number, margin: number = 16): number {
+  // 元素与容器顶边的相对偏移在滚动中保持不变，所以目标 scrollTop 是简单的平移；负值钳到 0
+  return Math.max(0, scrollTop + (elTop - viewportTop) - margin)
+}
+
 /** 一页在滚动容器坐标系里的上下边（同一参照系即可，通常直接用 getBoundingClientRect） */
 export interface PageEdges {
   page: number

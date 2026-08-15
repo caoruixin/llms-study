@@ -1,4 +1,4 @@
-// 推理全链路四层：自底向上，每个组件带讲解与面试考点
+// 推理全链路四层：自底向上，每个组件带讲解与客户常问要点
 export interface StackComponent {
   id: string
   name: string

@@ -398,7 +398,7 @@ export default function KdaDerivation() {
 
           {current.interview && (
             <div className="rounded-lg border border-warn/30 bg-warn/10 p-3">
-              <div className="mb-1 text-xs font-semibold tracking-wide text-warn">面试一句话</div>
+              <div className="mb-1 text-xs font-semibold tracking-wide text-warn">售前一句话</div>
               <p className="text-sm leading-relaxed">{current.interview}</p>
             </div>
           )}

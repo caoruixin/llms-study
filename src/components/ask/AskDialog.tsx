@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { motion, useDragControls } from 'framer-motion'
 import { splitFences } from '../../lib/liteMd'
-import type { LlmErrorKind } from '../../lib/llmClient'
+import type { LlmAuthCode, LlmErrorKind } from '../../lib/llmClient'
 import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 
 export interface AskMsg {
@@ -17,7 +17,10 @@ interface Props {
   messages: AskMsg[]
   busy: boolean
   error: string
-  errorKind: LlmErrorKind | null // 'auth' 时附「去设置」
+  errorKind: LlmErrorKind | null // 'auth' 时附引导动作
+  /** auth 细分：unauthenticated → 登录按钮（onLoginRetry）；no-user-key → 去设置页链接 */
+  errorCode: LlmAuthCode | null
+  onLoginRetry: () => void
   onSend: (text: string) => void
   onStop: () => void
   onClose: () => void
@@ -88,7 +91,7 @@ function renderAssistant(content: string) {
   )
 }
 
-export default function AskDialog({ messages, busy, error, errorKind, onSend, onStop, onClose }: Props) {
+export default function AskDialog({ messages, busy, error, errorKind, errorCode, onLoginRetry, onSend, onStop, onClose }: Props) {
   const [text, setText] = useState('')
   const constraintsRef = useRef<HTMLDivElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -204,11 +207,20 @@ export default function AskDialog({ messages, busy, error, errorKind, onSend, on
           {error && (
             <p className="mb-2 text-xs text-bad">
               {error}
-              {errorKind === 'auth' && (
-                <Link to="/settings" className="ml-2 underline hover:text-accent">
-                  去设置
+              {errorCode === 'unauthenticated' ? (
+                <button
+                  type="button"
+                  onClick={onLoginRetry}
+                  className="ml-2 min-h-11 text-accent underline underline-offset-2 md:min-h-0"
+                >
+                  登录后重试
+                </button>
+              ) : errorKind === 'auth' ? (
+                // no-user-key 与其余 403：账号侧配置问题，引导去设置页（key 托管/账号状态）
+                <Link to="/settings" className="ml-2 underline hover:text-accent" onClick={onClose}>
+                  去设置页配置
                 </Link>
-              )}
+              ) : null}
             </p>
           )}
           <textarea

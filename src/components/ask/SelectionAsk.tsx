@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { chatStream, LlmError } from '../../lib/llmClient'
-import type { LlmErrorKind } from '../../lib/llmClient'
+import type { LlmAuthCode, LlmErrorKind } from '../../lib/llmClient'
+import { useAuthStore } from '../../lib/auth/authStore'
 import { useSettings } from '../../store'
 import { NAV } from '../../nav'
 import AskDialog from './AskDialog'
 import type { AskMsg } from './AskDialog'
 
 const SYSTEM_PROMPT = `你是「LLM Infra Studio」站内答疑助手。这个站点用于准备 LLM 基础设施 /
-Token 与算力售前方向的面试，用户会框选页面上的内容并向你提问。
+Token 与算力售前场景的客户沟通，用户会框选页面上的内容并向你提问。
 回答要求：
-- 中文作答，面向面试表达：先给一句简明结论，再展开关键机制与取舍；
-- 适当补充数量级、成本与业务视角（这是售前面试的加分项）；
+- 中文作答，面向客户沟通表达：先给一句简明结论，再展开关键机制与取舍；
+- 适当补充数量级、成本与业务视角（这是售前沟通的加分项）；
 - 严格围绕引用的选中内容作答，不确定的信息明确说明，不要编造；
 - 代码、公式、配置用 markdown 代码块，保持简洁。`
 
@@ -22,24 +23,30 @@ interface BtnState {
   pageLabel: string // 选中那一刻的页面，路由切换后引用也不会张冠李戴
 }
 
-function friendlyError(e: unknown): { msg: string; kind: LlmErrorKind | null } {
+function friendlyError(e: unknown): { msg: string; kind: LlmErrorKind | null; code: LlmAuthCode | null } {
   if (e instanceof LlmError) {
+    const code = e.code ?? null
     switch (e.kind) {
       case 'auth':
-        return { msg: 'API key 无效或未配置：请到设置页粘贴 key，或配置 .env.local 后重启 dev', kind: 'auth' }
+        // 网关语义（P2 收口）：401 = 未登录，403 + no-user-key = 该账号没配这家的 key
+        if (code === 'unauthenticated') return { msg: '请先登录后使用 AI 功能', kind: 'auth', code }
+        if (code === 'no-user-key') {
+          return { msg: '该账号尚未配置此服务商的 API key，请到设置页配置', kind: 'auth', code }
+        }
+        return { msg: '访问被拒绝：账号可能被停用或无权限', kind: 'auth', code }
       case 'rate-limit':
-        return { msg: '触发上游限流（429），请稍后重试', kind: e.kind }
+        return { msg: '触发上游限流（429），请稍后重试', kind: e.kind, code }
       case 'timeout':
-        return { msg: '请求超时，可以重试或换个更快的模型', kind: e.kind }
+        return { msg: '请求超时，可以重试或换个更快的模型', kind: e.kind, code }
       case 'network':
-        return { msg: `网络异常：${e.message}`, kind: e.kind }
+        return { msg: `网络异常：${e.message}`, kind: e.kind, code }
       case 'bad-response':
-        return { msg: `上游返回异常：${e.message}`, kind: e.kind }
+        return { msg: `上游返回异常：${e.message}`, kind: e.kind, code }
       case 'server':
-        return { msg: `上游报错：${e.message}`, kind: e.kind }
+        return { msg: `上游报错：${e.message}`, kind: e.kind, code }
     }
   }
-  return { msg: e instanceof Error ? `出错了：${e.message}` : '出错了，请重试', kind: null }
+  return { msg: e instanceof Error ? `出错了：${e.message}` : '出错了，请重试', kind: null, code: null }
 }
 
 export default function SelectionAsk() {
@@ -49,9 +56,12 @@ export default function SelectionAsk() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [errorKind, setErrorKind] = useState<LlmErrorKind | null>(null)
+  const [errorCode, setErrorCode] = useState<LlmAuthCode | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
   const sessionRef = useRef(0) // 会话代数：竞态防护核心，关闭即 +1
+  // 最近一轮的上下文快照：unauthenticated 登录成功后重试用（用户消息已在列表里，不能重发重复追加）
+  const lastHistoryRef = useRef<AskMsg[] | null>(null)
   const idRef = useRef(0)
   const nextId = () => ++idRef.current
 
@@ -188,19 +198,29 @@ export default function SelectionAsk() {
     setOpen(true)
     setError('')
     setErrorKind(null)
+    setErrorCode(null)
     setBtn(null)
   }
 
   async function send(text: string) {
     if (busy || abortRef.current) return // 单会话单 in-flight 硬守卫
-    const gen = sessionRef.current
     const userMsg: AskMsg = { id: nextId(), role: 'user', content: text }
-    const holderId = nextId()
     const history = [...messages, userMsg] // 本轮上下文快照：必须在插入占位消息之前取
-    setMessages((m) => [...m, userMsg, { id: holderId, role: 'assistant', content: '', pending: true }])
+    setMessages((m) => [...m, userMsg])
+    await runTurn(history)
+  }
+
+  // 一轮 LLM 调用（用户消息已入列表）：send 与「登录后重试」共用——重试不重复追加用户消息
+  async function runTurn(history: AskMsg[]) {
+    if (busy || abortRef.current) return
+    const gen = sessionRef.current
+    lastHistoryRef.current = history
+    const holderId = nextId()
+    setMessages((m) => [...m, { id: holderId, role: 'assistant', content: '', pending: true }])
     setBusy(true)
     setError('')
     setErrorKind(null)
+    setErrorCode(null)
     const ctrl = new AbortController()
     abortRef.current = ctrl
     let partial = '' // 供 catch 判断是否保留了半截内容
@@ -208,7 +228,6 @@ export default function SelectionAsk() {
       const full = await chatStream({
         provider: settings.provider,
         model: settings.model,
-        userKey: settings.userKey || undefined,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           ...history.map(({ role, content }) => ({ role, content })),
@@ -228,10 +247,11 @@ export default function SelectionAsk() {
       )
     } catch (e) {
       if (gen !== sessionRef.current) return
-      const { msg, kind } = friendlyError(e)
+      const { msg, kind, code } = friendlyError(e)
       // 半截内容保留为普通消息并提示「响应中断」；无内容则移除占位
       setError(partial ? `响应中断：${msg}（已保留部分内容）` : msg)
       setErrorKind(kind)
+      setErrorCode(code)
       setMessages((m) =>
         m
           .map((x) => (x.id === holderId && x.content ? { ...x, pending: false } : x))
@@ -251,16 +271,26 @@ export default function SelectionAsk() {
     abortRef.current?.abort()
   }
 
+  // unauthenticated：弹登录 gate，成功后用上下文快照自动重试（同一会话代数内）
+  async function retryAfterLogin() {
+    const ok = await useAuthStore.getState().requireLogin('llm')
+    if (!ok) return
+    const history = lastHistoryRef.current
+    if (history) await runTurn(history)
+  }
+
   // Close：先升代数、再交出所有权后 abort，旧请求的任何后续写入都会被丢弃（关掉即忘）
   function onClose() {
     sessionRef.current++
     const old = abortRef.current
     abortRef.current = null
     old?.abort()
+    lastHistoryRef.current = null
     setMessages([])
     setBusy(false)
     setError('')
     setErrorKind(null)
+    setErrorCode(null)
     setOpen(false)
   }
 
@@ -284,6 +314,8 @@ export default function SelectionAsk() {
           busy={busy}
           error={error}
           errorKind={errorKind}
+          errorCode={errorCode}
+          onLoginRetry={() => void retryAfterLogin()}
           onSend={send}
           onStop={onStop}
           onClose={onClose}

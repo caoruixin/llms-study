@@ -137,7 +137,7 @@ export default function TransformerDiagram() {
               <p>{selected.why}</p>
             </div>
             <div className="rounded-lg border border-warn/30 bg-warn/10 p-3">
-              <div className="mb-1 text-xs font-semibold tracking-wide text-warn">面试一句话</div>
+              <div className="mb-1 text-xs font-semibold tracking-wide text-warn">售前一句话</div>
               <p>{selected.interview}</p>
             </div>
           </div>

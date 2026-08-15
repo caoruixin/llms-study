@@ -1,0 +1,12 @@
+{
+  // 构建产物不含 test/;rootDir=.. 使 dist 布局为 dist/{server/src,shared},
+  // 入口即 dist/server/src/index.js(systemd ExecStart 与 npm start 依赖此路径)
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "sourceMap": false,
+    "declaration": false
+  },
+  "include": ["src", "../shared", "../src/lib/keyRotation.ts"]
+}

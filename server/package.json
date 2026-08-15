@@ -1,0 +1,28 @@
+{
+  "name": "llms-study-api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "llm-pro.cn 后端:账号/邀请码/用户 LLM key 保管(Hono + better-sqlite3,systemd 单进程)",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json && mkdir -p dist/server/src/db/migrations && cp src/db/migrations/*.sql dist/server/src/db/migrations/",
+    "start": "node dist/server/src/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "@node-rs/argon2": "^2.0.2",
+    "better-sqlite3": "^12.2.0",
+    "hono": "^4.7.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0"
+  }
+}

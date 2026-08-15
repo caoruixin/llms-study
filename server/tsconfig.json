@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    // rootDir 指仓库根:server 通过相对路径引用 ../shared(不搞 alias),
+    // 因此编译输入横跨 server/ 与 shared/ 两棵树
+    "rootDir": "..",
+    "types": ["node"]
+  },
+  // ../src/lib/keyRotation.ts:前端与网关共用的纯逻辑(零依赖),直接编进来避免复制漂移
+  "include": ["src", "test", "../shared", "../src/lib/keyRotation.ts"]
+}

@@ -1,0 +1,29 @@
+# llms-study 后端 API(Hono + SQLite,单进程)
+# 安装:cp deploy/llms-study-api.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now llms-study-api
+# env 全部来自 /etc/llms-study/api.env(0600),代码目录不放任何机密
+[Unit]
+Description=llms-study API (llm-pro.cn backend)
+After=network.target
+
+[Service]
+Type=simple
+User=llmapp
+Group=llmapp
+WorkingDirectory=/opt/llms-study-api
+EnvironmentFile=/etc/llms-study/api.env
+# 路径与 server npm run build 的 dist 布局一致(rootDir=仓库根 → dist/server/src/index.js)
+ExecStart=/usr/bin/node /opt/llms-study-api/dist/server/src/index.js
+Restart=always
+RestartSec=2
+# SQLite + 少量并发,512M 足够;超限说明泄漏,宁可被杀重启
+MemoryMax=512M
+
+# 最小权限:只有数据目录可写
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/llms-study
+
+[Install]
+WantedBy=multi-user.target

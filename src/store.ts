@@ -48,15 +48,15 @@ export const PROVIDERS: ProviderPreset[] = [
   },
 ]
 
-const KEY_STORAGE = 'llm-user-key' // sessionStorage：key 不落 localStorage
+// 旧版残留清理：自带 key 已迁移到账号体系（加密存服务端、按登录态注入），
+// 浏览器端不再保存任何 LLM key；老会话的 sessionStorage 残留在启动时抹掉
+if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem('llm-user-key')
 
 interface SettingsState {
   provider: ProviderId
   model: string
-  userKey: string
   setProvider: (p: ProviderId) => void
   setModel: (m: string) => void
-  setUserKey: (k: string) => void
 }
 
 export const useSettings = create<SettingsState>()(
@@ -64,18 +64,13 @@ export const useSettings = create<SettingsState>()(
     (set) => ({
       provider: 'deepseek',
       model: 'deepseek-v4-flash',
-      userKey: typeof sessionStorage !== 'undefined' ? (sessionStorage.getItem(KEY_STORAGE) ?? '') : '',
       setProvider: (provider) =>
         set({ provider, model: PROVIDERS.find((p) => p.id === provider)?.defaultModel ?? '' }),
       setModel: (model) => set({ model }),
-      setUserKey: (userKey) => {
-        sessionStorage.setItem(KEY_STORAGE, userKey)
-        set({ userKey })
-      },
     }),
     {
       name: 'llm-infra-settings',
-      partialize: (s) => ({ provider: s.provider, model: s.model }), // userKey 不持久化到 localStorage
+      partialize: (s) => ({ provider: s.provider, model: s.model }),
     },
   ),
 )

@@ -24,6 +24,8 @@ export interface TurnError {
   message: string
   /** LlmError.kind / GatewayError.kind / 'cost-declined' / null */
   kind: string | null
+  /** kind='auth' 的细分（加法字段，透传 LlmError.code）：UI 据此分支「登录重试 / 去配 key」 */
+  code?: string
 }
 
 const HAS_CJK = /[一-鿿]/
@@ -240,7 +242,8 @@ export interface TurnRunner {
 
 const friendlyOf = (e: unknown): TurnError => {
   if (e instanceof GatewayError) return { message: e.message, kind: e.kind }
-  if (e instanceof LlmError) return { message: e.message, kind: e.kind }
+  // code 透传（modelGateway 原样上抛 LlmError，401/403 细分不在此处丢失）
+  if (e instanceof LlmError) return { message: e.message, kind: e.kind, ...(e.code ? { code: e.code } : {}) }
   return { message: e instanceof Error ? e.message : '未知错误', kind: null }
 }
 

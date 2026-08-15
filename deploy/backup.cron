@@ -1,0 +1,7 @@
+# llms-study 每日备份(P5)。安装:cp deploy/backup.cron /etc/cron.d/llms-study-backup
+# /etc/cron.d 格式带用户字段;root 执行(备份目录属 root,数据目录可读)。
+# 输出追加到日志文件,stderr(磁盘水位告警)同样落日志,便于 grep WARN。
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 3 * * * root /usr/local/bin/llms-study-backup.sh >> /var/log/llms-study-backup.log 2>&1

@@ -59,6 +59,8 @@ function makeStream(): FakeStream {
 interface StubInit {
   status?: number
   contentType?: string
+  /** 额外响应头（403 的 X-LLM-Deny 细分测试用） */
+  headers?: Record<string, string>
   body?: ReadableStream<Uint8Array> | null
   json?: unknown
   stream?: FakeStream
@@ -81,7 +83,10 @@ function stubFetch(init: StubInit) {
     return {
       ok: status >= 200 && status < 300,
       status,
-      headers: new Headers(init.contentType ? { 'content-type': init.contentType } : {}),
+      headers: new Headers({
+        ...(init.contentType ? { 'content-type': init.contentType } : {}),
+        ...(init.headers ?? {}),
+      }),
       body: init.body === undefined ? (init.stream?.stream ?? null) : init.body,
       json: async () => init.json,
     } as unknown as Response
@@ -125,12 +130,12 @@ describe('chatStream（流式）', () => {
     expect(deltas).toEqual(['你', '好'])
   })
 
-  it('请求体与头部：stream=true / temperature 0.7 / X-User-Key', async () => {
+  it('请求体与头部：stream=true / temperature 0.7 / 不携带任何 key 头', async () => {
     const s = makeStream()
     s.send(frame('hi'))
     s.close()
     stubFetch({ contentType: 'text/event-stream', stream: s })
-    await chatStream({ ...base, userKey: 'sk-test', onDelta: () => {} })
+    await chatStream({ ...base, onDelta: () => {} })
     expect(lastUrl).toBe('/api/deepseek/chat/completions')
     const sent = JSON.parse(String(lastInit?.body)) as {
       model: string
@@ -142,7 +147,8 @@ describe('chatStream（流式）', () => {
     expect(sent.temperature).toBe(0.7)
     expect(sent.model).toBe('deepseek-v4-flash')
     expect(sent.messages).toHaveLength(1)
-    expect((lastInit?.headers as Record<string, string>)['X-User-Key']).toBe('sk-test')
+    // key 一律由后端网关按登录账号注入：浏览器请求头不允许出现 X-User-Key
+    expect((lastInit?.headers as Record<string, string>)['X-User-Key']).toBeUndefined()
   })
 
   it('[DONE] 终止：上游不断开也能收尾', async () => {
@@ -208,10 +214,27 @@ describe('chatStream（流式）', () => {
     expect(deltas).toEqual(['整包回答'])
   })
 
-  it('401 → auth', async () => {
+  it('401 → auth + code=unauthenticated（未登录）', async () => {
     stubFetch({ status: 401, body: null })
     const r = await settled(chatStream({ ...base, onDelta: () => {} }))
-    expectKind(r.err, 'auth')
+    const err = expectKind(r.err, 'auth')
+    expect(err.code).toBe('unauthenticated')
+    expect(err.message).toContain('登录')
+  })
+
+  it('403 + X-LLM-Deny: no-user-key → auth + code=no-user-key（账号未配 key）', async () => {
+    stubFetch({ status: 403, body: null, headers: { 'X-LLM-Deny': 'no-user-key' } })
+    const r = await settled(chatStream({ ...base, onDelta: () => {} }))
+    const err = expectKind(r.err, 'auth')
+    expect(err.code).toBe('no-user-key')
+    expect(err.message).toContain('设置页')
+  })
+
+  it('裸 403 → auth + code=forbidden', async () => {
+    stubFetch({ status: 403, body: null })
+    const r = await settled(chatStream({ ...base, onDelta: () => {} }))
+    const err = expectKind(r.err, 'auth')
+    expect(err.code).toBe('forbidden')
   })
 
   it('429 → rate-limit', async () => {

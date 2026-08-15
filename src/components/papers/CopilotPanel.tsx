@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { useAuthStore } from '../../lib/auth/authStore'
 import {
   buildStructuredFallbackSpec,
   COST_CONFIRM_THRESHOLDS,
@@ -15,9 +17,7 @@ import {
   sectionizeUnits,
 } from '../../lib/paper/briefPipeline'
 import { createModelGateway } from '../../lib/paper/modelGateway'
-import { createCopilotRepository } from '../../lib/paper/repo/copilotRepo'
-import { createLearnerRepository } from '../../lib/paper/repo/learnerRepo'
-import { getPaperDb } from '../../lib/paper/repo/db'
+import { getRepos } from '../../lib/paper/repo/repos'
 import { createTurnRunner, findOrphanTurns, turnErrorDetail, type TurnError, type TurnState } from '../../lib/paper/turnEngine'
 import { KEEP_PAIRS_AFTER_FOLD, MAX_LIVE_TURN_PAIRS, foldMemo, shouldRequestMemo, trimHistoryPairs } from '../../lib/paper/summarizer'
 import { formatTokens, formatUsd } from '../../lib/paper/usage'
@@ -132,19 +132,24 @@ const ASK_TEMPLATES: Record<Exclude<PaperAskAction, 'queue'>, { question: string
   example: { question: '请举一个具体的例子帮助理解我选中的这段内容。', task: 'chat' },
 }
 
-const PROVIDER_KEY_HINT: Record<PaperProviderId, string> = {
-  deepseek: 'DEEPSEEK_API_KEY',
-  kimi: 'KIMI_API_KEY（或 MOONSHOT_API_KEY）',
+const PROVIDER_KEY_LABEL: Record<PaperProviderId, string> = {
+  deepseek: 'DeepSeek',
+  kimi: 'Kimi (Moonshot)',
 }
 
 /**
  * 错误文案（§QA D-10）：底层 message 已经中文化过一次，这里再套前缀就成了
- * 「网络异常：网络错误：Failed to fetch」；一律走 turnErrorDetail 去重 + 去英文原文。
+ * 「网络异常：网络异常：Failed to fetch」；一律走 turnErrorDetail 去重 + 去英文原文。
+ * auth 按网关细分码两分支：未登录（401）/ 账号没配该 provider 的 key（403 no-user-key）。
  */
 function friendlyTurnError(err: TurnError, provider: PaperProviderId = 'deepseek'): string {
   switch (err.kind) {
     case 'auth':
-      return `API key 无效或未配置：请在 .env.local 配置 ${PROVIDER_KEY_HINT[provider]} 后重启 dev`
+      if (err.code === 'no-user-key') {
+        return `该账号尚未配置 ${PROVIDER_KEY_LABEL[provider]} 的 API key，请到设置页配置`
+      }
+      if (err.code === 'forbidden') return '访问被拒绝：账号可能被停用或无权限'
+      return '请先登录后使用 AI 功能'
     case 'rate-limit':
       return '触发上游限流（429），稍候会自动排队，也可稍后手动重试'
     case 'timeout':
@@ -173,8 +178,9 @@ export default function CopilotPanel({
   onClose,
   onToggleSensitive,
 }: Props) {
-  const repo = useMemo(() => createCopilotRepository(getPaperDb()), [])
-  const learnerRepo = useMemo(() => createLearnerRepository(getPaperDb()), [])
+  // 门面引用永不变（repos.ts 单例工厂）：账号切换不重挂组件也能路由到正确的库
+  const repo = getRepos().copilot
+  const learnerRepo = getRepos().learner
 
   const [session, setSession] = useState<Awaited<ReturnType<typeof repo.getOrCreateSession>> | null>(null)
   const [messages, setMessages] = useState<StoredMessage[]>([])
@@ -296,7 +302,10 @@ export default function CopilotPanel({
     () =>
       createModelGateway({
         hasConsent: async (p) => (await repo.getConsent(p))?.granted === true,
-        recordUsage: (d) => repo.addUsage(d),
+        // addUsage 返回落库行(同步装饰器用),gateway 只要 void:显式吞掉返回值
+        recordUsage: async (d) => {
+          await repo.addUsage(d)
+        },
       }),
     [repo],
   )
@@ -482,7 +491,11 @@ export default function CopilotPanel({
           : undefined,
       })
       if (st.phase === 'error') {
-        setError({ message: `响应中断：${friendlyTurnError(st.error!, provider)}（已保留部分内容）`, kind: st.error!.kind })
+        setError({
+          message: `响应中断：${friendlyTurnError(st.error!, provider)}（已保留部分内容）`,
+          kind: st.error!.kind,
+          ...(st.error!.code ? { code: st.error!.code } : {}), // auth 细分码不丢：引导动作照常可用
+        })
       }
 
       // L2 画像（§6.2）：finalize 后从流内岛提取 learner 弱信号与 teach-back 判定
@@ -855,6 +868,12 @@ export default function CopilotPanel({
     const params = lastParamsRef.current
     if (params && !busy) void sendTurn(params)
   }, [busy, sendTurn])
+
+  /** 未登录（401）分支：弹全局登录 gate，成功后用 lastParamsRef 自动重试本轮 */
+  const loginAndRetry = useCallback(async () => {
+    const ok = await useAuthStore.getState().requireLogin('llm')
+    if (ok) retryLast()
+  }, [retryLast])
 
   const clearSession = useCallback(async () => {
     const s = sessionRefState.current
@@ -1289,10 +1308,26 @@ export default function CopilotPanel({
         {error && (
           <p className="mb-1.5 text-xs text-bad">
             {friendlyTurnError(error, errorProvider)}
-            {error.kind !== 'cost-declined' && error.kind !== 'sensitive-blocked' && (
-              <button type="button" onClick={retryLast} className="ml-2 text-accent underline underline-offset-2">
-                重试
+            {/* auth 细分动作优先：未登录给「登录后重试」、缺 key 给设置页入口，普通重试按钮让位 */}
+            {error.code === 'unauthenticated' ? (
+              <button
+                type="button"
+                onClick={() => void loginAndRetry()}
+                className="ml-2 text-accent underline underline-offset-2"
+              >
+                登录后重试
               </button>
+            ) : error.code === 'no-user-key' ? (
+              <Link to="/settings" className="ml-2 text-accent underline underline-offset-2">
+                去设置页配 key
+              </Link>
+            ) : (
+              error.kind !== 'cost-declined' &&
+              error.kind !== 'sensitive-blocked' && (
+                <button type="button" onClick={retryLast} className="ml-2 text-accent underline underline-offset-2">
+                  重试
+                </button>
+              )
             )}
             {error.kind === 'no-consent' && (
               <button

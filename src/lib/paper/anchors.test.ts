@@ -3,8 +3,10 @@ import {
   blockDomId,
   buildAnchorContext,
   describeTarget,
+  isPageActive,
   pageDomId,
   pickCurrentPage,
+  readerScrollTop,
   resolveAnchor,
   type PageEdges,
 } from './anchors'
@@ -190,6 +192,56 @@ describe('pickCurrentPage', () => {
 
   it('没有页矩形 → undefined（调用方据此不写回阅读位置）', () => {
     expect(pickCurrentPage([], VIEWPORT_TOP)).toBeUndefined()
+  })
+})
+
+describe('isPageActive', () => {
+  it('range 为 null（IO 未结算/首批全不可见）→ 兜底 {1,1}：首屏 1-3 页无条件 active', () => {
+    // 回归手机端「PDF 全白」：冷启动没有任何时序保证 IO 会给出可见集，第 1-3 页必须能渲染
+    expect(isPageActive(1, null)).toBe(true)
+    expect(isPageActive(2, null)).toBe(true)
+    expect(isPageActive(3, null)).toBe(true)
+    expect(isPageActive(4, null)).toBe(false)
+  })
+
+  it('正常 range 前后各扩 2 页（保持既有 ±2 预渲染语义）', () => {
+    const range = { min: 5, max: 6 }
+    expect(isPageActive(3, range)).toBe(true)
+    expect(isPageActive(8, range)).toBe(true)
+    expect(isPageActive(2, range)).toBe(false)
+    expect(isPageActive(9, range)).toBe(false)
+  })
+
+  it('窗口宽度可调（null 兜底同样按传入窗口扩展）', () => {
+    expect(isPageActive(4, { min: 4, max: 4 }, 0)).toBe(true)
+    expect(isPageActive(5, { min: 4, max: 4 }, 0)).toBe(false)
+    expect(isPageActive(4, null, 3)).toBe(true)
+    expect(isPageActive(5, null, 3)).toBe(false)
+  })
+})
+
+describe('readerScrollTop', () => {
+  it('与 scrollIntoView({block:start}) 的落点数学等价：任意出发 scrollTop 都算出 alignTo(N)', () => {
+    // 用上面 Chrome 实测的同一组常量：readerScrollTop 是 scrollIntoView 的容器内替代品，落点必须一致
+    for (const from of [0, 500, alignTo(4), alignTo(9), alignTo(PAGES)]) {
+      const edges = edgesAt(from)
+      expect(readerScrollTop(from, edges[3].top, VIEWPORT_TOP, SCROLL_MT)).toBe(alignTo(4))
+      expect(readerScrollTop(from, edges[0].top, VIEWPORT_TOP, SCROLL_MT)).toBe(alignTo(1))
+    }
+  })
+
+  it('目标在容器顶边上方（向上滚）同样成立', () => {
+    const from = alignTo(9)
+    const edges = edgesAt(from)
+    expect(readerScrollTop(from, edges[1].top, VIEWPORT_TOP, SCROLL_MT)).toBe(alignTo(2))
+  })
+
+  it('顶部越界钳到 0：margin 吃掉容器 padding 也不会产生负 scrollTop', () => {
+    expect(readerScrollTop(0, VIEWPORT_TOP + 10, VIEWPORT_TOP, 16)).toBe(0)
+  })
+
+  it('默认 margin = 16（scroll-mt-4）', () => {
+    expect(readerScrollTop(100, 200, 150)).toBe(100 + 50 - 16)
   })
 })
 

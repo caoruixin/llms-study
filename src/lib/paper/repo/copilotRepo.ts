@@ -1,5 +1,5 @@
 import type { PaperDb } from './db'
-import type { CopilotMessage, CopilotSession, PaperBrief, ProviderConsent } from '../types'
+import type { CopilotMessage, CopilotSession, ModelUsageRecord, PaperBrief, ProviderConsent } from '../types'
 import type { UsageDraft } from '../modelGateway'
 import type { UnitDigest } from '../briefPipeline'
 
@@ -35,7 +35,8 @@ export interface CopilotRepository {
   getConsent(provider: string): Promise<ProviderConsent | undefined>
   setConsent(provider: string, granted: boolean): Promise<void>
 
-  addUsage(draft: UsageDraft): Promise<void>
+  /** 返回落库行（含生成的 id）：P4 同步装饰器要把同一行镜像进 outbox，调用方可忽略返回值 */
+  addUsage(draft: UsageDraft): Promise<ModelUsageRecord>
   usageTotal(paperId: string): Promise<SessionUsageTotal>
 
   getBrief(paperId: string, cacheKey: string): Promise<PaperBrief | undefined>
@@ -101,7 +102,7 @@ export function createCopilotRepository(db: PaperDb): CopilotRepository {
     },
 
     async addUsage(draft) {
-      await db.usage.add({
+      const row: ModelUsageRecord = {
         id: newId(),
         paperId: draft.paperId,
         provider: draft.provider,
@@ -114,7 +115,9 @@ export function createCopilotRepository(db: PaperDb): CopilotRepository {
         status: draft.status,
         latencyMs: draft.latencyMs,
         task: draft.task,
-      })
+      }
+      await db.usage.add(row)
+      return row
     },
 
     async usageTotal(paperId) {

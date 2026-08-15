@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { CATEGORY_LABELS, QUESTIONS, QUESTIONS_BY_CATEGORY } from '../data/questions'
 import type { Grade, ScoreResult } from '../data/types'
-import { chatComplete } from '../lib/llmClient'
-import type { ChatMessage } from '../lib/llmClient'
+import { chatComplete, LlmError } from '../lib/llmClient'
+import type { ChatMessage, LlmAuthCode } from '../lib/llmClient'
+import { useAuthStore } from '../lib/auth/authStore'
 import { buildGradingMessages, parseScoreJson, toGrade, weightedScore } from '../lib/grading'
 import { isSpeechSupported, startDictation } from '../lib/speech'
 import type { DictationSession } from '../lib/speech'
@@ -31,6 +33,8 @@ export default function InterviewPage() {
   const [dictating, setDictating] = useState(false)
   const [phase, setPhase] = useState<Phase>('idle')
   const [error, setError] = useState('')
+  // 网关 401/403 的细分码：unauthenticated → 登录后自动重试；no-user-key → 引导去设置页配 key
+  const [errorCode, setErrorCode] = useState<LlmAuthCode | null>(null)
   const [result, setResult] = useState<{ score: ScoreResult; grade: Grade } | null>(null)
   const [showRef, setShowRef] = useState(false)
   const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null)
@@ -65,6 +69,7 @@ export default function InterviewPage() {
     setPhase('idle')
     setResult(null)
     setError('')
+    setErrorCode(null)
     setShowRef(false)
     setConfirmTarget(null)
     setShowAllHistory(false)
@@ -154,6 +159,7 @@ export default function InterviewPage() {
     if (!answer.trim()) return
     setPhase('grading')
     setError('')
+    setErrorCode(null)
     setResult(null)
     try {
       const messages = buildGradingMessages(question, answer)
@@ -172,7 +178,14 @@ export default function InterviewPage() {
     } catch (e) {
       setPhase('error')
       setError(e instanceof Error ? e.message : String(e))
+      setErrorCode(e instanceof LlmError ? (e.code ?? null) : null)
     }
+  }
+
+  /** unauthenticated 分支：弹登录 gate，成功后自动重试本次评分（answer 仍在输入框） */
+  async function loginAndRetry() {
+    const ok = await useAuthStore.getState().requireLogin('llm')
+    if (ok) void grade()
   }
 
   async function gradeWithRetry(messages: ChatMessage[]): Promise<ScoreResult> {
@@ -180,7 +193,6 @@ export default function InterviewPage() {
       chatComplete({
         provider: settings.provider,
         model: settings.model,
-        userKey: settings.userKey || undefined,
         messages,
         wantJson: true,
       })
@@ -192,7 +204,6 @@ export default function InterviewPage() {
       const retry = await chatComplete({
         provider: settings.provider,
         model: settings.model,
-        userKey: settings.userKey || undefined,
         messages: [
           ...messages,
           { role: 'assistant', content: first },
@@ -281,7 +292,25 @@ export default function InterviewPage() {
               {showRef ? '隐藏参考要点' : '查看参考要点'}
             </button>
           </div>
-          {error && <p className="mt-2 text-sm text-bad">{error}</p>}
+          {error && (
+            <p className="mt-2 text-sm text-bad">
+              {error}
+              {errorCode === 'unauthenticated' && (
+                <button
+                  type="button"
+                  onClick={() => void loginAndRetry()}
+                  className="ml-2 min-h-11 text-accent underline underline-offset-2 md:min-h-0"
+                >
+                  登录后重试
+                </button>
+              )}
+              {errorCode === 'no-user-key' && (
+                <Link to="/settings" className="ml-2 text-accent underline underline-offset-2">
+                  去设置页配置 key
+                </Link>
+              )}
+            </p>
+          )}
         </div>
 
         {showRef && (
@@ -351,7 +380,7 @@ export default function InterviewPage() {
             )}
             {result.score.comments.length > 0 && (
               <div className="mb-3">
-                <div className="mb-1 text-xs text-dim">面试官点评</div>
+                <div className="mb-1 text-xs text-dim">教练点评</div>
                 <ul className="list-inside list-disc space-y-1 text-sm leading-relaxed">
                   {result.score.comments.map((c, i) => (
                     <li key={i}>{c}</li>

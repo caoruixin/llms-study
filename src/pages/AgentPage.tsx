@@ -50,7 +50,7 @@ export default function AgentPage() {
           <h3 className="font-bold text-accent">{el.name}</h3>
           <p className="mt-2 text-sm leading-relaxed">{el.what}</p>
           <div className="mt-3 rounded-lg border border-warn/30 bg-warn/10 p-3 text-sm leading-relaxed">
-            <span className="text-xs font-semibold text-warn">面试一句话：</span>
+            <span className="text-xs font-semibold text-warn">售前一句话：</span>
             {el.interview}
           </div>
         </div>

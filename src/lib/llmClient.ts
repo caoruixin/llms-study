@@ -9,12 +9,17 @@ export interface ChatMessage {
 
 export type LlmErrorKind = 'auth' | 'rate-limit' | 'timeout' | 'network' | 'bad-response' | 'server'
 
+/** kind='auth' 的细分（加法字段）：后端网关的 401/403 语义，UI 据此分支引导 */
+export type LlmAuthCode = 'unauthenticated' | 'no-user-key' | 'forbidden'
+
 export class LlmError extends Error {
   kind: LlmErrorKind
   /** HTTP 状态码（仅 kind=server 且来自 HTTP 响应时携带；加法字段，既有调用方不读） */
   status?: number
   /** 429 响应的 Retry-After 解析结果（毫秒；加法字段，供 paper gateway 的退避策略用） */
   retryAfterMs?: number
+  /** auth 细分码（加法字段）：unauthenticated=未登录，no-user-key=已登录但该 provider 未配 key */
+  code?: LlmAuthCode
   constructor(kind: LlmErrorKind, message: string) {
     super(message)
     this.kind = kind
@@ -24,7 +29,6 @@ export class LlmError extends Error {
 export interface ChatOptions {
   provider: ProviderId
   model: string
-  userKey?: string
   messages: ChatMessage[]
   wantJson?: boolean
   timeoutMs?: number
@@ -40,10 +44,26 @@ function parseRetryAfter(header: string | null): number | undefined {
   return undefined
 }
 
-/** HTTP 状态 → LlmError 归一化（chatComplete / runSseChat 共用，文案保持既有字节不变） */
+/**
+ * HTTP 状态 → LlmError 归一化（chatComplete / runSseChat 共用）。
+ * 401/403 语义来自后端网关（P2 收口后 LLM 调用一律登录态 + 服务端注入 key）：
+ * kind 仍是 'auth'（既有重试/熔断判定不变），细分走加法字段 code。
+ */
 export function throwForHttpStatus(res: Response): void {
-  if (res.status === 401 || res.status === 403) {
-    throw new LlmError('auth', 'API key 无效或未配置（401/403）：请在设置页粘贴 key 或配置 .env.local 后重启 dev')
+  if (res.status === 401) {
+    const err = new LlmError('auth', '请先登录后使用 AI 功能')
+    err.code = 'unauthenticated'
+    throw err
+  }
+  if (res.status === 403) {
+    // 网关约定：X-LLM-Deny: no-user-key = 已登录但该 provider 未配用户 key
+    const noKey = res.headers.get('X-LLM-Deny') === 'no-user-key'
+    const err = new LlmError(
+      'auth',
+      noKey ? '该账号尚未配置此服务商的 API key，请到设置页配置' : '访问被拒绝（403）：账号可能被停用或无权限',
+    )
+    err.code = noKey ? 'no-user-key' : 'forbidden'
+    throw err
   }
   if (res.status === 429) {
     const err = new LlmError('rate-limit', '触发限流（429），请稍后重试')
@@ -58,8 +78,8 @@ export function throwForHttpStatus(res: Response): void {
   }
 }
 
-// 统一 OpenAI 兼容调用：走同源 allowlist 代理；key 经 X-User-Key 头由代理改写为上游鉴权，
-// 或代理端从 .env.local 注入（此处不传头）。错误归一化为 LlmError。
+// 统一 OpenAI 兼容调用：走同源 allowlist 代理转发到后端网关，key 由服务端按登录账号注入
+// （admin 用站点 key，普通用户用本人托管的 key），浏览器不再携带任何 key。错误归一化为 LlmError。
 export async function chatComplete(opts: ChatOptions): Promise<string> {
   const preset = PROVIDERS.find((p) => p.id === opts.provider)
   if (!preset) throw new LlmError('bad-response', `未知 provider: ${opts.provider}`)
@@ -81,10 +101,7 @@ export async function chatComplete(opts: ChatOptions): Promise<string> {
   try {
     const res = await fetch(preset.proxyPrefix + preset.chatPath, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(opts.userKey ? { 'X-User-Key': opts.userKey } : {}),
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal: controller.signal,
     })
@@ -244,7 +261,6 @@ export async function runSseChat(opts: RunSseChatOptions): Promise<RunSseChatRes
 export interface ChatStreamOptions {
   provider: ProviderId
   model: string
-  userKey?: string
   messages: ChatMessage[]
   signal?: AbortSignal // 外部中止（Stop / 关闭对话框都走此，语义区分在调用方）
   firstByteTimeoutMs?: number // 默认 120_000，fetch 前启动
@@ -261,7 +277,6 @@ export async function chatStream(opts: ChatStreamOptions): Promise<string> {
   let acc = ''
   const result = await runSseChat({
     url: preset.proxyPrefix + preset.chatPath,
-    headers: opts.userKey ? { 'X-User-Key': opts.userKey } : {},
     body: {
       model: opts.model,
       messages: opts.messages,

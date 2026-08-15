@@ -23,7 +23,7 @@ export type KVSpec =
 export interface Highlight {
   title: string
   what: string // 一句话机制
-  why: string // 为什么重要 / 面试一句话
+  why: string // 为什么重要 / 售前一句话
 }
 
 export interface ModelSpec extends Sourced {

@@ -11,7 +11,7 @@ export default function StackExplorer() {
     <div className="flex flex-col gap-5 lg:flex-row">
       <div className="min-w-0 flex-1 space-y-3">
         <p className="text-sm text-dim">
-          自顶向下：一个请求穿过的四层。点击任意组件查看讲解与面试考点（顺序即请求流向，硬件层承载全部上层）。
+          自顶向下：一个请求穿过的四层。点击任意组件查看讲解与客户常问要点（顺序即请求流向，硬件层承载全部上层）。
         </p>
         {STACK_LAYERS.map((l) => (
           <div key={l.id} className="rounded-xl border border-line bg-panel shadow-sm p-4">
@@ -51,7 +51,7 @@ export default function StackExplorer() {
           <h3 className="text-lg font-bold">{comp.name}</h3>
           <p className="mt-3 text-sm leading-relaxed">{comp.what}</p>
           <div className="mt-4 rounded-lg border border-warn/30 bg-warn/10 p-3 text-sm leading-relaxed">
-            <div className="mb-1 text-xs font-semibold text-warn">面试考点</div>
+            <div className="mb-1 text-xs font-semibold text-warn">客户常问</div>
             {comp.interview}
           </div>
         </div>

@@ -2,6 +2,10 @@ node_modules
 dist
 .env.local
 .env*.local
+server/.env
+server/data/
+# QA 跑批的临时数据库快照(server/data 的时间戳变体)
+server/data.*/
 *.log
 .DS_Store
 .specstory/

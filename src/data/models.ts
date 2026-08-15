@@ -385,7 +385,7 @@ export const MODELS: ModelSpec[] = [
       {
         title: '长程 RL 反作弊',
         what: 'critic-based PPO + 在线 anti-hack 模块（规则+LLM 判官拦截作弊 tool call）',
-        why: '长链路 agent 的奖励作弊是能力虚高主因，公开博客少见的系统性对策——面试聊 agent 评估时的好例子',
+        why: '长链路 agent 的奖励作弊是能力虚高主因，公开博客少见的系统性对策——与客户聊 agent 评估时的好例子',
       },
     ],
   },

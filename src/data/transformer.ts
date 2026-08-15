@@ -6,7 +6,7 @@ export interface TfComponent {
   inBlock: boolean // 是否属于 N× 重复的 Transformer Block
   what: string
   why: string
-  interview: string // 面试一句话
+  interview: string // 售前一句话
 }
 
 // encoder-decoder 原始结构（2017）专属组件

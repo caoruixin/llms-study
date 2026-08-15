@@ -75,8 +75,8 @@ export function profileToRow(paperId: string, profile: ConceptProfile): LearnerC
 export interface LearnerRepository {
   load(paperId: string): Promise<ConceptProfile[]>
   save(paperId: string, profiles: readonly ConceptProfile[]): Promise<void>
-  /** append-only 日志：每个受影响概念（含 '*'）一行 */
-  logEvidence(paperId: string, ev: ProfileEvidence): Promise<void>
+  /** append-only 日志：每个受影响概念（含 '*'）一行。返回落库行——P4 同步装饰器镜像进 outbox 用 */
+  logEvidence(paperId: string, ev: ProfileEvidence): Promise<EvidenceRecord[]>
   listEvidence(paperId: string): Promise<EvidenceRecord[]>
   reset(paperId: string): Promise<void>
 }
@@ -109,6 +109,7 @@ export function createLearnerRepository(db: PaperDb): LearnerRepository {
         ts: ev.ts,
       }))
       await db.evidence.bulkAdd(rows)
+      return rows
     },
 
     listEvidence: (paperId) => db.evidence.where('paperId').equals(paperId).toArray(),
