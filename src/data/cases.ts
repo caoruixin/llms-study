@@ -63,8 +63,7 @@ export const WORKED_CASES: WorkedCase[] = [
     name: 'ROI 测算 worked case ②：出海 SaaS 代码助手（USD 结算）',
     scenario:
       '某出海 SaaS 公司（研发 400 人）要上 AI 编码助手，纠结「买国际旗舰 API」vs「混合路由（开源模型托管 + 旗舰兜底）」。USD 结算、数据需留在海外区。',
-    priceValidUntil: '2026-08-31', // claude-sonnet-5 限时价 $2/$10 的截止日
-
+    // claude-sonnet-5 的 $2/$10 已由限时价转为标准价（原定 2026-09-01 涨价取消）→ 本案例不再有限时价截止日
     sections: [
       {
         title: '① 负载画像',
@@ -76,7 +75,7 @@ export const WORKED_CASES: WorkedCase[] = [
         ],
       },
       {
-        title: '② 方案 A：全量国际旗舰 API（以 claude-sonnet-5 限时价 $2/$10 计）',
+        title: '② 方案 A：全量国际旗舰 API（以 claude-sonnet-5 标准价 $2/$10 计）',
         rows: [
           ['日成本', '未命中 43×$2 + 命中 101×$0.3（0.1×+写入摊销）+ 输出 19.2×$10 ≈ $308/日'],
           ['月成本', '≈ $9.3K/月（22 工作日）；全 fable-5（$10/$50）则 ~$46K/月——模型档位是 5 倍级变量'],

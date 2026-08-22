@@ -36,12 +36,13 @@ describe('isPromoExpired', () => {
 })
 
 describe('cases.ts 限时价与 pricing.ts 同源', () => {
-  it('roi-global-saas 案例的 priceValidUntil = claude-sonnet-5 行的 validUntil', () => {
+  // sonnet-5 的 $2/$10 已转为标准价（2026-08 官方定价页），两处的限时价截止日同步下线
+  // → 断言保持「两处必须同源」：一处有 validUntil 另一处没有，同样判失败
+  it('roi-global-saas 案例的 priceValidUntil = claude-sonnet-5 行的 validUntil（双方都无限时价时也须一致）', () => {
     const c = WORKED_CASES.find((x) => x.id === 'roi-global-saas')
     const p = PRICING.find((x) => x.modelId === 'claude-sonnet-5')
     expect(c).toBeDefined()
     expect(p).toBeDefined()
-    expect(c!.priceValidUntil).toBeDefined()
     expect(c!.priceValidUntil).toBe(p!.validUntil)
   })
 })

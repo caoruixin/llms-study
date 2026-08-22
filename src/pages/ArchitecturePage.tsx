@@ -209,7 +209,7 @@ export default function ArchitecturePage() {
               ))}
             </ul>
             <p className="mt-3 text-xs text-dim">
-              数据时点 2026-07-31，均来自各家官方定价页（点模型 ID 跳转）；价格月月变，报价前务必再核对。
+              数据时点 2026-08-22，均来自各家官方定价页（点模型 ID 跳转）；价格月月变，报价前务必再核对。
             </p>
           </div>
         </div>
