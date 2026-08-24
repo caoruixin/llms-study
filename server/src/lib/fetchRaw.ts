@@ -85,6 +85,12 @@ export interface SafeFetchOptions {
   maxRedirects?: number
   transport?: FetchTransport
   lookup?: FetchLookup
+  /**
+   * 【仅本机开发】跳过"域名解析结果落禁区"检查(config.fetchUrlAllowForbiddenDev 透传)。
+   * fake-IP DNS 环境里所有公网域名都解析进 198.18/15,不跳过则寸步难行;
+   * 字面 IP 的 URL 仍在 validateTargetUrl 被拒,其余防线(端口/重定向/限额)全部保留。
+   */
+  allowForbiddenAddresses?: boolean
 }
 
 export interface SafeFetchResult {
@@ -276,9 +282,11 @@ export async function safeFetchUrl(
         throw new FetchFailedError(`域名解析失败:${errMsg(e)}`)
       }
       if (resolved.length === 0) throw new FetchFailedError('域名无法解析')
-      for (const r of resolved) {
-        if (isForbiddenAddress(r.address)) {
-          throw new FetchDeniedError('目标地址指向内网或保留地址')
+      if (!opts.allowForbiddenAddresses) {
+        for (const r of resolved) {
+          if (isForbiddenAddress(r.address)) {
+            throw new FetchDeniedError('目标地址指向内网或保留地址')
+          }
         }
       }
       target = resolved[0]

@@ -66,14 +66,14 @@ interface FetchCtx {
 }
 
 async function setup(
-  opts: { maxBytes?: number; lookup?: FetchLookup; production?: boolean } = {},
+  opts: { maxBytes?: number; lookup?: FetchLookup; production?: boolean; allowForbiddenDev?: boolean } = {},
 ): Promise<FetchCtx> {
   const origin = await startOrigin()
   origins.push(origin)
   // 生产 transport 原样复用,只把"连哪儿"换成本机 stub
   const transport: FetchTransport = (req) =>
     nodeTransport({ ...req, address: '127.0.0.1', family: 4, port: origin.port })
-  const ctx = createTestApp(undefined, {
+  const ctx = createTestApp(opts.allowForbiddenDev ? { fetchUrlAllowForbiddenDev: true } : undefined, {
     fetchTuning: {
       maxBytes: opts.maxBytes,
       timeoutMs: 5000,
@@ -155,6 +155,20 @@ describe('SSRF 拒绝(走真实校验路径)', () => {
       expect(await res.json()).toMatchObject({ error: 'fetch-denied' })
       expect(f.origin.requests).toHaveLength(0)
     }
+  })
+
+  it('dev 逃生阀:FETCH_URL_ALLOW_FORBIDDEN_DEV 下解析进保留段(fake-IP DNS)仍可抓取,字面 IP 依旧拒', async () => {
+    const f = await setup({
+      allowForbiddenDev: true,
+      // fake-IP 代理的典型形态:所有公网域名都解析到 198.18/15
+      lookup: async () => [{ address: '198.18.1.141', family: 4 }],
+    })
+    const res = await f.post('http://origin.test/')
+    expect(res.status).toBe(200)
+    expect(f.origin.requests).toHaveLength(1)
+    // 逃生阀只放宽"解析结果落禁区"这一层:字面内网 IP 在 validateTargetUrl 仍被拒
+    const literal = await f.post('http://127.0.0.1/')
+    expect(literal.status).toBe(403)
   })
 
   it('零注入的生产路径:localhost 经真实 DNS 解析到环回 → 403', async () => {

@@ -32,6 +32,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       'openai-compat': 'http://127.0.0.1:9',
     },
     adminDailyCallLimit: 0,
+    fetchUrlAllowForbiddenDev: false,
     ...overrides,
   }
 }

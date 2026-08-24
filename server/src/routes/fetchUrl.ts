@@ -154,6 +154,7 @@ export function fetchUrlRoutes(deps: AppDeps): Hono<AppEnv> {
           timeoutMs: tuning.timeoutMs ?? FETCH_URL_TIMEOUT_MS,
           transport: tuning.transport,
           lookup: tuning.lookup,
+          allowForbiddenAddresses: deps.config.fetchUrlAllowForbiddenDev,
         })
       } catch (e) {
         if (e instanceof FetchDeniedError) return apiError(c, 403, 'fetch-denied', e.message)

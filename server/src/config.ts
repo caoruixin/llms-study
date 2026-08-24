@@ -27,6 +27,12 @@ export interface Config {
   llmUpstreams: Record<LlmProvider, string>
   /** admin 走服务端 key 的日调用上限;0 = 不限(账单兜底,防 key 被刷爆) */
   adminDailyCallLimit: number
+  /**
+   * 【仅本机开发】允许 /api/app/fetch-url 连接解析进保留网段的域名。
+   * fake-IP 模式的代理(Surge/Clash 等)会把所有域名解析到 198.18/15,
+   * 不开这个开关本机什么都抓不到。生产严禁配置——等于拆掉 SSRF 防线。
+   */
+  fetchUrlAllowForbiddenDev: boolean
 }
 
 /** 逗号分隔列表解析:空段剔除,顺序即优先级(与 src/lib/keyRotation.ts 的 parseKeyList 同语义) */
@@ -110,5 +116,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     serverLlmKeys,
     llmUpstreams,
     adminDailyCallLimit,
+    fetchUrlAllowForbiddenDev: parseBool(env.FETCH_URL_ALLOW_FORBIDDEN_DEV, false),
   }
 }
