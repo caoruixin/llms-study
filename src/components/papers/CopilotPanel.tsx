@@ -58,6 +58,7 @@ import {
   type TtsPlayer,
 } from '../../lib/paper/tts'
 import { isSpeechSupported, startDictation, type DictationSession } from '../../lib/speech'
+import { personaHintText, type PersonaId } from '../../lib/paper/personas'
 import type { RetrievalService } from '../../lib/paper/retrieval'
 import type { ScrollTarget } from '../../lib/paper/anchors'
 import type {
@@ -73,6 +74,7 @@ import type { ChatMessage } from '../../lib/llmClient'
 import CopilotMessageView from './CopilotMessage'
 import ConsentDialog from './ConsentDialog'
 import CostConfirm, { type CostConfirmInfo } from './CostConfirm'
+import PersonaChip from './PersonaChip'
 import ProfileChip from './ProfileChip'
 import TurnFeedback from './TurnFeedback'
 
@@ -380,6 +382,23 @@ export default function CopilotPanel({
     }
   }, [paper.id, paper.title, repo])
 
+  /**
+   * Track 3：售前新人视角开关，落在 CopilotSession.persona 上。
+   * sessions 表已被 synced 装饰，updateSession 会自动把这次写入镜像进 outbox——
+   * 跨设备同步不需要这里再写一行同步代码。本地 state 同步更新，下一轮发起时
+   * runSendTurn 直接从 sessionRefState.current 读到最新值。
+   */
+  const setPersona = useCallback(
+    (persona: PersonaId) => {
+      const s = sessionRefState.current
+      if (!s) return
+      const patch = { persona }
+      void repo.updateSession(s.id, patch).catch(() => undefined)
+      setSession((prev) => (prev && prev.id === s.id ? { ...prev, ...patch } : prev))
+    },
+    [repo],
+  )
+
   // -----------------------------------------------------------------------
   // 发起一轮
   // -----------------------------------------------------------------------
@@ -445,6 +464,7 @@ export default function CopilotPanel({
           context: {
             brief,
             profileHint: hint.text,
+            personaHint: personaHintText(s.persona),
             rollingSummary: s.rollingSummary ?? null,
             history,
             currentSection: positionRef.current.section,
@@ -584,7 +604,7 @@ export default function CopilotPanel({
   )
 
   // -----------------------------------------------------------------------
-  // 引导模式（§3.4 六入口 / §6.1c 每步 1 调用）
+  // 引导模式（§3.4 七入口 / §6.1c 每步 1 调用）
   // -----------------------------------------------------------------------
   const guidedCtx = useCallback(
     (): GuidedContext => ({
@@ -1035,6 +1055,7 @@ export default function CopilotPanel({
 
       <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.7rem] text-dim">
         <ProfileChip summary={profileSummary} onPin={pinLevel} onReset={resetProfile} />
+        <PersonaChip value={session?.persona} onChange={setPersona} />
         <span>
           {sessionCost > 0 && <>会话累计 {formatUsd(sessionCost)} · </>}
           deepseek-v4-pro
@@ -1132,7 +1153,7 @@ export default function CopilotPanel({
           </section>
         )}
 
-        {/* 引导模式入口（六入口全开；每步 1 次调用，由用户点击推进） */}
+        {/* 引导模式入口（七入口全开；每步 1 次调用，由用户点击推进） */}
         {!guided && !busy && (
           <section>
             <p className="mb-1.5 text-xs font-medium text-fg">引导模式</p>

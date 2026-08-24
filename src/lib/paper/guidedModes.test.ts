@@ -17,10 +17,10 @@ const ctx = (over: Partial<GuidedContext> = {}): GuidedContext => ({
   ...over,
 })
 
-describe('六入口定义（§3.4）', () => {
-  it('恰好六个模式且 id 唯一', () => {
-    expect(GUIDED_MODE_IDS).toEqual(['overview', 'section', 'method', 'derive', 'experiment', 'review'])
-    expect(new Set(GUIDED_MODE_IDS).size).toBe(6)
+describe('七入口定义（§3.4，Track 3 加售前导读）', () => {
+  it('恰好七个模式且 id 唯一', () => {
+    expect(GUIDED_MODE_IDS).toEqual(['overview', 'section', 'method', 'derive', 'experiment', 'review', 'presales'])
+    expect(new Set(GUIDED_MODE_IDS).size).toBe(7)
   })
   it('每个模式都能生成非空步骤，且步骤字段完整', () => {
     for (const mode of GUIDED_MODE_DEFS) {
@@ -75,6 +75,41 @@ describe('逐节精读的动态步骤', () => {
   })
 })
 
+describe('presales：售前导读五步（Track 3 第 7 入口）', () => {
+  it('恰好 5 步，label 依次为定位/术语/卖点/话术/追问，全部 task:chat', () => {
+    const steps = findGuidedMode('presales')!.buildSteps(ctx())
+    expect(steps.map((s) => s.label)).toEqual([
+      '文档定位',
+      '关键概念与术语表',
+      '方案架构与卖点拆解',
+      '怎么讲给客户听',
+      '客户追问与应对',
+    ])
+    expect(steps.every((s) => s.task === 'chat')).toBe(true)
+    expect(steps.every((s) => s.planIsland)).toBe(true)
+  })
+  it('每步的展示块提示与 PLAN 草稿一致', () => {
+    const steps = findGuidedMode('presales')!.buildSteps(ctx())
+    const blockHintOf = (i: number) => steps[i].extraDirectives.find((d) => d.includes('本步优先用这些展示块'))
+    expect(blockHintOf(0)).toContain('copilot:explanation')
+    expect(blockHintOf(0)).toContain('copilot:timeline')
+    expect(blockHintOf(1)).toContain('copilot:flashcard')
+    expect(blockHintOf(1)).toContain('copilot:explanation')
+    expect(blockHintOf(2)).toContain('copilot:flow')
+    expect(blockHintOf(2)).toContain('copilot:comparison')
+    expect(blockHintOf(3)).toContain('copilot:stepper')
+    expect(blockHintOf(3)).toContain('copilot:explanation')
+    expect(blockHintOf(4)).toContain('copilot:comparison')
+    expect(blockHintOf(4)).toContain('copilot:quiz')
+  })
+  it('末步（客户追问与应对）问题里要求文档答不了的直说、并留一道演练题', () => {
+    const steps = findGuidedMode('presales')!.buildSteps(ctx())
+    const last = steps[steps.length - 1]
+    expect(last.question).toContain('直说')
+    expect(last.question).toContain('模拟')
+  })
+})
+
 describe('步序状态机（每步 1 次调用）', () => {
   it('start 从第 0 步开始并带总步数', () => {
     expect(startGuided('method', ctx())).toEqual({ modeId: 'method', stepIndex: 0, total: 4 })
@@ -105,5 +140,17 @@ describe('步序状态机（每步 1 次调用）', () => {
     const run = startGuided('section', ctx({ sectionTitles: ['a', 'b', 'c'] }))!
     expect(advanceGuided(run, ctx({ sectionTitles: ['a'] }))).toBeNull()
     expect(advanceGuided(run, ctx({ sectionTitles: ['a', 'b'] }))).toMatchObject({ stepIndex: 1 })
+  })
+  it('presales 走完 5 步：start 带 total=5，advance 依次推进到底后返回 null', () => {
+    let run = startGuided('presales', ctx())!
+    expect(run).toEqual({ modeId: 'presales', stepIndex: 0, total: 5 })
+    const labels = [guidedStepAt(run, ctx())!.label]
+    for (;;) {
+      const next = advanceGuided(run, ctx())
+      if (!next) break
+      run = next
+      labels.push(guidedStepAt(run, ctx())!.label)
+    }
+    expect(labels).toEqual(['文档定位', '关键概念与术语表', '方案架构与卖点拆解', '怎么讲给客户听', '客户追问与应对'])
   })
 })

@@ -1,5 +1,5 @@
 /**
- * 引导模式脚本（§3.4 六入口 / §6.1c 每步 1 次调用）。
+ * 引导模式脚本（§3.4 七入口 / §6.1c 每步 1 次调用）。
  *
  * 步序是**客户端状态机**：每一步的问题、检索查询、任务档位（普通/深度）与逐轮指令
  * 都在这里确定，模型不参与流程控制。用户点「继续下一步」才发起下一次调用——
@@ -8,7 +8,7 @@
  * 纯函数、无 React 依赖，node 环境直测。
  */
 
-export type GuidedModeId = 'overview' | 'section' | 'method' | 'derive' | 'experiment' | 'review'
+export type GuidedModeId = 'overview' | 'section' | 'method' | 'derive' | 'experiment' | 'review' | 'presales'
 
 export interface GuidedContext {
   paperTitle: string
@@ -184,6 +184,45 @@ export const GUIDED_MODE_DEFS: readonly GuidedModeDef[] = [
         task: 'deep',
         blocks: ['explanation', 'teach-back'],
       }),
+    ],
+  },
+  {
+    // Track 3：售前新人视角的第 7 个入口。与 persona 开关正交——persona 走 system#2
+    // 自动叠加到所有模式的回答上，这里的 5 步只负责固定「售前该问的顺序」，不重复写视角约束。
+    id: 'presales',
+    label: '售前导读',
+    hint: '定位 → 术语 → 卖点 → 话术 → 追问，五步为讲给客户听而读',
+    buildSteps: (ctx) => [
+      step(
+        '文档定位',
+        '请先帮我定位这份文档：它面向什么类型的客户/场景，主要解决什么业务问题，用一句话概括它最核心的信息，方便我判断值不值得往下细读、怎么跟客户介绍它。',
+        `${ctx.paperTitle} 背景 场景 客户 业务问题 概述`,
+        { blocks: ['explanation', 'timeline'] },
+      ),
+      step(
+        '关键概念与术语表',
+        '请梳理这份文档里的关键概念和专业术语，逐个给通俗解释，并配一个客户语境下的类比或例子；重点标出哪些术语客户大概率听不懂、需要我提前准备通俗说法。',
+        `${ctx.paperTitle} 术语 概念 定义 缩写`,
+        { blocks: ['flashcard', 'explanation'] },
+      ),
+      step(
+        '方案架构与卖点拆解',
+        '请拆解这份文档描述的方案/架构：整理出可以对客户讲的核心卖点，每个卖点对应给出客户能感知的价值，并标注支撑这个卖点的文档证据；证据不够充分的地方请直说，不要替我夸大。',
+        `${ctx.paperTitle} 架构 方案 优势 卖点 价值`,
+        { blocks: ['flow', 'comparison'] },
+      ),
+      step(
+        '怎么讲给客户听',
+        '请帮我准备怎么把这份文档讲给客户听：先给一个 30 秒电梯演讲版本，再分别给业务决策者版（讲价值和收益）和技术评估者版（讲架构和实现）两套话术。',
+        `${ctx.paperTitle} 价值主张 电梯演讲 汇报话术`,
+        { blocks: ['stepper', 'explanation'] },
+      ),
+      step(
+        '客户追问与应对',
+        '请列出客户最可能追问的问题（价格、竞品对比、落地难度、风险等），逐条给出应对角度；文档里确实没有答案的问题请直说需要另外确认，不要编造。最后出一道模拟客户追问，让我练习怎么回应。',
+        `${ctx.paperTitle} 价格 竞品 风险 落地 常见问题`,
+        { blocks: ['comparison', 'quiz'] },
+      ),
     ],
   },
 ]

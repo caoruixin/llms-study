@@ -195,6 +195,8 @@ export interface TurnRequest {
   context: {
     brief?: string | null
     profileHint?: string | null
+    /** Track 3：售前新人等读者视角 directive，透传进 assembleContext 第 2 层 */
+    personaHint?: string | null
     rollingSummary?: string | null
     history: readonly ChatMessage[]
     currentSection?: string
@@ -288,6 +290,7 @@ export function createTurnRunner(deps: TurnRunnerDeps): TurnRunner {
       const built = assembleContext({
         brief: req.context.brief,
         profileHint: req.context.profileHint,
+        personaHint: req.context.personaHint,
         rollingSummary: req.context.rollingSummary,
         history: req.context.history,
         selection: req.selection,

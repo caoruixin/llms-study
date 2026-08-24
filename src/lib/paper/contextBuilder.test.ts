@@ -73,6 +73,37 @@ describe('assembleContext · 五层排布', () => {
     c.chunk.anchor = { kind: 'docx', blockIndex: 1 }
     expect(renderChunkHeader(c)).toBe('[c9]')
   })
+
+  it('Track 3：personaHint 进第 2 层，join 顺序为 brief → profileHint → personaHint', () => {
+    const { messages } = assembleContext(baseInput({ personaHint: '【读者视角】售前新人 SA' }))
+    const layer2 = messages[1].content
+    expect(layer2).toContain('论文地图摘要')
+    expect(layer2).toContain('讲解层次：进阶')
+    expect(layer2).toContain('【读者视角】售前新人 SA')
+    expect(layer2.indexOf('论文地图摘要')).toBeLessThan(layer2.indexOf('讲解层次：进阶'))
+    expect(layer2.indexOf('讲解层次：进阶')).toBeLessThan(layer2.indexOf('【读者视角】售前新人 SA'))
+  })
+
+  it('Track 3：personaHint 缺省/null 时第 2 层字节与不带该字段完全一致（不留空拼接符）', () => {
+    const withoutField = assembleContext(baseInput()).messages[1].content
+    const withNull = assembleContext(baseInput({ personaHint: null })).messages[1].content
+    expect(withNull).toBe(withoutField)
+    expect(withNull).not.toContain('undefined')
+    expect(withNull).not.toContain('null')
+  })
+
+  it('Track 3：只有 personaHint 时第 2 层单独成层（brief/profileHint/rollingSummary 缺省）', () => {
+    const { messages } = assembleContext(
+      baseInput({ brief: null, profileHint: null, personaHint: '【读者视角】售前新人 SA', rollingSummary: null, history: [] }),
+    )
+    expect(messages.map((m) => m.role)).toEqual(['system', 'system', 'user'])
+    expect(messages[1].content).toBe('【读者视角】售前新人 SA')
+  })
+
+  it('Track 3：不影响 system#1（字节仍与 PAPER_TUTOR_SYSTEM_PROMPT 常量相等）', () => {
+    const { messages } = assembleContext(baseInput({ personaHint: '【读者视角】售前新人 SA' }))
+    expect(messages[0].content).toBe(PAPER_TUTOR_SYSTEM_PROMPT)
+  })
 })
 
 describe('assembleContext · 裁剪阶梯', () => {

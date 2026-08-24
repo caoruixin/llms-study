@@ -149,6 +149,20 @@ describe('createSyncedCopilotRepository', () => {
     expect((queue[2].payload as { feedback?: string }).feedback).toBe('right')
   })
 
+  it('Track 3：updateSession 写 persona 字段落库并入队 outbox（与其余 patch 字段同一路径，无需专门代码）', async () => {
+    const { db, paper, copilot } = await setup()
+    const session = await copilot.getOrCreateSession(paper.id, '会话')
+    await db.outbox.clear()
+    await copilot.updateSession(session.id, { persona: 'presales' })
+
+    const row = await db.sessions.get(session.id)
+    expect(row?.persona).toBe('presales')
+
+    const queue = await db.outbox.toArray()
+    expect(queue.map((i) => [i.op, i.tbl, i.recordId])).toEqual([['record', 'sessions', session.id]])
+    expect((queue[0].payload as { persona?: string }).persona).toBe('presales')
+  })
+
   it('resetSession：删掉的消息逐条入队墓碑 + session 行重推', async () => {
     const { db, paper, copilot } = await setup()
     const session = await copilot.getOrCreateSession(paper.id, '会话')

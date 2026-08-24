@@ -167,6 +167,8 @@ export interface CopilotSession {
   turnsSinceMemo?: number
   /** 会话累计成本（美元） */
   costTotal?: number
+  /** Track 3 加法字段：售前新人视角开关（personas.ts 的 PersonaId），缺省视同 'none' */
+  persona?: string
 }
 
 /** 与 retrieval.CiteMapEntry 结构一致的可序列化形态（types.ts 不 import retrieval，避免环） */

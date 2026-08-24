@@ -5,7 +5,7 @@ import { estimateTokens } from './usage'
 /**
  * 上下文组装（§5.4/§6.3）：稳定前缀 → 动态尾部的五层排布，最大化 provider 前缀缓存命中。
  * 1. system#1 静态 tutor prompt（常量 + 版本号，字节稳定）
- * 2. system#2 PaperBrief 摘要 + 粗粒度画像
+ * 2. system#2 PaperBrief 摘要 + 粗粒度画像 + 读者视角（persona，Track 3）
  * 3. system#3 rolling summary
  * 4. 最近 ≤6 轮真实 user/assistant 消息
  * 5. 本轮 user = 选区 + 白名单 chunk 段 + 问题 + 逐轮指令（一切逐轮变化集中于此）
@@ -48,6 +48,8 @@ export interface AssembleInput {
   brief?: string | null
   /** 粗粒度画像（层级桶），Phase 3 为固定占位文案 */
   profileHint?: string | null
+  /** Track 3：售前新人等读者视角 directive（personas.ts personaHintText 的产物）；null/未设置整层不占字节 */
+  personaHint?: string | null
   rollingSummary?: string | null
   /** 最近轮次的真实消息（user/assistant 交替，最旧在前） */
   history: readonly ChatMessage[]
@@ -145,7 +147,7 @@ export function assembleContext(input: AssembleInput): BuiltContext {
 
   const build = (): ChatMessage[] => {
     const messages: ChatMessage[] = [{ role: 'system', content: PAPER_TUTOR_SYSTEM_PROMPT }]
-    const layer2 = [input.brief?.trim(), input.profileHint?.trim()].filter(Boolean).join('\n\n')
+    const layer2 = [input.brief?.trim(), input.profileHint?.trim(), input.personaHint?.trim()].filter(Boolean).join('\n\n')
     if (layer2) messages.push({ role: 'system', content: layer2 })
     if (input.rollingSummary?.trim()) {
       messages.push({ role: 'system', content: `【此前对话摘要】\n${input.rollingSummary.trim()}` })
