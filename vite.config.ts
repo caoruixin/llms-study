@@ -139,6 +139,29 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), tailwindcss(), jinaFailoverPlugin(env), ...(paperEnabled ? [] : [paperCopilotOffPlugin()])],
     server: { proxy },
     preview: { proxy },
+    build: {
+      rollupOptions: {
+        output: {
+          /**
+           * 大件 vendor 单独成 chunk，两个目的（站点跨境直连、实测带宽仅 ~17KB/s）：
+           * 1. 入口瘦身：recharts 原先被打进入口，论文陪读等不用图表的路由也被迫下载；
+           * 2. 缓存稳定：vendor 版本不随业务代码变，hash 跨部署不变——发版后老用户
+           *    只需重下业务 chunk，不再全量重拉。
+           * 只点名"大且边界清晰"的库；其余交给 Rollup 默认切分（点太细反而碎片化）。
+           * 只影响主构建；worker 产物（pdfWorkerEntry）走独立管线不受此配置影响。
+           */
+          manualChunks(id: string) {
+            if (!id.includes('node_modules')) return undefined
+            if (/node_modules\/(recharts|victory-vendor|d3-[a-z-]+)\//.test(id)) return 'vendor-charts'
+            if (/node_modules\/katex\//.test(id)) return 'vendor-katex'
+            if (/node_modules\/(framer-motion|motion-dom|motion-utils)\//.test(id)) return 'vendor-motion'
+            if (/node_modules\/(react|react-dom|scheduler|react-router|react-router-dom|zustand)\//.test(id))
+              return 'vendor-react'
+            return undefined
+          },
+        },
+      },
+    },
     test: {
       environment: 'node',
       include: ['src/**/*.test.ts'],
