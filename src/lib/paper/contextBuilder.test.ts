@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { assembleContext, PAPER_TUTOR_SYSTEM_PROMPT, renderChunkHeader, SELECTION_MAX_CHARS, type AssembleInput } from './contextBuilder'
+import { assembleContext, PAPER_TUTOR_SYSTEM_PROMPT, PERSONA_NO_HIT_DIRECTIVE, renderChunkHeader, SELECTION_MAX_CHARS, type AssembleInput } from './contextBuilder'
 import type { RetrievedChunk } from './retrieval'
 import type { PaperChunk } from './types'
 
@@ -103,6 +103,26 @@ describe('assembleContext · 五层排布', () => {
   it('Track 3：不影响 system#1（字节仍与 PAPER_TUTOR_SYSTEM_PROMPT 常量相等）', () => {
     const { messages } = assembleContext(baseInput({ personaHint: '【读者视角】售前新人 SA' }))
     expect(messages[0].content).toBe(PAPER_TUTOR_SYSTEM_PROMPT)
+  })
+
+  it('零命中 + persona：追加通用知识兜底授权（E2E R2 P1-1）', () => {
+    const { messages } = assembleContext(
+      baseInput({ chunks: [], personaHint: '【读者视角】售前新人 SA' }),
+    )
+    const finalUser = messages[messages.length - 1].content
+    expect(finalUser).toContain(PERSONA_NO_HIT_DIRECTIVE)
+    // 原有 directives 仍在，兜底条排在其后
+    expect(finalUser.indexOf('输出 plan 岛')).toBeLessThan(finalUser.indexOf(PERSONA_NO_HIT_DIRECTIVE))
+  })
+
+  it('零命中但无 persona：不追加兜底授权（默认模式保持严格证据纪律）', () => {
+    const { messages } = assembleContext(baseInput({ chunks: [], personaHint: null }))
+    expect(messages[messages.length - 1].content).not.toContain('通用行业知识')
+  })
+
+  it('有命中 + persona：不追加兜底授权（有片段就按片段讲）', () => {
+    const { messages } = assembleContext(baseInput({ personaHint: '【读者视角】售前新人 SA' }))
+    expect(messages[messages.length - 1].content).not.toContain('通用行业知识')
   })
 })
 

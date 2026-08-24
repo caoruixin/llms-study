@@ -22,12 +22,19 @@ const PHASE_LABEL: Record<UrlProgressEvent['phase'], string> = {
   failed: '失败',
 }
 
-function hostnameOf(url: string): string {
+/**
+ * 进度/跳过清单里同域多链接必须能区分（E2E R2 P2-1）：域名 + 路径，
+ * 超长时中段截断保尾部——文档站 URL 的末段才是章节名。
+ */
+function displayUrl(raw: string): string {
+  let full: string
   try {
-    return new URL(url).hostname
+    const u = new URL(raw)
+    full = u.hostname + (u.pathname === '/' ? '' : u.pathname)
   } catch {
-    return url
+    full = raw
   }
+  return full.length > 56 ? `${full.slice(0, 24)}…${full.slice(-30)}` : full
 }
 
 interface Props {
@@ -111,7 +118,7 @@ export default function UrlImportDialog({ onClose, onSubmit, running, progress, 
             <ul className="space-y-1.5">
               {progress.map((p) => (
                 <li key={p.url} className="flex items-center justify-between gap-3 text-sm">
-                  <span className="min-w-0 truncate text-dim">{hostnameOf(p.url)}</span>
+                  <span className="min-w-0 truncate text-dim">{displayUrl(p.url)}</span>
                   <span
                     className={`shrink-0 text-xs ${
                       p.phase === 'done' ? 'text-ok' : p.phase === 'failed' ? 'text-bad' : 'text-amber'
@@ -131,7 +138,7 @@ export default function UrlImportDialog({ onClose, onSubmit, running, progress, 
                 <ul className="space-y-1 text-xs text-dim">
                   {failedEntries.map((e) => (
                     <li key={e.url}>
-                      {hostnameOf(e.url)}：{e.error ?? '未知错误'}
+                      {displayUrl(e.url)}：{e.error ?? '未知错误'}
                     </li>
                   ))}
                 </ul>

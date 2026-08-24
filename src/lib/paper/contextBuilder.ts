@@ -110,6 +110,14 @@ function renderChunks(chunks: readonly RetrievedChunk[], truncated: boolean): st
     .join('\n---\n')
 }
 
+/**
+ * 零命中 + 读者视角开启时的兜底授权（E2E R2 P1-1）：persona 承诺「解释术语」，
+ * 但铁律与证据重试 directive 都要求「缺证据只说缺什么」，零命中的术语类提问
+ * 会被直接拒答。这里精确放行「标注为通用知识的边界化解释」，论文事实仍只认证据。
+ */
+export const PERSONA_NO_HIT_DIRECTIVE =
+  '本轮白名单为空。若问题属术语、缩写或行业背景类：先声明「论文未直接覆盖」，再给出明确标注为【通用行业知识，非本文内容】的简短解释与客户价值，不使用 [[cite]] 标记；若问题涉及本文的事实、数据或结论，仍只说明缺少哪些证据，不要编造。本条优先于其他「只说明缺少什么」的要求。'
+
 function buildFinalUser(
   input: AssembleInput,
   chunks: readonly RetrievedChunk[],
@@ -122,8 +130,12 @@ function buildFinalUser(
   }
   parts.push(`【本轮白名单片段】只准引用以下别名：\n${renderChunks(chunks, opts.chunksTruncated)}`)
   parts.push(`【问题】${input.question}`)
-  if (input.directives.length) {
-    parts.push(`【本轮要求】\n${input.directives.map((d) => `- ${d}`).join('\n')}`)
+  const directives =
+    chunks.length === 0 && input.personaHint?.trim()
+      ? [...input.directives, PERSONA_NO_HIT_DIRECTIVE]
+      : input.directives
+  if (directives.length) {
+    parts.push(`【本轮要求】\n${directives.map((d) => `- ${d}`).join('\n')}`)
   }
   return parts.join('\n\n')
 }
