@@ -43,6 +43,8 @@ export interface PendingAsk {
   text: string
   anchor: SourceAnchor
   at: number
+  /** 选区来自应用内生成的中文译文：队列卡片加「译文」徽章，消费时提示模型以原文语义为准 */
+  translated?: boolean
 }
 
 /** 论文地图生成进度（CopilotPanel 写入，OutlinePane 展示；跨栏共享走 store） */

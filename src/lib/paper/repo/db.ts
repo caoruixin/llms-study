@@ -1,6 +1,7 @@
 import Dexie, { type Table } from 'dexie'
 import { useAuthStore } from '../../auth/authStore'
 import type {
+  BlockTranslation,
   CopilotMessage,
   CopilotSession,
   EvidenceRecord,
@@ -71,6 +72,8 @@ export interface SyncMetaRow {
  * v1 一次建齐 §4.2 全部 12 张表（含尚未使用的 Phase 2–4 实体），Phase 2–4 只加字段不加 migration。
  * v2（P4 同步客户端）纯加法：outbox / syncState / syncMeta 三张同步域本地表，
  * 既有 12 张表的索引与数据零变动——老库升级只是建三张空表。
+ * v3（全文翻译）纯加法：translations 一张表（[paperId+blockIndex] 供按块查询），
+ * 老库升级同样只是建一张空表，无数据迁移。
  * sha256 用普通索引而非 &unique：去重由 findBySha256 显式判定后交给用户选择
  * （打开已有 / 替换导入），不依赖 ConstraintError 做控制流。
  */
@@ -90,6 +93,7 @@ export class PaperDb extends Dexie {
   outbox!: Table<OutboxItem, number>
   syncState!: Table<SyncStateRow, string>
   syncMeta!: Table<SyncMetaRow, string>
+  translations!: Table<BlockTranslation, string>
 
   constructor(name = PAPER_DB_NAME, options?: { indexedDB: IDBFactory; IDBKeyRange: typeof IDBKeyRange }) {
     super(name, options)
@@ -111,6 +115,9 @@ export class PaperDb extends Dexie {
       outbox: '++qid, op, paperId',
       syncState: 'key',
       syncMeta: 'paperId',
+    })
+    this.version(3).stores({
+      translations: 'id, paperId, [paperId+blockIndex]',
     })
   }
 }

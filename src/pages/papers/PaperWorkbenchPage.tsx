@@ -1,6 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import BlockReader from '../../components/papers/BlockReader'
+import ConsentDialog from '../../components/papers/ConsentDialog'
 import OutlinePane, { buildOutline, type OutlineTab } from '../../components/papers/OutlinePane'
 import PdfViewer from '../../components/papers/PdfViewer'
 import SelectionActions from '../../components/papers/SelectionActions'
@@ -18,7 +19,10 @@ import { bootstrapSyncEngine, fetchRemoteFileToLocal, getSyncEngine } from '../.
 import { useAuthStore } from '../../lib/auth/authStore'
 import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
-import type { PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
+import { estimateTranslationCost } from '../../lib/paper/translate/translateBatch'
+import { useTranslations } from '../../lib/paper/translate/useTranslations'
+import { formatUsd } from '../../lib/paper/usage'
+import type { LangMode, PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
   MAX_ASK_TEXT,
   PAPER_ASK_ACTIONS,
@@ -54,6 +58,20 @@ const MODE_TABS_SHORT = [
   { id: 'original', label: 'PDF' },
   { id: 'text', label: '文本' },
 ] as const satisfies readonly { readonly id: ReaderMode; readonly label: string }[]
+
+/** 正文语言三态（全文翻译）：与 ReaderMode 正交，只作用于语义化视图 */
+const LANG_TABS = [
+  { id: 'orig', label: '原文' },
+  { id: 'zh', label: '中文' },
+  { id: 'both', label: '对照' },
+] as const satisfies readonly { readonly id: LangMode; readonly label: string }[]
+
+/** 短标签沿 MODE_TABS_SHORT 先例：<md 单字保工具行不爆 */
+const LANG_TABS_SHORT = [
+  { id: 'orig', label: '原' },
+  { id: 'zh', label: '中' },
+  { id: 'both', label: '双' },
+] as const satisfies readonly { readonly id: LangMode; readonly label: string }[]
 
 /**
  * Copilot 宽度档位 → 类名。必须是完整字面量（Tailwind 只扫描源码里出现的完整类名，
@@ -104,6 +122,9 @@ export default function PaperWorkbenchPage() {
   /** 换设备补拉进行中（papers 行或 blocks 从服务端拉取） */
   const [pullingRemote, setPullingRemote] = useState(false)
   const [mode, setMode] = useState<ReaderMode>('text')
+  const [langMode, setLangMode] = useState<LangMode>('orig')
+  /** 首次在本篇切非原文时的一次性成本提示：unseen → show → dismissed（按论文重置） */
+  const [costNotice, setCostNotice] = useState<'unseen' | 'show' | 'dismissed'>('unseen')
   const [bytes, setBytes] = useState<ArrayBuffer | null>(null)
   const [bytesError, setBytesError] = useState<string | null>(null)
   /** 「重试」计数：进懒拉 effect 依赖，递增即重跑同一条取字节路径 */
@@ -227,6 +248,9 @@ export default function PaperWorkbenchPage() {
           setMaxBlockIndex(Math.max(p?.maxBlockIndex ?? 0, p?.blockIndex ?? 0))
           // DOCX 只有语义化视图；PDF 恢复上次用的视图，默认原版
           setMode(record.format === 'docx' ? 'text' : (p?.mode ?? 'original'))
+          // 语言三态与视图正交：恢复上次的语言（只在文本视图生效）；成本提示按论文重置
+          setLangMode(p?.lang ?? 'orig')
+          setCostNotice(p?.lang && p.lang !== 'orig' ? 'dismissed' : 'unseen')
         }
       } finally {
         if (alive) setLoading(false)
@@ -452,6 +476,29 @@ export default function PaperWorkbenchPage() {
     setMode(next)
   }, [])
 
+  /** 语言切换（与视图正交）：PDF 原版视图下点中文/对照自动转文本视图——译文只在语义化视图渲染 */
+  const changeLang = useCallback(
+    (next: LangMode) => {
+      setLangMode(next)
+      if (next === 'orig') return
+      setCostNotice((s) => (s === 'unseen' ? 'show' : s))
+      if (modeRef.current === 'original') {
+        changeMode('text')
+        setToast('已切换到文本视图显示译文')
+      }
+    },
+    [changeMode],
+  )
+
+  // 全文翻译：整表缓存 + 懒翻译窗口调度；deepseek 授权对话框由本页渲染（复用 ConsentDialog）
+  const {
+    texts: translations,
+    failed: failedTranslations,
+    retryBlock,
+    consentAsk,
+  } = useTranslations({ paper, blocks, langMode, currentBlockIndex: position.blockIndex })
+  const translationEstimate = useMemo(() => estimateTranslationCost(blocks, DEEPSEEK_V4_PRO.pricing), [blocks])
+
   useEffect(() => {
     if (mode !== 'text' || !blocks.length || !paperId) return
     alignOnce(`${paperId}:text`)
@@ -510,12 +557,13 @@ export default function PaperWorkbenchPage() {
           page: position.page,
           maxBlockIndex,
           mode,
+          lang: langMode,
           updatedAt: Date.now(),
         })
         .catch(() => undefined)
     }, PROGRESS_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [paperId, repo, loading, totalBlocks, position.blockIndex, position.page, maxBlockIndex, ratio, mode])
+  }, [paperId, repo, loading, totalBlocks, position.blockIndex, position.page, maxBlockIndex, ratio, mode, langMode])
 
   // ---------------------------------------------------------------------
   // 选区快捷操作 / 搜索
@@ -543,7 +591,7 @@ export default function PaperWorkbenchPage() {
   }, [])
 
   const handleAskAction = useCallback(
-    (action: PaperAskAction, text: string, anchor: SourceAnchor | null) => {
+    (action: PaperAskAction, text: string, anchor: SourceAnchor | null, opts: { translated: boolean }) => {
       if (!paperId) return
       const pos = positionRef.current
       addPendingAsk({
@@ -552,6 +600,7 @@ export default function PaperWorkbenchPage() {
         label: PAPER_ASK_ACTIONS.find((a) => a.id === action)?.label ?? '加入提问',
         text: text.slice(0, MAX_ASK_TEXT),
         anchor: anchor ?? { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
+        ...(opts.translated ? { translated: true } : {}),
       })
       setCopilotOpen(true)
       setToast('已加入 Copilot 待提问，在右栏点击即可发起')
@@ -739,6 +788,15 @@ export default function PaperWorkbenchPage() {
             {paper.format === 'pdf' && (
               <SegmentedTabs tabs={isTablet ? MODE_TABS : MODE_TABS_SHORT} value={mode} onChange={changeMode} />
             )}
+            {/* 语言三态与视图正交；敏感论文禁用（灰化 + title，内层 pointer-events-none 让悬停落在外层出提示） */}
+            <div
+              title={paper.sensitive ? '敏感论文：远程翻译已禁用，仅可阅读原文' : '正文语言：原文 / 中文 / 中英对照'}
+              className={paper.sensitive ? 'cursor-not-allowed opacity-40' : undefined}
+            >
+              <div className={paper.sensitive ? 'pointer-events-none' : undefined}>
+                <SegmentedTabs tabs={isTablet ? LANG_TABS : LANG_TABS_SHORT} value={langMode} onChange={changeLang} />
+              </div>
+            </div>
             {!isDesktop && (
               <button
                 type="button"
@@ -865,7 +923,33 @@ export default function PaperWorkbenchPage() {
                 </div>
               )
             ) : (
-              <BlockReader blocks={blocks} containerRef={readerRef} onVisibleBlock={handleVisibleBlock} />
+              <>
+                {/* 首次切非原文的一次性成本提示（内联在阅读区顶部，不挡正文） */}
+                {costNotice === 'show' && langMode !== 'orig' && (
+                  <div className="mx-auto mb-2 flex max-w-3xl items-start gap-2 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-xs text-dim">
+                    <span className="min-w-0 flex-1">
+                      全文翻译按阅读位置逐段进行，整篇约 {formatUsd(translationEstimate.cost)}
+                      （deepseek-v4-pro 估算）；已译段落本地缓存复用，不重复计费。
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setCostNotice('dismissed')}
+                      className="shrink-0 text-accent transition-colors hover:underline"
+                    >
+                      知道了
+                    </button>
+                  </div>
+                )}
+                <BlockReader
+                  blocks={blocks}
+                  containerRef={readerRef}
+                  onVisibleBlock={handleVisibleBlock}
+                  langMode={langMode}
+                  translations={translations}
+                  failedTranslations={failedTranslations}
+                  onRetryTranslation={retryBlock}
+                />
+              </>
             )}
           </main>
 
@@ -914,6 +998,9 @@ export default function PaperWorkbenchPage() {
             {toast}
           </div>
         )}
+
+        {/* 翻译链路的 deepseek 授权（与 CopilotPanel 的 gate 同一对话框组件、同一 consents 表） */}
+        {consentAsk && <ConsentDialog provider="deepseek" onDecide={consentAsk} />}
 
         <SelectionActions
           containerRef={readerRef}

@@ -18,7 +18,8 @@ interface Props {
   containerRef: RefObject<HTMLElement | null>
   /** 由工作台注入：从选区所在元素解析出锚点（需要 anchorContext，故不在本组件内做） */
   anchorFromElement: (el: Element) => SourceAnchor | null
-  onAction: (action: PaperAskAction, text: string, anchor: SourceAnchor | null) => void
+  /** opts.translated：选区起点落在应用内译文（[data-translated]）里 */
+  onAction: (action: PaperAskAction, text: string, anchor: SourceAnchor | null, opts: { translated: boolean }) => void
 }
 
 interface BarState {
@@ -26,6 +27,8 @@ interface BarState {
   y: number
   text: string
   anchor: SourceAnchor | null
+  /** 选区起点是否在译文元素内（Copilot 侧据此提示「以原文语义为准」） */
+  translated: boolean
 }
 
 const BAR_WIDTH = 336
@@ -71,7 +74,9 @@ export default function SelectionActions({ containerRef, anchorFromElement, onAc
         const r = sel.getRangeAt(0).getBoundingClientRect()
         const x = Math.min(Math.max(r.left + r.width / 2 - BAR_WIDTH / 2, 8), window.innerWidth - BAR_WIDTH - 8)
         const y = r.top > 108 ? r.top - 44 : r.bottom + 10
-        setBar({ x, y, text, anchor: anchorFnRef.current(anchorEl) })
+        // 以选区起点判定「引用的是译文」：跨原文/译文的混合选区按起点归类（精确切分不值得）
+        const translated = anchorEl.closest('[data-translated]') != null
+        setBar({ x, y, text, anchor: anchorFnRef.current(anchorEl), translated })
       }, 0)
     }
 
@@ -119,7 +124,7 @@ export default function SelectionActions({ containerRef, anchorFromElement, onAc
           // 防止按下时选区塌陷 / 抢焦点
           onPointerDown={(e) => e.preventDefault()}
           onClick={() => {
-            onAction(a.id, bar.text, bar.anchor)
+            onAction(a.id, bar.text, bar.anchor, { translated: bar.translated })
             setBar(null)
           }}
           className="flex-1 rounded-md px-2 py-1 text-xs whitespace-nowrap text-accent transition-colors hover:bg-panel-2"

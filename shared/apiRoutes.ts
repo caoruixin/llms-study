@@ -65,3 +65,32 @@ export const LLM_RATE_CAPACITY = 3
 export const LLM_RATE_REFILL_MS = 10_000
 /** 每用户并发 SSE 上限:防单用户占满上游连接/后端内存 */
 export const LLM_MAX_CONCURRENT_STREAMS = 3
+
+// ---- URL 抓取代理(Track 1)----
+
+/**
+ * 单次抓取字节上限 20MB:白皮书类 PDF 常见 5~15MB,再大也超出"可陪读文档"的范畴。
+ * 比 FILE_MAX_BYTES 小得多——抓取字节要整块进内存(不落盘),必须更保守。
+ */
+export const FETCH_URL_MAX_BYTES = 20 * 1024 * 1024
+/** 单次抓取总超时(建连 + 读完 + 全部重定向跳数共用这一个预算) */
+export const FETCH_URL_TIMEOUT_MS = 20_000
+/** 重定向跟随上限:正常站点 1~2 跳足够,更深多半是跳转陷阱/循环 */
+export const FETCH_URL_MAX_REDIRECTS = 3
+/**
+ * 每用户抓取令牌桶:5 容量、每 10s 回一枚。
+ * 比 LLM 桶松一点(批量导入本就要连抓十几个 URL),但仍能挡住"拿服务器当扫描器"。
+ */
+export const FETCH_URL_RATE_CAPACITY = 5
+export const FETCH_URL_RATE_REFILL_MS = 10_000
+/** 每用户并发抓取 1:前端逐 URL 串行,多余并发只会放大探测能力与内存峰值 */
+export const FETCH_URL_MAX_CONCURRENT = 1
+/** 目标 URL 长度上限:超长 URL 多为追踪串/攻击载荷,正常文档链接远低于此 */
+export const FETCH_URL_MAX_LENGTH = 2048
+/** 单次批量导入的 URL 条数上限(前端闸门,服务端逐条抓) */
+export const MAX_URLS_PER_IMPORT = 20
+/**
+ * 重定向后的最终 URL 回传头:前端做相对链接绝对化必须以最终 URL 为基准,
+ * 否则跳转过域名的站点会把相对路径拼到原始域上。
+ */
+export const FETCH_URL_HEADER_FINAL_URL = 'x-fetch-final-url'

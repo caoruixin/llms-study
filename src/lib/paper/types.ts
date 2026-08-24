@@ -20,6 +20,9 @@ export type IngestFailureKind =
   | 'storage'
   | 'unknown'
 
+/** 正文语言三态（全文翻译）：与阅读视图（original/text）正交，只作用于语义化视图 */
+export type LangMode = 'orig' | 'zh' | 'both'
+
 export interface ReadingProgress {
   blockIndex: number
   ratio: number
@@ -29,6 +32,8 @@ export interface ReadingProgress {
   maxBlockIndex?: number
   /** 上次使用的阅读视图，回到这篇论文时恢复 */
   mode?: 'original' | 'text'
+  /** 上次使用的正文语言（随 papers 行免费同步；译文本体 V1 不同步） */
+  lang?: LangMode
 }
 
 export interface IngestFailure {
@@ -258,6 +263,27 @@ export interface EvidenceRecord {
   weight: number
   source: string
   ts: number
+}
+
+/**
+ * 全文翻译：按块存储的译文（schema v3 新表 translations）。
+ * 独立成表而不在 blocks 加字段——blocks 重解析时整批先清后写，译文会被无谓抹掉。
+ * id 是 `${paperId}:${blockIndex}:${targetLang}` 确定性拼接：重译 bulkPut 幂等覆盖同一行。
+ * promptVersion 或 srcHash 与当前不符视同缺失，懒重译（bump promptVersion = 全篇重新计费，需纪律）。
+ */
+export interface BlockTranslation {
+  id: string
+  paperId: string
+  blockIndex: number
+  blockId: string
+  targetLang: 'zh'
+  promptVersion: string
+  model: string
+  /** 原文 FNV-1a 哈希：原文变化（重解析/换解析器）后旧译文自动失效 */
+  srcHash: string
+  text: string
+  createdAt: number
+  updatedAt: number
 }
 
 /** Phase 3 落地：按 provider 独立的文档片段外发授权，不跨 provider 继承 */

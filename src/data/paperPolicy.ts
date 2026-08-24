@@ -124,6 +124,20 @@ export const PAPER_TASKS = {
     temperature: 0.6,
     inputBudgetTokens: 24_000,
   },
+  /**
+   * 全文翻译（三态切换）：非流式 JSON 逐块批量翻译，validate→修复→兜底阶梯天然是对齐保险。
+   * V1 收敛 deepseek-v4-pro（与全任务统一决策一致）；若 flash 档 pricing 实核通过，
+   * 在此把 cap 换成对应 capability 即可一行切换。
+   * 输入预算 4000 ≈ system 提示 + 单包 ≤1800 token 正文 + JSON 包装；输出 4000 覆盖中译膨胀。
+   */
+  translate: {
+    cap: DEEPSEEK_V4_PRO,
+    thinking: 'off',
+    responseFormat: { type: 'json_object' },
+    maxOutputTokens: 4000,
+    temperature: 0.2,
+    inputBudgetTokens: 4000,
+  },
 } as const satisfies Record<string, PaperTaskSpec>
 
 export type PaperTaskId = keyof typeof PAPER_TASKS

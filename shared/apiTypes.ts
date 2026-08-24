@@ -22,6 +22,10 @@ export type ApiErrorCode =
   | 'not-found' // 404
   | 'quota-exceeded' // 413:存储配额不足(P3 同步域用)
   | 'rate-limited' // 429:登录爆破限流/LLM 限流,带 Retry-After 头
+  | 'fetch-denied' // 403:URL 抓取被安全策略拒绝(内网/保留地址、userinfo、非常规端口)
+  | 'fetch-failed' // 502:URL 抓取失败(连接/超时/上游 4xx-5xx/重定向过多)
+  | 'fetch-too-large' // 413:抓取内容超过 FETCH_URL_MAX_BYTES
+  | 'unsupported-content' // 415:抓到的内容类型不在 html/xhtml/plain/pdf 白名单内
   | 'internal' // 500
 
 export interface ApiError {
@@ -202,6 +206,16 @@ export interface FilePutResponse {
   ok: true
   sha256: string
   byteSize: number
+}
+
+// ---- URL 抓取代理(Track 1)----
+
+/**
+ * POST /api/app/fetch-url 请求体:一次一个 URL(前端逐条串行抓)。
+ * 成功响应不是 JSON 而是原始字节 + `X-Fetch-Final-Url` 头,正文抽取在客户端做。
+ */
+export interface FetchUrlBody {
+  url: string
 }
 
 // ---- misc ----

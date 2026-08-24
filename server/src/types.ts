@@ -4,6 +4,7 @@
  */
 import type { Config } from './config.js'
 import type { Db, UserRow } from './db/db.js'
+import type { FetchLookup, FetchTransport } from './lib/fetchRaw.js'
 
 export interface AppDeps {
   db: Db
@@ -16,6 +17,17 @@ export interface AppDeps {
     rateCapacity?: number
     rateRefillMs?: number
     maxStreams?: number
+  }
+  /**
+   * URL 抓取参数覆盖(测试专用),同 llmTuning 的理由不进 config。
+   * transport/lookup 是注入口:transport 让测试把请求打到本机 stub 而不必放宽禁区校验,
+   * lookup 让测试构造"域名解析到内网"这一必须走真实校验路径的场景。
+   */
+  fetchTuning?: {
+    maxBytes?: number
+    timeoutMs?: number
+    transport?: FetchTransport
+    lookup?: FetchLookup
   }
 }
 

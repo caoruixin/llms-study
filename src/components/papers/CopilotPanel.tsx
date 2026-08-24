@@ -16,7 +16,7 @@ import {
   runBriefPipeline,
   sectionizeUnits,
 } from '../../lib/paper/briefPipeline'
-import { createModelGateway } from '../../lib/paper/modelGateway'
+import { getPaperGateway } from '../../lib/paper/gatewaySingleton'
 import { getRepos } from '../../lib/paper/repo/repos'
 import { createTurnRunner, findOrphanTurns, turnErrorDetail, type TurnError, type TurnState } from '../../lib/paper/turnEngine'
 import { KEEP_PAIRS_AFTER_FOLD, MAX_LIVE_TURN_PAIRS, foldMemo, shouldRequestMemo, trimHistoryPairs } from '../../lib/paper/summarizer'
@@ -136,6 +136,9 @@ const PROVIDER_KEY_LABEL: Record<PaperProviderId, string> = {
   deepseek: 'DeepSeek',
   kimi: 'Kimi (Moonshot)',
 }
+
+/** 选区来自应用内译文时注入 question 最前（displayText 不带，用户不可见）：模型须回到英文原文语义作答 */
+const TRANSLATED_ASK_NOTE = '以下引用是应用内生成的中文译文，原文为英文，请以原文语义为准。'
 
 /**
  * 错误文案（§QA D-10）：底层 message 已经中文化过一次，这里再套前缀就成了
@@ -296,19 +299,10 @@ export default function CopilotPanel({
   )
 
   // -----------------------------------------------------------------------
-  // Gateway 与 turn runner（同一实例：brief 与对话共享令牌桶）
+  // Gateway 与 turn runner（模块级单例：对话 / brief / 全文翻译共享同一令牌桶与熔断，
+  // 各自建实例会让合成流量绕过客户端排队直接撞 nginx 429）
   // -----------------------------------------------------------------------
-  const gateway = useMemo(
-    () =>
-      createModelGateway({
-        hasConsent: async (p) => (await repo.getConsent(p))?.granted === true,
-        // addUsage 返回落库行(同步装饰器用),gateway 只要 void:显式吞掉返回值
-        recordUsage: async (d) => {
-          await repo.addUsage(d)
-        },
-      }),
-    [repo],
-  )
+  const gateway = getPaperGateway()
 
   const runnerRef = useRef<ReturnType<typeof createTurnRunner> | null>(null)
   const getRunner = useCallback(() => {
@@ -549,10 +543,11 @@ export default function CopilotPanel({
   const sendFree = useCallback(
     (text: string) => {
       const sel = attachedAsk?.text ?? null
+      const fromTranslation = attachedAsk?.translated === true
       setAttachedAsk(null)
       if (attachedAsk) onRemoveAsk(attachedAsk.id)
       void sendTurn({
-        question: text,
+        question: fromTranslation ? `${TRANSLATED_ASK_NOTE}\n${text}` : text,
         selection: sel,
         task: 'chat',
         planIsland: true,
@@ -577,7 +572,7 @@ export default function CopilotPanel({
       const shortcut = evidenceFromShortcut(ask.action, lastTurnConceptsRef.current, Date.now())
       if (shortcut) recordEvidence(shortcut)
       void sendTurn({
-        question: tpl.question,
+        question: ask.translated ? `${TRANSLATED_ASK_NOTE}\n${tpl.question}` : tpl.question,
         selection: ask.text,
         task: tpl.task,
         planIsland: false, // (b) 类：意图由按钮完全确定，无 plan 岛，TTFT 最快
@@ -1117,6 +1112,11 @@ export default function CopilotPanel({
                     <span className="mb-1 inline-block rounded border border-accent/40 px-1.5 py-0.5 text-[0.65rem] text-accent">
                       {ask.action === 'queue' ? '引用并提问' : ask.label}
                     </span>
+                    {ask.translated && (
+                      <span className="mb-1 ml-1 inline-block rounded border border-accent-2/40 bg-accent-2/10 px-1.5 py-0.5 text-[0.65rem] text-accent-2">
+                        译文
+                      </span>
+                    )}
                     <span className="line-clamp-2 block text-[0.7rem] leading-relaxed text-fg">{ask.text}</span>
                   </button>
                   <button

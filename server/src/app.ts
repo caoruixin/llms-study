@@ -12,6 +12,7 @@ import { apiError } from './lib/respond.js'
 import { llmGatewayRoutes } from './llm/gateway.js'
 import { adminRoutes } from './routes/admin.js'
 import { authRoutes } from './routes/auth.js'
+import { fetchUrlRoutes } from './routes/fetchUrl.js'
 import { filesRoutes } from './routes/files.js'
 import { healthRoutes } from './routes/health.js'
 import { llmKeysRoutes } from './routes/llmKeys.js'
@@ -22,7 +23,7 @@ export function createApp(deps: AppDeps) {
   const root = new Hono<AppEnv>()
   root.use('*', originCheck(deps.config))
 
-  // ---- /api/app/*:账号/同步/文件 ----
+  // ---- /api/app/*:账号/同步/文件/URL 抓取 ----
   const api = new Hono<AppEnv>()
   api.route('/', healthRoutes())
   api.route('/auth', authRoutes(deps))
@@ -30,6 +31,7 @@ export function createApp(deps: AppDeps) {
   api.route('/admin', adminRoutes(deps))
   api.route('/sync', syncRoutes(deps))
   api.route('/files', filesRoutes(deps))
+  api.route('/fetch-url', fetchUrlRoutes(deps))
   root.route(APP_API_PREFIX, api)
 
   // ---- /api/{deepseek,moonshot,zhipu,jina,openai-compat}/*:LLM 网关 ----
