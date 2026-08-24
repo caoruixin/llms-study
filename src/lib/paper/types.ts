@@ -2,7 +2,8 @@
 // Phase 1 完整实现 papers / files / blocks / jobs 四张表所用类型；其余实体为占位类型，
 // schema v1 已一次建齐对应表（见 repo/db.ts），后续 Phase 只加字段、不加 migration。
 
-export type PaperFormat = 'pdf' | 'docx'
+/** 'html' = URL 导入产出的净化 HTML 合集（见 lib/paper/url/urlBundle.ts），不是原始上传格式 */
+export type PaperFormat = 'pdf' | 'docx' | 'html'
 
 /** 导入状态机阶段（§4.4：校验 → 解析 → 规范化 → 索引 → 可阅读） */
 export type IngestStage = 'queued' | 'validating' | 'parsing' | 'normalizing' | 'indexing' | 'ready' | 'failed'
@@ -75,6 +76,29 @@ export interface PaperBlock {
 /** 解析器产出形：id / paperId 由仓储在写入时补齐 */
 export type NormalizedBlock = Omit<PaperBlock, 'id' | 'paperId'>
 
+/**
+ * URL 导入产出论文的抓取来源记录（Track 1）。逐条对应粘贴框里的每一行，
+ * 成功/失败都留痕——部分失败时用户仍能在论文详情里看到「哪几条链接被跳过、为什么」。
+ */
+export interface UrlSourceEntry {
+  /** 用户粘贴的原始 URL（补 https 前缀后的规范形态） */
+  url: string
+  /** 重定向后的最终 URL（服务端 X-Fetch-Final-Url 回传），成功抓取才有 */
+  finalUrl?: string
+  /** 抽取出的页面标题，成功抓取才有 */
+  title?: string
+  ok: boolean
+  /** ok=false 时的失败原因（用户可读中文文案） */
+  error?: string
+  fetchedAt: number
+}
+
+/** PaperRecord.source：目前只有 URL 导入这一种来源；本地上传的 PDF/DOCX 没有该字段 */
+export interface PaperSource {
+  type: 'url'
+  entries: UrlSourceEntry[]
+}
+
 export interface PaperRecord {
   id: string
   title: string
@@ -96,6 +120,8 @@ export interface PaperRecord {
   updatedAt: number
   lastReadAt?: number
   progress: ReadingProgress
+  /** Track 1 加法字段：URL 导入的抓取来源清单，本地上传的文件没有该字段 */
+  source?: PaperSource
 }
 
 /**

@@ -1,3 +1,6 @@
+// 从叶子文件取常量而非 './url/urlBundle'：urlBundle.ts 依赖 ingest.ts，ingest.ts 又依赖本文件，
+// 直接从 urlBundle.ts 取值会形成循环 import（细节见 urlBundleMime.ts 头注释）
+import { URL_BUNDLE_MIME } from './url/urlBundleMime'
 import type { IngestFailureKind, PaperFormat } from './types'
 
 // §4.5 默认约束
@@ -15,13 +18,19 @@ export type ValidateResult =
   | { ok: true; format: PaperFormat; mime: string }
   | { ok: false; kind: IngestFailureKind; message: string }
 
-/** MIME 白名单：浏览器/系统给出的 type 差异极大，空串与 octet-stream 一律放行，只拒绝明确冲突的 */
+/**
+ * MIME 白名单：浏览器/系统给出的 type 差异极大，空串与 octet-stream 一律放行，只拒绝明确冲突的。
+ * html 项只为满足 Record<PaperFormat, string[]> 的完备性——URL 导入走 lib/paper/url/urlImport.ts
+ * 的独立编排（不经 <input type="file"> 选择器），validateFile/validateFileMeta 这条校验路径
+ * 实际上走不到 html 分支，这里补一条纯粹是类型系统要求。
+ */
 const MIME_BY_FORMAT: Record<PaperFormat, string[]> = {
   pdf: ['application/pdf', 'application/x-pdf'],
   docx: [
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'application/zip',
   ],
+  html: [URL_BUNDLE_MIME],
 }
 
 const LENIENT_MIME = ['', 'application/octet-stream']

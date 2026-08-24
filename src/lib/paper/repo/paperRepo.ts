@@ -9,6 +9,7 @@ import type {
   PaperFileBytes,
   PaperFormat,
   PaperRecord,
+  PaperSource,
 } from '../types'
 import { PARSER_VERSION, type PaperDb } from './db'
 
@@ -21,6 +22,8 @@ export interface NewPaperInput {
   sha256: string
   bytes: ArrayBuffer
   sensitive?: boolean
+  /** Track 1：URL 导入透传抓取来源清单；本地文件上传不传 */
+  source?: PaperSource
 }
 
 export interface ReadyStats {
@@ -127,6 +130,7 @@ export function createPaperRepository(db: PaperDb): PaperRepository {
           createdAt: now,
           updatedAt: now,
           progress: { blockIndex: 0, ratio: 0, updatedAt: now },
+          ...(input.source ? { source: input.source } : {}),
         }
         // papers + files + jobs 同事务：任一步失败都不会留下「有元数据无字节」的半截论文
         await db.transaction('rw', [db.papers, db.files, db.jobs], async () => {

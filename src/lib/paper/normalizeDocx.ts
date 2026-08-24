@@ -30,13 +30,13 @@ const dropDangerous = (html: string): string =>
   html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
 
 /** 去标签 → 解码实体 → 空白规整。<br> 视作空格，其余内联标签直接抹掉（中文不会被插入多余空格） */
-function toText(html: string): string {
+export function toText(html: string): string {
   const withBreaks = dropDangerous(html).replace(/<br\s*\/?>/gi, ' ')
   const stripped = withBreaks.replace(/<[^>]*>/g, '')
   return decodeEntities(stripped).replace(/\s+/g, ' ').trim()
 }
 
-interface RawBlock {
+export interface RawBlock {
   tag: string
   inner: string
 }
@@ -44,8 +44,11 @@ interface RawBlock {
 /**
  * 顶层块级元素扫描（带同名标签深度计数，支持嵌套列表）。
  * 遇到非块级容器（如 mammoth 偶尔产出的包裹 div）会继续向内扫描。
+ *
+ * export：normalizeHtml.ts（URL 导入的 HTML 规范化）复用同一套块级扫描/去标签工具，
+ * 不迁移/不复制这份实现——两条格式管线共享一份解析逻辑，行为与 bug 修复天然同步。
  */
-function extractBlocks(html: string): RawBlock[] {
+export function extractBlocks(html: string): RawBlock[] {
   const out: RawBlock[] = []
   const openTag = /<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/g
   let i = 0
@@ -93,7 +96,7 @@ function extractBlocks(html: string): RawBlock[] {
 }
 
 /** 拆 <li>：嵌套列表的子项会被外层 li 的 inner 一并带出，toText 后仍是可读文本 */
-function listItems(inner: string): string[] {
+export function listItems(inner: string): string[] {
   const items: string[] = []
   const re = /<li\b[^>]*>([\s\S]*?)(?=<li\b|<\/(?:ul|ol)\s*>|$)/gi
   let m: RegExpExecArray | null
@@ -105,7 +108,7 @@ function listItems(inner: string): string[] {
 }
 
 /** 表格文本化：单元格用 ` | ` 连接、行用换行连接，供检索与纯文本预览使用 */
-function tableToText(inner: string): string {
+export function tableToText(inner: string): string {
   const rows: string[] = []
   const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi
   let r: RegExpExecArray | null
@@ -137,7 +140,7 @@ const BOLD_TAG = /<(strong|b)\b[^>]*>[\s\S]*?<\/\1\s*>/gi
  * 判据（三条同时成立）：段内**全部**文本都在 strong/b 内、长度 ≤60、不以句末标点结尾。
  * 级别：有 `1.` / `2.3` 编号前缀时按编号层级，否则统一 level 2。
  */
-function detectPseudoHeading(inner: string, text: string): { level: number } | null {
+export function detectPseudoHeading(inner: string, text: string): { level: number } | null {
   if (!text || text.length > PSEUDO_HEADING_MAX_CHARS) return null
   if (PSEUDO_HEADING_ENDS_SENTENCE.test(text)) return null
   if (!/<(strong|b)\b/i.test(inner)) return null

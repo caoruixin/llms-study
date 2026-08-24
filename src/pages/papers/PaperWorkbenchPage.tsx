@@ -22,7 +22,7 @@ import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
 import { estimateTranslationCost } from '../../lib/paper/translate/translateBatch'
 import { useTranslations } from '../../lib/paper/translate/useTranslations'
 import { formatUsd } from '../../lib/paper/usage'
-import type { LangMode, PaperBlock, PaperRecord, SourceAnchor } from '../../lib/paper/types'
+import type { LangMode, PaperBlock, PaperFormat, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
   MAX_ASK_TEXT,
   PAPER_ASK_ACTIONS,
@@ -65,6 +65,9 @@ const LANG_TABS = [
   { id: 'zh', label: '中文' },
   { id: 'both', label: '对照' },
 ] as const satisfies readonly { readonly id: LangMode; readonly label: string }[]
+
+/** 头部 meta 行的格式展示名：html = URL 导入产出的净化 HTML 合集，用户看到的应是「网页」而不是内部格式名 */
+const FORMAT_LABEL: Record<PaperFormat, string> = { pdf: 'PDF', docx: 'DOCX', html: '网页' }
 
 /** 短标签沿 MODE_TABS_SHORT 先例：<md 单字保工具行不爆 */
 const LANG_TABS_SHORT = [
@@ -246,8 +249,8 @@ export default function PaperWorkbenchPage() {
           const p = record.progress
           setPosition({ blockIndex: p?.blockIndex ?? 0, page: p?.page })
           setMaxBlockIndex(Math.max(p?.maxBlockIndex ?? 0, p?.blockIndex ?? 0))
-          // DOCX 只有语义化视图；PDF 恢复上次用的视图，默认原版
-          setMode(record.format === 'docx' ? 'text' : (p?.mode ?? 'original'))
+          // 非 PDF（DOCX / URL 导入的 html）只有语义化视图；PDF 恢复上次用的视图，默认原版
+          setMode(record.format !== 'pdf' ? 'text' : (p?.mode ?? 'original'))
           // 语言三态与视图正交：恢复上次的语言（只在文本视图生效）；成本提示按论文重置
           setLangMode(p?.lang ?? 'orig')
           setCostNotice(p?.lang && p.lang !== 'orig' ? 'dismissed' : 'unseen')
@@ -778,7 +781,7 @@ export default function PaperWorkbenchPage() {
             </button>
             <h1 className="min-w-0 flex-1 truncate text-base font-bold md:flex-none md:text-xl">{paper.title}</h1>
             <p className="hidden text-xs text-dim md:block">
-              {paper.format.toUpperCase()}
+              {FORMAT_LABEL[paper.format]}
               {paper.pageCount ? ` · ${paper.pageCount} 页` : ''} · {totalBlocks} 段 · 已读 {Math.round(ratio * 100)}%
               {position.page !== undefined ? ` · 当前第 ${position.page} 页` : ''}
             </p>

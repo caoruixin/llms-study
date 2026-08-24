@@ -9,6 +9,7 @@ import type {
   PaperChunk,
   PaperFormat,
   PaperRecord,
+  PaperSource,
 } from './types'
 
 /** 全链路统一的分类错误：解析器 / 仓储 / 编排层都抛它，编排层据此写 IngestFailure */
@@ -240,12 +241,31 @@ export async function buildPaperIndex(
   return rows
 }
 
+/** ingestPrepared 的输入：字节已就绪、格式已确定（文件校验 / URL 抽取各自负责这一步） */
+export interface PreparedInput {
+  title: string
+  fileName: string
+  format: PaperFormat
+  mime: string
+  byteSize: number
+  bytes: ArrayBuffer
+  /** Track 1：URL 导入携带抓取来源清单；本地文件导入不传 */
+  source?: PaperSource
+}
+
 /**
- * 单文件导入全链路：
- * 校验 → SHA-256 → 去重早退 → 建记录 → 解析 → 落块 → 索引（Phase 1 为 no-op 占位）→ ready。
- * 任何抛出都被分类成 IngestFailure 并写进论文记录，绝不留下卡在中间态的空论文。
+ * 导入编排的共享核心：SHA-256 → 去重早退 → 建记录 → 解析 → 落块 → 索引 → ready。
+ * importPaper（本地文件）与 importFromUrls（URL 导入）在「怎么拿到 bytes/format」上
+ * 完全不同，但从「字节已就绪」往后的全部步骤字节不差，因此提炼成这一份实现，
+ * 两条导入路径共用，行为与 bug 修复天然同步、不会出现「文件导入修好了、URL 导入还没修」。
+ *
+ * 状态机从本地全新的 INITIAL_INGEST_STATE 开始，第一个事件是 'parse:start'
+ * （该事件本就同时接受 queued/validating 起点，见 ingestReducer 注释，与 reingestPaper
+ * 的重试入口是同一条迁移路径）——调用方在此之前自行完成校验阶段的 dispatch（如
+ * importPaper 的 validate:start/文件校验），两段 dispatch 拼起来对 onState 而言
+ * 是无缝的同一条 validating → parsing → normalizing → indexing → ready 序列。
  */
-export async function importPaper(file: ImportFileInput, deps: IngestDeps): Promise<ImportOutcome> {
+export async function ingestPrepared(input: PreparedInput, deps: IngestDeps): Promise<ImportOutcome> {
   const now = deps.now ?? Date.now
   let state = INITIAL_INGEST_STATE
   const dispatch = (ev: IngestEvent) => {
@@ -253,35 +273,29 @@ export async function importPaper(file: ImportFileInput, deps: IngestDeps): Prom
     deps.onState?.(state)
   }
 
-  dispatch({ type: 'validate:start' })
-
-  const head = new Uint8Array(file.bytes.slice(0, 8))
-  const verdict = validateFile({ name: file.name, size: file.size, type: file.type }, head)
-  if (!verdict.ok) {
-    // 校验不过的文件不写库——列表里不该出现一条永远打不开的记录
-    dispatch({ type: 'fail', kind: verdict.kind, message: verdict.message, at: now() })
-    return { kind: 'failed', failure: { kind: verdict.kind, message: verdict.message, at: now() } }
-  }
-  dispatch({ type: 'validate:ok' })
-
   let paper: PaperRecord | undefined
   try {
-    const sha = await deps.hash(file.bytes)
+    // 与原 importPaper 顺序一致：先报「进入 parsing」，再做哈希/去重查询——
+    // 命中去重早退时，onState 序列仍是 [...,'parsing']，不会因为提前 return 少报一段
+    dispatch({ type: 'parse:start' })
+
+    const sha = await deps.hash(input.bytes)
     const existing = await deps.repo.findBySha256(sha)
     if (existing) return { kind: 'duplicate', existing }
 
     paper = await deps.repo.createPaper({
-      title: titleFromFileName(file.name),
-      fileName: file.name,
-      format: verdict.format,
-      mime: verdict.mime,
-      byteSize: file.size,
+      title: input.title,
+      fileName: input.fileName,
+      format: input.format,
+      mime: input.mime,
+      byteSize: input.byteSize,
       sha256: sha,
-      bytes: file.bytes,
+      bytes: input.bytes,
+      ...(input.source ? { source: input.source } : {}),
     })
     await deps.repo.setStage(paper.id, 'parsing')
 
-    const parsed = await deps.parse({ bytes: file.bytes, format: verdict.format })
+    const parsed = await deps.parse({ bytes: input.bytes, format: input.format })
     dispatch({ type: 'parse:ok' })
 
     const charCount = countBlockChars(parsed.blocks)
@@ -321,6 +335,42 @@ export async function importPaper(file: ImportFileInput, deps: IngestDeps): Prom
     }
     return { kind: 'failed', paper, failure }
   }
+}
+
+/**
+ * 单文件导入全链路：校验 → 委托 ingestPrepared 完成「哈希起」的共享部分。
+ * 任何抛出都被分类成 IngestFailure 并写进论文记录，绝不留下卡在中间态的空论文。
+ */
+export async function importPaper(file: ImportFileInput, deps: IngestDeps): Promise<ImportOutcome> {
+  const now = deps.now ?? Date.now
+  let state = INITIAL_INGEST_STATE
+  const dispatch = (ev: IngestEvent) => {
+    state = ingestReducer(state, ev)
+    deps.onState?.(state)
+  }
+
+  dispatch({ type: 'validate:start' })
+
+  const head = new Uint8Array(file.bytes.slice(0, 8))
+  const verdict = validateFile({ name: file.name, size: file.size, type: file.type }, head)
+  if (!verdict.ok) {
+    // 校验不过的文件不写库——列表里不该出现一条永远打不开的记录
+    dispatch({ type: 'fail', kind: verdict.kind, message: verdict.message, at: now() })
+    return { kind: 'failed', failure: { kind: verdict.kind, message: verdict.message, at: now() } }
+  }
+  // 不在这里 dispatch 'validate:ok'：ingestPrepared 内部的第一个动作就是 dispatch('parse:start')
+  // 报告同一次 validating→parsing 迁移，两段拼起来对 onState 而言是完整无缝的序列
+  return ingestPrepared(
+    {
+      title: titleFromFileName(file.name),
+      fileName: file.name,
+      format: verdict.format,
+      mime: verdict.mime,
+      byteSize: file.size,
+      bytes: file.bytes,
+    },
+    deps,
+  )
 }
 
 /**

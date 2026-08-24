@@ -1,9 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import ClaimBanner from '../../components/papers/ClaimBanner'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
 import { useAuthStore } from '../../lib/auth/authStore'
-import { createSerialQueue, importPaper, isRetryable, reingestPaper, type IngestDeps, type ParseResult } from '../../lib/paper/ingest'
+import {
+  createSerialQueue,
+  importPaper,
+  isRetryable,
+  reingestPaper,
+  type ImportOutcome,
+  type IngestDeps,
+  type ParseResult,
+} from '../../lib/paper/ingest'
 import { getPaperDb, type SyncMetaRow } from '../../lib/paper/repo/db'
 import { getRepos } from '../../lib/paper/repo/repos'
 import {
@@ -16,8 +24,12 @@ import {
 } from '../../lib/paper/sync/syncEngine'
 import { ensureStorageFor } from '../../lib/paper/storage'
 import { MAX_FILE_BYTES, MAX_PDF_PAGES, sha256Hex } from '../../lib/paper/validate'
-import type { IngestStage, PaperFormat, PaperRecord } from '../../lib/paper/types'
+import type { IngestStage, PaperFormat, PaperRecord, UrlSourceEntry } from '../../lib/paper/types'
+import type { UrlProgressEvent } from '../../lib/paper/url/urlImport'
 import { usePaperUi, type PaperFilter, type PaperSortBy } from './paperUiStore'
+
+/** 「按 URL 导入」弹窗懒加载：@mozilla/readability 等抽取依赖只在用户点开时才会被拉取 */
+const UrlImportDialog = lazy(() => import('../../components/papers/UrlImportDialog'))
 
 const FILTER_TABS = [
   { id: 'all', label: '全部' },
@@ -50,14 +62,39 @@ const fmtTime = (ts?: number): string =>
 
 const isProcessing = (s: IngestStage) => s !== 'ready' && s !== 'failed'
 
-/** 解析器按格式动态 import：pdfjs / mammoth 都不进论文库入口 chunk，首次导入对应格式时才拉取 */
+/**
+ * 解析器按格式动态 import：pdfjs / mammoth / urlBundle 都不进论文库入口 chunk，
+ * 首次导入对应格式时才拉取。html = URL 导入产出的净化 HTML 合集（见 lib/paper/url/urlBundle.ts）。
+ */
 async function parseByFormat(input: { bytes: ArrayBuffer; format: PaperFormat }): Promise<ParseResult> {
   if (input.format === 'pdf') {
     const { parsePdfBytes } = await import('../../lib/paper/parsePdf')
     return parsePdfBytes(input.bytes)
   }
+  if (input.format === 'html') {
+    const { parseUrlBundleBytes } = await import('../../lib/paper/url/urlBundle')
+    return parseUrlBundleBytes(input.bytes)
+  }
   const { parseDocxBytes } = await import('../../lib/paper/parseDocx')
   return parseDocxBytes(input.bytes)
+}
+
+const FORMAT_BADGE: Record<PaperFormat, string> = { pdf: 'PDF', docx: 'DOCX', html: 'URL' }
+
+/** URL 导入卡片的来源域名摘要：去重按首次出现顺序，超过 3 个截断成「等 N 个站点」 */
+function summarizeSourceDomains(entries: UrlSourceEntry[]): string {
+  const hosts: string[] = []
+  for (const e of entries) {
+    try {
+      const h = new URL(e.finalUrl || e.url).hostname
+      if (!hosts.includes(h)) hosts.push(h)
+    } catch {
+      /* 理论上不会走到：entries 里的 url 都在抓取阶段已校验过 */
+    }
+  }
+  if (hosts.length === 0) return '—'
+  const shown = hosts.slice(0, 3)
+  return hosts.length > shown.length ? `来源：${shown.join('、')} 等 ${hosts.length} 个站点` : `来源：${shown.join('、')}`
 }
 
 interface ActiveJob {
@@ -82,8 +119,9 @@ export default function PapersPage() {
   const userId = useAuthStore((s) => s.user?.id ?? null)
   const queueRef = useRef(createSerialQueue())
   const inputRef = useRef<HTMLInputElement>(null)
-  // 重复导入时暂存原 File，供「替换导入」重跑；串行队列保证同时只有一个待决项
-  const duplicateFileRef = useRef<File | null>(null)
+  // 重复导入时暂存原始导入源（文件或 URL 列表），供「替换导入」重跑；
+  // 串行队列保证同时只有一个待决项，两种来源互斥，泛化成联合类型统一处理
+  const duplicatePendingRef = useRef<{ kind: 'file'; file: File } | { kind: 'url'; urls: string[] } | null>(null)
   const dragDepth = useRef(0)
 
   const [papers, setPapers] = useState<PaperRecord[]>([])
@@ -93,6 +131,13 @@ export default function PapersPage() {
   const [dragging, setDragging] = useState(false)
   const [syncMetas, setSyncMetas] = useState<Record<string, SyncMetaRow>>({})
   const [claimScan, setClaimScan] = useState<ClaimScanResult | null>(null)
+
+  // 「按 URL 导入」弹窗状态：running/progress/result 与弹窗开关是分开的——
+  // 关闭弹窗不取消后台任务，重新打开还能看到同一个任务的最新进度（见 UrlImportDialog 头注释）
+  const [urlDialogOpen, setUrlDialogOpen] = useState(false)
+  const [urlRunning, setUrlRunning] = useState(false)
+  const [urlProgress, setUrlProgress] = useState<UrlProgressEvent[]>([])
+  const [urlResult, setUrlResult] = useState<{ outcome: ImportOutcome } | null>(null)
 
   const { sortBy, filter, pendingDuplicate, confirmDeleteId, setSortBy, setFilter, setPendingDuplicate, setConfirmDeleteId } =
     usePaperUi()
@@ -202,7 +247,7 @@ export default function PapersPage() {
             depsFor(jobId),
           )
           if (outcome.kind === 'duplicate') {
-            duplicateFileRef.current = file
+            duplicatePendingRef.current = { kind: 'file', file }
             setPendingDuplicate({ existing: outcome.existing, fileName: file.name })
           } else if (outcome.kind === 'failed') {
             setNotice(`${file.name}：${outcome.failure.message}`)
@@ -215,6 +260,74 @@ export default function PapersPage() {
         })
     },
     [depsFor, refresh, setPendingDuplicate],
+  )
+
+  const runUrlImport = useCallback(
+    (urls: string[]) => {
+      const jobId = `url-${Date.now()}`
+      setJobs((prev) => [...prev, { id: jobId, name: `URL 导入（${urls.length} 个链接）`, stage: 'queued' }])
+      setUrlRunning(true)
+      setUrlResult(null)
+      setUrlProgress(urls.map((url, index) => ({ index, total: urls.length, url, phase: 'pending' })))
+      void queueRef.current
+        .enqueue(jobId, async () => {
+          // 抓取/抽取相关依赖只在真正发起 URL 导入时才拉取，不进论文库入口 chunk
+          const [{ importFromUrls }, { fetchUrl }, { extractFromFetchedHtml }] = await Promise.all([
+            import('../../lib/paper/url/urlImport'),
+            import('../../lib/paper/url/fetchUrlApi'),
+            import('../../lib/paper/url/extractArticle'),
+          ])
+          const outcome = await importFromUrls(
+            urls,
+            {
+              repo,
+              hash: sha256Hex,
+              parse: parseByFormat,
+              fetchUrl,
+              extract: extractFromFetchedHtml,
+              onState: (s) => {
+                setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, stage: s.stage } : j)))
+                void refresh()
+              },
+            },
+            (ev) => setUrlProgress((prev) => prev.map((p) => (p.index === ev.index ? ev : p))),
+          )
+
+          if (outcome.kind === 'duplicate') {
+            // 去重命中：关掉本弹窗，转交给页面既有的 pendingDuplicate 面板
+            duplicatePendingRef.current = { kind: 'url', urls }
+            setPendingDuplicate({ existing: outcome.existing, fileName: `URL 导入（${urls.length} 个链接）` })
+            setUrlDialogOpen(false)
+          } else if (outcome.kind === 'ready') {
+            const entries = outcome.paper.source?.entries ?? []
+            if (entries.every((e) => e.ok)) {
+              // 全部链接都成功：自动关闭弹窗 + 提示，不需要用户再确认一次
+              setUrlDialogOpen(false)
+              setNotice(`已导入「${outcome.paper.title}」`)
+            } else {
+              // 部分失败：弹窗停留展示「已导入 n/m 页，以下链接被跳过」（详情见弹窗），
+              // 同时也发一条 notice——用户可能在任务跑的时候已经关掉了弹窗，notice 是唯一还看得见的信号
+              const okCount = entries.filter((e) => e.ok).length
+              setUrlResult({ outcome })
+              setNotice(`已导入「${outcome.paper.title}」（${okCount}/${entries.length} 个链接成功，详情见「按 URL 导入」弹窗）`)
+            }
+          } else {
+            setUrlResult({ outcome })
+            setNotice(`URL 导入失败：${outcome.failure.message}`)
+          }
+        })
+        .catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : '导入失败'
+          setUrlResult({ outcome: { kind: 'failed', failure: { kind: 'unknown', message, at: Date.now() } } })
+          setNotice(`URL 导入失败：${message}`)
+        })
+        .finally(() => {
+          setJobs((prev) => prev.filter((j) => j.id !== jobId))
+          setUrlRunning(false)
+          void refresh()
+        })
+    },
+    [repo, refresh, setPendingDuplicate],
   )
 
   const handleFiles = useCallback(
@@ -271,11 +384,11 @@ export default function PapersPage() {
 
   const replaceDuplicate = useCallback(async () => {
     if (!(await useAuthStore.getState().requireLogin('upload'))) return
-    const file = duplicateFileRef.current
+    const pending = duplicatePendingRef.current
     const existing = pendingDuplicate?.existing
     setPendingDuplicate(null)
-    duplicateFileRef.current = null
-    if (!file || !existing) return
+    duplicatePendingRef.current = null
+    if (!pending || !existing) return
     try {
       await repo.deletePaper(existing.id)
     } catch (e) {
@@ -283,8 +396,9 @@ export default function PapersPage() {
       return
     }
     await refresh()
-    runImport(file)
-  }, [pendingDuplicate, repo, refresh, runImport, setPendingDuplicate])
+    if (pending.kind === 'file') runImport(pending.file)
+    else runUrlImport(pending.urls)
+  }, [pendingDuplicate, repo, refresh, runImport, runUrlImport, setPendingDuplicate])
 
   const visible = useMemo(() => {
     const filtered = papers.filter((p) => {
@@ -365,16 +479,34 @@ export default function PapersPage() {
         }`}
       >
         <p className="mb-1 font-medium text-fg">把 PDF / DOCX 拖到这里</p>
-        <p className="mb-4 text-xs text-dim">
+        <p className="mb-1 text-xs text-dim">
           单文件 ≤ {Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB · PDF ≤ {MAX_PDF_PAGES} 页 · 不支持 .doc 与扫描件（无文字层）
         </p>
-        <button
-          type="button"
-          onClick={() => inputRef.current?.click()}
-          className="rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/90"
-        >
-          选择文件
-        </button>
+        <p className="mb-4 text-xs text-dim">也可以按 URL 导入网页文章，多个链接会按顺序合并为一篇文档</p>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => inputRef.current?.click()}
+            className="rounded-lg bg-accent px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-accent/90"
+          >
+            选择文件
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              if (!(await useAuthStore.getState().requireLogin('upload'))) return
+              // 没有任务在跑时才清空上一轮的结果/进度，避免打断仍在后台执行的任务
+              if (!urlRunning) {
+                setUrlResult(null)
+                setUrlProgress([])
+              }
+              setUrlDialogOpen(true)
+            }}
+            className="rounded-lg border border-line bg-panel px-5 py-2 text-sm font-semibold text-fg transition-colors hover:bg-panel-2"
+          >
+            按 URL 导入
+          </button>
+        </div>
         <input
           ref={inputRef}
           type="file"
@@ -387,6 +519,25 @@ export default function PapersPage() {
           }}
         />
       </section>
+
+      {urlDialogOpen && (
+        <Suspense fallback={null}>
+          <UrlImportDialog
+            onClose={() => {
+              setUrlDialogOpen(false)
+              // 只在没有任务运行时清空——仍在后台跑的任务下次打开弹窗还要能看到当前进度
+              if (!urlRunning) {
+                setUrlResult(null)
+                setUrlProgress([])
+              }
+            }}
+            onSubmit={runUrlImport}
+            running={urlRunning}
+            progress={urlProgress}
+            result={urlResult}
+          />
+        </Suspense>
+      )}
 
       {notice && (
         <div className="flex items-start justify-between gap-4 rounded-xl border border-bad/40 bg-panel shadow-sm p-4">
@@ -409,7 +560,7 @@ export default function PapersPage() {
               onClick={() => {
                 const id = pendingDuplicate.existing.id
                 setPendingDuplicate(null)
-                duplicateFileRef.current = null
+                duplicatePendingRef.current = null
                 navigate(`/papers/${id}`)
               }}
               className="rounded-lg bg-accent px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-accent/90"
@@ -427,7 +578,7 @@ export default function PapersPage() {
               type="button"
               onClick={() => {
                 setPendingDuplicate(null)
-                duplicateFileRef.current = null
+                duplicatePendingRef.current = null
               }}
               className="rounded-lg border border-line bg-panel px-4 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2"
             >
@@ -505,7 +656,7 @@ export default function PapersPage() {
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="truncate font-semibold text-fg">{p.title}</h2>
                     <span className="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs text-dim uppercase">
-                      {p.format}
+                      {FORMAT_BADGE[p.format]}
                     </span>
                     <span
                       className={`shrink-0 text-xs font-medium ${
@@ -528,6 +679,9 @@ export default function PapersPage() {
                     })()}
                   </div>
                   <p className="mt-1 truncate text-xs text-dim">{p.fileName}</p>
+                  {p.format === 'html' && p.source && (
+                    <p className="mt-1 truncate text-xs text-dim">{summarizeSourceDomains(p.source.entries)}</p>
+                  )}
                   <p className="mt-1 text-xs text-dim">
                     {fmtSize(p.byteSize)}
                     {p.pageCount ? ` · ${p.pageCount} 页` : ''}
