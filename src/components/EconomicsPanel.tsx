@@ -27,14 +27,22 @@ const DEFAULT_PRICE_ROW = USD_PRICING.find((p) => p.provider === 'DeepSeek') ?? 
 const DEFAULT_PRICE_KEY = DEFAULT_PRICE_ROW ? `${DEFAULT_PRICE_ROW.provider}|${DEFAULT_PRICE_ROW.modelId}` : ''
 
 export default function EconomicsPanel() {
-  // 缓存命中率与 /inference 其他面板共享（src/store.ts useInferenceParams）；其余为本面板专属
-  const { cacheRate, setCacheRate } = useInferenceParams()
+  // 自建参数与 KPI/Sizing 共享；这里的 utilization 是成本模型有效利用率，不是 GPU 遥测利用率。
+  const {
+    cacheRate,
+    gpuId,
+    gpuCount,
+    systemTps: tps,
+    utilization,
+    hourlyCost: clusterHourly,
+    setCacheRate,
+    setGpuId,
+    setGpuCount,
+    setSystemTps,
+    setUtilization,
+    setHourlyCost,
+  } = useInferenceParams()
   const [priceKey, setPriceKey] = useState(DEFAULT_PRICE_KEY)
-  const [gpuId, setGpuId] = useState('h100')
-  const [gpuCount, setGpuCount] = useState(8)
-  const [hourlyText, setHourlyText] = useState('')
-  const [tps, setTps] = useState(5000)
-  const [utilization, setUtilization] = useState(0.4)
   const [outputShare, setOutputShare] = useState(0.15)
   const [openCase, setOpenCase] = useState<string | null>(null)
 
@@ -42,10 +50,7 @@ export default function EconomicsPanel() {
   const price = USD_PRICING.find((p) => `${p.provider}|${p.modelId}` === priceKey) ?? USD_PRICING[0]
   const gpu = GPUS.find((g) => g.id === gpuId)!
   const cloud = CLOUD_PRICES.find((c) => c.gpuId === gpuId)
-  // 输入框存原始文本（可自由清空/中间态），计算时解析：空/非法回落云价参考，下限 0.1 防 $0 成本
-  const parsedHourly = Number.parseFloat(hourlyText)
-  const hourlyPerGpu = Number.isFinite(parsedHourly) ? Math.max(0.1, parsedHourly) : (cloud?.typicalUSD ?? 3.5)
-  const clusterHourly = hourlyPerGpu * gpuCount
+  const hourlyPerGpu = clusterHourly / Math.max(1, gpuCount)
 
   const r = useMemo(() => {
     const apiPerMTok = apiBlendedPerMTok(
@@ -119,7 +124,16 @@ export default function EconomicsPanel() {
         </label>
         <label className="block text-xs text-dim">
           自建 GPU
-          <select value={gpuId} onChange={(e) => { setGpuId(e.target.value); setHourlyText('') }} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
+          <select
+            value={gpuId}
+            onChange={(e) => {
+              const nextId = e.target.value
+              const nextCloud = CLOUD_PRICES.find((c) => c.gpuId === nextId)
+              setGpuId(nextId)
+              if (nextCloud) setHourlyCost(nextCloud.typicalUSD * gpuCount)
+            }}
+            className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg"
+          >
             {GPUS.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}
@@ -129,18 +143,29 @@ export default function EconomicsPanel() {
         </label>
         <label className="block text-xs text-dim">
           卡数：{gpuCount}
-          <input type="range" min={1} max={72} value={gpuCount} onChange={(e) => setGpuCount(+e.target.value)} className="mt-2 w-full" />
+          <input
+            type="range"
+            min={1}
+            max={72}
+            value={gpuCount}
+            onChange={(e) => {
+              const next = Number(e.target.value)
+              setGpuCount(next)
+              setHourlyCost(hourlyPerGpu * next)
+            }}
+            className="mt-2 w-full"
+          />
         </label>
         <label className="block text-xs text-dim">
-          时租 $/卡/时（按 {hourlyPerGpu.toFixed(2)} 计）
-          <input type="number" step={0.1} min={0.1} value={hourlyText} placeholder={String(cloud?.typicalUSD ?? 3.5)} onChange={(e) => setHourlyText(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg" />
+          集群成本 $/h（{hourlyPerGpu.toFixed(2)}/卡）
+          <input type="number" step={0.1} min={0} value={clusterHourly} onChange={(e) => setHourlyCost(Number(e.target.value))} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg" />
         </label>
         <label className="block text-xs text-dim">
-          集群吞吐 tok/s
-          <input type="number" step={500} value={tps} onChange={(e) => setTps(Math.max(1, +e.target.value))} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg" />
+          系统输出 TPS（tok/s）
+          <input type="number" step={500} value={tps} onChange={(e) => setSystemTps(Number(e.target.value))} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg" />
         </label>
         <label className="block text-xs text-dim">
-          利用率：{Math.round(utilization * 100)}%
+          成本模型利用率：{Math.round(utilization * 100)}%
           <input type="range" min={5} max={95} value={utilization * 100} onChange={(e) => setUtilization(+e.target.value / 100)} className="mt-2 w-full" />
         </label>
         <label className="block text-xs text-dim">

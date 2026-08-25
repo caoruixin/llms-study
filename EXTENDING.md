@@ -11,6 +11,8 @@
 | 新增注意力机制 | `src/data/types.ts` 的 `AttentionType` + `src/data/attention.ts` | union 字面量 + `AttentionStage` | 否 |
 | 新增 GPU / 机架 | `src/data/hardware.ts` | `GpuChip` / `RackSystem`（分层实体，禁跨层对比） | 否 |
 | 新增推理引擎/算子/组件 | `src/data/stack.ts` 对应层的 `components` | `StackComponent`（what + interview 两段） | 否 |
+| 新增推理架构图/组件 | `src/data/archAtlas.ts` | `ArchDiagram` / `ArchComponentDef`（组件全局注册一次，图内只声明放置；含数字的 benefit 必带 `sourceIdx`） | 否 |
+| 新增推理 KPI / 诊断规则 | `src/data/inferenceKpis.ts` + `src/lib/kpiEngine.ts` | `KpiDefinition` / 纯函数；必须区分 target / estimated / measured | 否 |
 | 新增生命周期阶段 | `src/components/LifecycleSim.tsx` 的 `STAGES` | — | 是（该数组就在组件内） |
 | 新增模拟公式 | `src/lib/simEngine.ts` + `simEngine.test.ts` | 纯函数 + 必配已知算例单测 | 否 |
 | 新增 KDA 推导步骤 / 演示场景 | `src/data/kda.ts` 的 `KDA_DERIV_STEPS`（场景数值改 `src/lib/kdaEngine.ts` 的 `DEFAULT_SCENARIO`） | `DerivStep`（`body` 必须是 `(step, fmt) => string` 取数函数，**禁写死数字**）+ `ScenarioSpec` | 否（四个 tab 组件全部按 `views` 声明渲染） |
@@ -18,6 +20,13 @@
 | 新增 ROI/POC 案例 | `src/data/cases.ts` | `WorkedCase` | 否 |
 | 新增 API 价格行 | `src/data/pricing.ts` | `PriceRow`（sourceUrl+asOf 必填） | 否 |
 | 新增评分 Provider | `src/store.ts` 的 `PROVIDERS` + `vite.config.ts` 的 `routes` + `.env.example` | `ProviderPreset` + 代理 allowlist | 否 |
+
+> 架构图谱的 `variantNote` 琥珀语义：它是对比模式里**唯一**参与「调整（琥珀）」判定的字段——
+> 两图同一组件的 `norm(variantNote)`（trim、缺省归空串）不相等即亮琥珀。因此只在组件**职责/形态有实质差异**时写（≤40 字），
+> 数量/规格差异写 `badge`（不参与 diff），图内风味补充写 `detail`（不参与 diff）。措辞漂移会造成琥珀误报，不确定就不写。
+
+> AIPerf 导入的口径约束：`unit` 以 artifact 内容为准；系统输出 TPS、单用户 tok/s、RPS 与 Goodput 是四个不同指标。
+> Goodput 只接受 AIPerf 已按逐请求 SLO 计算的值，禁止用多个 p95 汇总值二次伪造。
 
 ## 演练 ①：新增一个模型（例：Qwen4 发布了）
 

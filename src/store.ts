@@ -75,22 +75,56 @@ export const useSettings = create<SettingsState>()(
   ),
 )
 
-// /inference 三个面板（生命周期模拟 / 显存计算器 / Token 经济）共享的推理参数：
-// 同一份 模型/GPU/量化/batch/缓存命中率，切 tab 结论不打架；会话内共享、不持久化。
-// 面板专属参数（上下文长度、价目、时租、利用率等）仍留在各组件本地。
+// /inference 全部面板共享的场景参数：切 tab 后模型、负载、SLO、Sizing 与成本口径不打架。
+// 只在当前浏览器会话内保存，不持久化；客户 benchmark 信息不落 localStorage/IndexedDB。
 export type QuantId = 'fp16' | 'fp8' | 'int4'
 
-interface InferenceParamsState {
+export interface InferenceSlo {
+  ttftMs: number | null
+  tpotMs: number | null
+  e2eMs: number | null
+  attainment: number // 0~1，默认 95%
+}
+
+export interface InferenceParamsState {
   modelId: string
   gpuId: string
   quantId: QuantId
   batch: number
   cacheRate: number // 前缀缓存命中率 0~0.95
+  inputTokens: number
+  outputTokens: number
+  peakRps: number
+  concurrency: number
+  slo: InferenceSlo
+  headroom: number // 容量余量 0~1
+  spareUnits: number // N+1 默认 1
+  gpusPerCapacityUnit: number
+  gpusPerServer: number | null // 不隐藏猜拓扑；用户未给则 server/rack 结果 N/A
+  serversPerRack: number | null
+  gpuCount: number
+  systemTps: number
+  utilization: number // 成本模型的有效利用率，不等于 GPU utilization 遥测
+  hourlyCost: number // 当前容量单元的集群 $/h
   setModelId: (modelId: string) => void
   setGpuId: (gpuId: string) => void
   setQuantId: (quantId: QuantId) => void
   setBatch: (batch: number) => void
   setCacheRate: (cacheRate: number) => void
+  setInputTokens: (inputTokens: number) => void
+  setOutputTokens: (outputTokens: number) => void
+  setPeakRps: (peakRps: number) => void
+  setConcurrency: (concurrency: number) => void
+  setSlo: (slo: Partial<InferenceSlo>) => void
+  setHeadroom: (headroom: number) => void
+  setSpareUnits: (spareUnits: number) => void
+  setGpusPerCapacityUnit: (gpusPerCapacityUnit: number) => void
+  setGpusPerServer: (gpusPerServer: number | null) => void
+  setServersPerRack: (serversPerRack: number | null) => void
+  setGpuCount: (gpuCount: number) => void
+  setSystemTps: (systemTps: number) => void
+  setUtilization: (utilization: number) => void
+  setHourlyCost: (hourlyCost: number) => void
 }
 
 export const useInferenceParams = create<InferenceParamsState>()((set) => ({
@@ -99,12 +133,74 @@ export const useInferenceParams = create<InferenceParamsState>()((set) => ({
   quantId: 'fp8',
   batch: 16,
   cacheRate: 0.7,
+  inputTokens: 16_000,
+  outputTokens: 512,
+  peakRps: 20,
+  concurrency: 32,
+  slo: { ttftMs: null, tpotMs: null, e2eMs: null, attainment: 0.95 },
+  headroom: 0.2,
+  spareUnits: 1,
+  gpusPerCapacityUnit: 8,
+  gpusPerServer: null,
+  serversPerRack: null,
+  gpuCount: 8,
+  systemTps: 5000,
+  utilization: 0.4,
+  hourlyCost: 27.2,
   setModelId: (modelId) => set({ modelId }),
   setGpuId: (gpuId) => set({ gpuId }),
   setQuantId: (quantId) => set({ quantId }),
-  setBatch: (batch) => set({ batch }),
-  setCacheRate: (cacheRate) => set({ cacheRate }),
+  setBatch: (batch) => set({ batch: Math.max(1, Math.round(batch)) }),
+  setCacheRate: (cacheRate) => set({ cacheRate: Math.min(0.95, Math.max(0, cacheRate)) }),
+  setInputTokens: (inputTokens) => set({ inputTokens: Math.max(1, Math.round(inputTokens)) }),
+  setOutputTokens: (outputTokens) => set({ outputTokens: Math.max(1, Math.round(outputTokens)) }),
+  setPeakRps: (peakRps) => set({ peakRps: Math.max(0, peakRps) }),
+  setConcurrency: (concurrency) => set({ concurrency: Math.max(1, Math.round(concurrency)) }),
+  setSlo: (next) =>
+    set((state) => ({
+      slo: {
+        ...state.slo,
+        ...next,
+        ttftMs:
+          next.ttftMs === undefined
+            ? state.slo.ttftMs
+            : next.ttftMs === null
+              ? null
+              : Math.max(0, next.ttftMs),
+        tpotMs:
+          next.tpotMs === undefined
+            ? state.slo.tpotMs
+            : next.tpotMs === null
+              ? null
+              : Math.max(0, next.tpotMs),
+        e2eMs:
+          next.e2eMs === undefined
+            ? state.slo.e2eMs
+            : next.e2eMs === null
+              ? null
+              : Math.max(0, next.e2eMs),
+        attainment:
+          next.attainment === undefined
+            ? state.slo.attainment
+            : Math.min(1, Math.max(0, next.attainment)),
+      },
+    })),
+  setHeadroom: (headroom) => set({ headroom: Math.min(1, Math.max(0, headroom)) }),
+  setSpareUnits: (spareUnits) => set({ spareUnits: Math.max(0, Math.round(spareUnits)) }),
+  setGpusPerCapacityUnit: (gpusPerCapacityUnit) =>
+    set({ gpusPerCapacityUnit: Math.max(1, Math.round(gpusPerCapacityUnit)) }),
+  setGpusPerServer: (gpusPerServer) =>
+    set({ gpusPerServer: gpusPerServer === null ? null : Math.max(1, Math.round(gpusPerServer)) }),
+  setServersPerRack: (serversPerRack) =>
+    set({ serversPerRack: serversPerRack === null ? null : Math.max(1, Math.round(serversPerRack)) }),
+  setGpuCount: (gpuCount) => set({ gpuCount: Math.max(1, Math.round(gpuCount)) }),
+  setSystemTps: (systemTps) => set({ systemTps: Math.max(1, systemTps) }),
+  setUtilization: (utilization) => set({ utilization: Math.min(0.99, Math.max(0.01, utilization)) }),
+  setHourlyCost: (hourlyCost) => set({ hourlyCost: Math.max(0, hourlyCost) }),
 }))
+
+// 新名称表达「场景」含义；保留 useInferenceParams 供现有面板与架构图谱无缝兼容。
+export const useInferenceScenario = useInferenceParams
 
 interface HistoryState {
   attempts: AttemptRecord[]

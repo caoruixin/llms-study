@@ -9,6 +9,7 @@ server/data.*/
 *.log
 .DS_Store
 .specstory/
+.firecrawl/
 
 # codex E2E 验收产物(报告/截图/脚本),不入库
 .e2e-codex/

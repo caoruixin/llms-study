@@ -35,11 +35,25 @@ const MOCK_OUTPUT =
 
 export default function LifecycleSim() {
   // 模型/GPU/量化/batch/缓存命中率与 /inference 其他面板共享（src/store.ts useInferenceParams）
-  const { modelId, gpuId, quantId, batch, cacheRate, setModelId, setGpuId, setQuantId, setBatch, setCacheRate } =
-    useInferenceParams()
+  const {
+    modelId,
+    gpuId,
+    quantId,
+    batch,
+    cacheRate,
+    inputTokens,
+    outputTokens,
+    setModelId,
+    setGpuId,
+    setQuantId,
+    setBatch,
+    setCacheRate,
+    setInputTokens,
+    setOutputTokens,
+    setSystemTps,
+  } = useInferenceParams()
   const [priceKey, setPriceKey] = useState('DeepSeek|deepseek-v4-pro')
   const [prompt, setPrompt] = useState('你是资深售前顾问。请解释为什么长上下文会显著推高推理成本，并给出三个可落地的优化手段。')
-  const [tokenOverride, setTokenOverride] = useState<number | null>(null)
 
   const [stageIdx, setStageIdx] = useState(-1) // -1 未开始
   const [outTokens, setOutTokens] = useState<string[]>([])
@@ -53,7 +67,6 @@ export default function LifecycleSim() {
   const quant = QUANTS.find((q) => q.id === quantId)!
   const price = PRICING.find((p) => `${p.provider}|${p.modelId}` === priceKey)!
 
-  const inputTokens = tokenOverride ?? estimateTokens(prompt)
   const cacheHitTokens = Math.round(inputTokens * cacheRate)
 
   const calc = useMemo(() => {
@@ -71,11 +84,11 @@ export default function LifecycleSim() {
       gpus,
     )
     const tps = tokensPerSecond(stepMs, batch)
-    const outN = Math.round(MOCK_OUTPUT.length / 1.6)
+    const outN = outputTokens
     const cost = apiRequestCost(inputTokens, outN, cacheHitTokens, price.inputPerMTok ?? 0, price.outputPerMTok ?? 0, price.cachedInputPerMTok)
     const costNoCache = apiRequestCost(inputTokens, outN, 0, price.inputPerMTok ?? 0, price.outputPerMTok ?? 0, price.cachedInputPerMTok)
     return { bd, gpus, ttft, stepMs, tps, outN, cost, costNoCache }
-  }, [model, gpu, quant, batch, inputTokens, cacheHitTokens, price])
+  }, [model, gpu, quant, batch, inputTokens, outputTokens, cacheHitTokens, price])
 
   function clearTimers() {
     timerRef.current.forEach(clearTimeout)
@@ -83,6 +96,7 @@ export default function LifecycleSim() {
   }
 
   useEffect(() => clearTimers, [])
+  useEffect(() => setSystemTps(calc.tps), [calc.tps, setSystemTps])
 
   function run() {
     clearTimers()
@@ -187,14 +201,32 @@ export default function LifecycleSim() {
         <div className="flex flex-wrap items-end gap-3">
           <label className="block basis-full sm:basis-auto sm:min-w-64 flex-1 text-xs text-dim">
             用户 Prompt（模拟，不调真实模型）
-            <textarea value={prompt} onChange={(e) => { setPrompt(e.target.value); setTokenOverride(null) }} rows={2} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-3 py-2 text-sm text-fg" />
+            <textarea
+              value={prompt}
+              onChange={(e) => {
+                setPrompt(e.target.value)
+                setInputTokens(estimateTokens(e.target.value))
+              }}
+              rows={2}
+              className="mt-1 w-full rounded-md border border-line bg-panel-2 px-3 py-2 text-sm text-fg"
+            />
           </label>
           <label className="block text-xs text-dim">
             输入 token（估算，可改）
             <input
               type="number"
               value={inputTokens}
-              onChange={(e) => setTokenOverride(Math.max(1, +e.target.value))}
+              onChange={(e) => setInputTokens(Number(e.target.value))}
+              className="mt-1 w-28 rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg"
+            />
+          </label>
+          <label className="block text-xs text-dim">
+            目标输出 token
+            <input
+              type="number"
+              min={1}
+              value={outputTokens}
+              onChange={(e) => setOutputTokens(Number(e.target.value))}
               className="mt-1 w-28 rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg"
             />
           </label>

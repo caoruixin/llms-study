@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 import { MODELS } from '../data/models'
 import { GPUS, RACKS } from '../data/hardware'
 import {
@@ -13,17 +13,30 @@ import {
 } from '../lib/simEngine'
 import { useInferenceParams, type QuantId } from '../store'
 
-const CTX_STEPS = [4, 8, 16, 32, 64, 128, 256, 512, 1000] // K tokens
-
 export default function MemoryCalculator() {
-  // 模型/GPU/量化/batch 与 /inference 其他面板共享（src/store.ts useInferenceParams）；上下文长度为本面板专属
-  const { modelId, gpuId, quantId, batch, setModelId, setGpuId, setQuantId, setBatch } = useInferenceParams()
-  const [ctxIdx, setCtxIdx] = useState(2) // 16K
+  // 上下文长度也进入统一场景：KPI 工作台、显存墙和生命周期始终用同一口径。
+  const {
+    modelId,
+    gpuId,
+    quantId,
+    batch,
+    inputTokens,
+    outputTokens,
+    setModelId,
+    setGpuId,
+    setQuantId,
+    setBatch,
+    setInputTokens,
+    setOutputTokens,
+    setSystemTps,
+  } = useInferenceParams()
 
   const model = MODELS.find((m) => m.id === modelId)!
   const gpu = GPUS.find((g) => g.id === gpuId)!
   const quant = QUANTS.find((q) => q.id === quantId)!
-  const contextTokens = CTX_STEPS[ctxIdx] * 1000
+  // KV 容量覆盖 prefill 后的整段序列；TTFT 则只与输入 prefill 长度相关。
+  const contextTokens = inputTokens + outputTokens
+  const contextLabel = contextTokens >= 1_000_000 ? `${(contextTokens / 1_000_000).toFixed(1)}M` : `${(contextTokens / 1000).toFixed(contextTokens % 1000 ? 1 : 0)}K`
 
   const r = useMemo(() => {
     const bd = memoryBreakdown(model.totalParamsB, quant.bytesPerParam, model.kvSpec, contextTokens, batch)
@@ -33,7 +46,7 @@ export default function MemoryCalculator() {
     const gpus = minGpus(baseGB, gpu.memoryGB)
     // 量化对应算力口径：仅 INT4/FP4 且该卡有官方 FP4 值时切换，否则回退 FP8 并在下方标注
     const cap = tflopsForQuant(gpu, quant.id)
-    const ttft = estTTFTms(model.activeParamsB, contextTokens, cap.tflops, gpus)
+    const ttft = estTTFTms(model.activeParamsB, inputTokens, cap.tflops, gpus)
     const stepMs = estStepMs(
       model.activeParamsB,
       quant.bytesPerParam,
@@ -44,7 +57,9 @@ export default function MemoryCalculator() {
       gpus,
     )
     return { bd, unsupported, baseGB, gpus, ttft, ttftBasis: cap.basis, stepMs, tps: tokensPerSecond(stepMs, batch) }
-  }, [model, gpu, quant, contextTokens, batch])
+  }, [model, gpu, quant, inputTokens, contextTokens, batch])
+
+  useEffect(() => setSystemTps(r.tps), [r.tps, setSystemTps])
 
   // 分段先给 2% 可见性下限，再整体归一化——三段之和恒为 100%，不会溢出
   const segs = (defs: { gb: number; color: string; label: string }[]) => {
@@ -64,7 +79,7 @@ export default function MemoryCalculator() {
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5">
+      <div className="grid gap-3 rounded-xl border border-line bg-panel shadow-sm p-4 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
         <label className="block text-xs text-dim">
           模型
           <select value={modelId} onChange={(e) => setModelId(e.target.value)} className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg">
@@ -96,8 +111,29 @@ export default function MemoryCalculator() {
           </select>
         </label>
         <label className="block text-xs text-dim">
-          上下文：{CTX_STEPS[ctxIdx] >= 1000 ? '1M' : `${CTX_STEPS[ctxIdx]}K`}
-          <input type="range" min={0} max={CTX_STEPS.length - 1} value={ctxIdx} onChange={(e) => setCtxIdx(+e.target.value)} className="mt-2 w-full" />
+          输入长度 ISL
+          <input
+            type="number"
+            min={1}
+            max={1_000_000}
+            step={1000}
+            value={inputTokens}
+            onChange={(e) => setInputTokens(Number(e.target.value))}
+            className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg"
+          />
+        </label>
+        <label className="block text-xs text-dim">
+          输出长度 OSL
+          <input
+            type="number"
+            min={1}
+            max={1_000_000}
+            step={100}
+            value={outputTokens}
+            onChange={(e) => setOutputTokens(Number(e.target.value))}
+            className="mt-1 w-full rounded-md border border-line bg-panel-2 px-2 py-1.5 text-sm text-fg"
+          />
+          <span className="mt-1 block text-[10px]">总 KV 序列 {contextLabel}</span>
         </label>
         <label className="block text-xs text-dim">
           并发 batch：{batch}
@@ -143,7 +179,7 @@ export default function MemoryCalculator() {
 
       <div className="grid gap-3 md:grid-cols-3">
         <div className="rounded-xl border border-line bg-panel shadow-sm p-4">
-          <div className="text-xs text-dim">TTFT（prefill {CTX_STEPS[ctxIdx] >= 1000 ? '1M' : `${CTX_STEPS[ctxIdx]}K`} tokens）</div>
+          <div className="text-xs text-dim">TTFT（prefill {(inputTokens / 1000).toLocaleString()}K tokens）</div>
           <div className="mt-1 font-mono text-2xl font-bold">
             {r.ttft === null ? 'N/A' : r.ttft >= 1000 ? `${(r.ttft / 1000).toFixed(1)}s` : `${r.ttft.toFixed(0)}ms`}
           </div>
