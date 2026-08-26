@@ -1,4 +1,5 @@
 import type { NormalizedBenchmarkRun, NormalizedMetric, SweepPoint } from '../../lib/aiperfImport'
+import { findSaturationPair, type SweepDiagnosticPoint } from '../../lib/kpiEngine'
 
 export type MetricRecord = Record<string, NormalizedMetric>
 
@@ -6,6 +7,8 @@ const simplify = (value: string) => value.toLowerCase().replace(/[^a-z0-9\u4e00-
 
 export const METRIC_ALIASES = {
   systemTps: ['outputtokenthroughput', 'outputthroughput', 'systemoutputtps', 'tokenstps', 'tokenspersecond'],
+  perUserTps: ['outputtokenthroughputperuser'],
+  osl: ['outputsequencelength'],
   rps: ['requestthroughput', 'requestpersecond', 'requestspersecond', 'requesttps'],
   goodput: ['goodput', 'goodputrps'],
   goodFraction: ['goodrequestfraction', 'goodrequestpercentage', 'sloattainmentrate'],
@@ -14,25 +17,133 @@ export const METRIC_ALIASES = {
   e2e: ['requestlatency', 'endtoendlatency', 'e2elatency', 'e2e'],
   gpuUtil: ['gpuutilization', 'gpuutil'],
   memoryUtil: ['gpumemoryutilization', 'gpumemoryusage', 'memoryutilization', 'hbmutilization'],
-  kvUtil: ['kvcacheutilization', 'kvcacheusage', 'gpucacheusageperc', 'gpucacheusage'],
+  kvUtil: ['kvcacheutilization', 'kvcacheusage', 'gpucacheusageperc', 'gpucacheusage', 'sglangtokenusage'],
   cacheHit: ['prefixcachehitrate', 'prefixcachehit', 'cachehitrate', 'cachehit'],
   queue: ['queuedrequests', 'queuedrequest', 'queuetime', 'queuesize', 'numrequestswaiting'],
   queueTime: ['queuetime', 'requestqueuetime', 'waitingtime'],
-  queueDepth: ['queuedrequests', 'queuedrequest', 'queuesize', 'numrequestswaiting', 'waitingrequests'],
-  preemption: ['preemptionrate', 'preemptionspersecond', 'numrequestspreempted'],
+  queueDepth: ['queuedrequests', 'queuedrequest', 'queuesize', 'numrequestswaiting', 'waitingrequests', 'sglangnumqueuereqs'],
+  preemption: ['preemptionrate', 'preemptionspersecond', 'numrequestspreempted', 'numpreemptions'],
 } as const
 
 export type MetricAlias = keyof typeof METRIC_ALIASES
 
+export type MetricStatisticKey = 'mean' | 'p50' | 'p90' | 'p95' | 'p99' | 'min' | 'max' | 'value' | 'rate' | 'sum'
+
+interface MetricMatch {
+  key: string
+  metric: NormalizedMetric
+  encodedStatistic: MetricStatisticKey | null
+}
+
+const STATISTIC_SUFFIX = /(p50|p90|p95|p99)(?:estimate)?$|(avg|mean)$/
+
+function statisticEncodedBy(key: string, metric: NormalizedMetric): MetricStatisticKey | null {
+  for (const identity of [key, metric.name]) {
+    const match = simplify(identity).match(STATISTIC_SUFFIX)
+    if (!match) continue
+    if (match[1]) return match[1] as MetricStatisticKey
+    if (match[2]) return 'mean'
+  }
+  return null
+}
+
+function matchesAlias(key: string, metric: NormalizedMetric, alias: MetricAlias): boolean {
+  const haystack = `${simplify(key)}${simplify(metric.name)}`
+  // system TPS 只允许系统聚合输出吞吐；per-user 与 e2e per-user 两个 AIPerf 指标均不能靠子串混入。
+  if (alias === 'systemTps' && (haystack.includes('peruser') || haystack.includes('e2eoutputtokenthroughput'))) {
+    return false
+  }
+  return METRIC_ALIASES[alias].some((candidate) => haystack.includes(candidate))
+}
+
+function matchingMetrics(metrics: MetricRecord | undefined, alias: MetricAlias): MetricMatch[] {
+  if (!metrics) return []
+  return Object.entries(metrics)
+    .filter(([key, metric]) => matchesAlias(key, metric, alias))
+    .map(([key, metric]) => ({ key, metric, encodedStatistic: statisticEncodedBy(key, metric) }))
+}
+
+/** Returns every matching source series so diagnostics can aggregate across GPUs/endpoints. */
+export function findMetrics(metrics: MetricRecord | undefined, alias: MetricAlias): NormalizedMetric[] {
+  return matchingMetrics(metrics, alias).map((match) => match.metric)
+}
+
+function directStatistic(metric: NormalizedMetric, statistic: MetricStatisticKey): number | null {
+  const keys = statistic === 'mean'
+    ? ['mean', 'avg']
+    : statistic.startsWith('p')
+      ? [statistic, statistic.toUpperCase(), statistic.slice(1), `${statistic}_estimate`]
+      : [statistic]
+  for (const key of keys) {
+    if (Number.isFinite(metric.stats[key])) return metric.stats[key]
+  }
+  return null
+}
+
+function encodedMetricValue(match: MetricMatch, statistic: MetricStatisticKey): number | null {
+  const direct = directStatistic(match.metric, statistic)
+  if (direct !== null) return direct
+  if (match.encodedStatistic !== statistic) return null
+  // 分列 aggregate 的 *_p95 / *_p99 本身是一条跨 trial 汇总指标，数值通常放在 mean；
+  // 白名单之外的统计量（std/min 等）不是"该指标的值"，取不到就返回 null 走 N/A 通路。
+  for (const key of ['mean', 'avg', 'value', 'rate']) {
+    if (Number.isFinite(match.metric.stats[key])) return match.metric.stats[key]
+  }
+  return null
+}
+
+export interface MetricStatisticSelection {
+  metric: NormalizedMetric
+  value: number
+}
+
+/**
+ * 按 alias + statistic 选择原始指标并取值。显式 *_p95/_p99 分列优先于 avg，
+ * 其次才读指标内嵌的 p95/p99(_estimate)；不存在时返回 null，不让均值冒充百分位。
+ */
+export function selectMetricStatistic(
+  metrics: MetricRecord | undefined,
+  alias: MetricAlias,
+  statistic: MetricStatisticKey = 'mean',
+): MetricStatisticSelection | null {
+  const matches = matchingMetrics(metrics, alias)
+  const encoded = matches.find((match) => match.encodedStatistic === statistic && encodedMetricValue(match, statistic) !== null)
+  if (encoded) return { metric: encoded.metric, value: encodedMetricValue(encoded, statistic)! }
+
+  const embedded = matches.find((match) =>
+    (statistic !== 'mean' || match.encodedStatistic === null || match.encodedStatistic === 'mean') &&
+    directStatistic(match.metric, statistic) !== null,
+  )
+  if (embedded) return { metric: embedded.metric, value: directStatistic(embedded.metric, statistic)! }
+  return null
+}
+
+/** 只取 alias + statistic 的数值；调用方需要 unit 时使用 selectMetricStatistic。 */
+export function metricStatisticValue(
+  metrics: MetricRecord | undefined,
+  alias: MetricAlias,
+  statistic: MetricStatisticKey = 'mean',
+): number | null {
+  return selectMetricStatistic(metrics, alias, statistic)?.value ?? null
+}
+
 export function findMetric(metrics: MetricRecord | undefined, alias: MetricAlias): NormalizedMetric | undefined {
-  if (!metrics) return undefined
-  const candidates = METRIC_ALIASES[alias]
-  return Object.entries(metrics).find(([key, metric]) => {
-    const haystack = `${simplify(key)}${simplify(metric.name)}`
-    // AIPerf 的 output_token_throughput_per_user 是单用户速度，绝不能因子串匹配被当成系统 TPS。
-    if (alias === 'systemTps' && haystack.includes('peruser')) return false
-    return candidates.some((candidate) => haystack.includes(candidate))
-  })?.[1]
+  const matches = matchingMetrics(metrics, alias)
+  if (matches.length === 0) return undefined
+  if (matches.length === 1) return matches[0].metric
+
+  // 优先以未分列指标为展示基底，其次 avg/mean；百分位分列只补对应 stats，不能覆盖 mean。
+  const preferred = matches.find((match) => match.encodedStatistic === null && match.metric.available !== false && match.metric.unit.trim())
+    ?? matches.find((match) => match.encodedStatistic === 'mean' && match.metric.available !== false && match.metric.unit.trim())
+    ?? matches.find((match) => match.encodedStatistic === null)
+    ?? matches.find((match) => match.encodedStatistic === 'mean')
+    ?? matches[0]
+  const stats = { ...preferred.metric.stats }
+  for (const statistic of ['mean', 'p50', 'p90', 'p95', 'p99'] as const) {
+    const selected = selectMetricStatistic(metrics, alias, statistic)
+    if (selected) stats[statistic] = selected.value
+  }
+  return { ...preferred.metric, stats }
 }
 
 export function metricValue(metric: NormalizedMetric | undefined, statistic = 'mean'): number | null {
@@ -42,8 +153,8 @@ export function metricValue(metric: NormalizedMetric | undefined, statistic = 'm
   for (const key of preferred) {
     if (key && Number.isFinite(stats[key])) return stats[key]
   }
-  const first = Object.values(stats).find(Number.isFinite)
-  return first ?? null
+  // 不做任意 stat 兜底：只剩 std/min 之类时它们不能冒充均值，返回 null 走 N/A 通路。
+  return null
 }
 
 export function percentileValue(metric: NormalizedMetric | undefined, percentile: 'p95' | 'p99'): number | null {
@@ -113,6 +224,31 @@ export function latencyPercentileMs(
   return null
 }
 
+function latencyValueMs(value: number, unit: string): number | null {
+  const normalized = compactUnit(unit)
+  if (/^(?:ms|millisecond|milliseconds)(?:\/|$)/.test(normalized)) return value
+  if (/^(?:us|µs|microsecond|microseconds)(?:\/|$)/.test(normalized)) return value / 1000
+  if (/^(?:ns|nanosecond|nanoseconds)(?:\/|$)/.test(normalized)) return value / 1_000_000
+  if (/^(?:s|sec|second|seconds)(?:\/|$)/.test(normalized)) return value * 1000
+  return null
+}
+
+/** 给 Little's Law 等公式使用：按 alias 选择 mean，并严格按 artifact unit 归一为 ms。 */
+export function meanLatencyMs(metrics: MetricRecord | undefined, alias: MetricAlias): number | null {
+  const selection = selectMetricStatistic(metrics, alias, 'mean')
+  return selection ? latencyValueMs(selection.value, selection.metric.unit) : null
+}
+
+/** Selects the percentile together with its own source unit before converting to ms. */
+export function latencyStatisticMs(
+  metrics: MetricRecord | undefined,
+  alias: MetricAlias,
+  statistic: 'p95' | 'p99',
+): number | null {
+  const selection = selectMetricStatistic(metrics, alias, statistic)
+  return selection ? latencyValueMs(selection.value, selection.metric.unit) : null
+}
+
 export function metricUnit(metric: NormalizedMetric | undefined, fallback = ''): string {
   return metric?.unit || fallback
 }
@@ -126,16 +262,29 @@ export function formatMetric(value: number | null | undefined, unit = '', digits
   return `${shown}${unit ? ` ${unit}` : ''}`
 }
 
-const coordinateValue = (point: SweepPoint): { value: number; label: string } => {
-  const entries = Object.entries(point.coordinates)
-  const preferred = entries.find(([key, value]) =>
-    typeof value === 'number' && /concurr|request.?rate|rps|clients?|batch/i.test(key),
-  )
-  const numeric = preferred ?? entries.find(([, value]) => typeof value === 'number')
-  return {
-    value: typeof numeric?.[1] === 'number' ? numeric[1] : (point.variationIndex ?? 0),
-    label: numeric?.[0] ?? 'variation',
+function sharedSweepAxis(points: readonly SweepPoint[]): string | null {
+  if (points.length === 0) return null
+  const keys = new Set(points.flatMap((point) => Object.keys(point.coordinates)))
+  const varying = [...keys].filter((key) => {
+    const values = points.map((point) => JSON.stringify(point.coordinates[key]))
+    return new Set(values).size > 1
+  })
+
+  if (varying.length === 1) {
+    const key = varying[0]
+    return points.every((point) => typeof point.coordinates[key] === 'number' && Number.isFinite(point.coordinates[key]))
+      ? key
+      : null
   }
+
+  // 单点或重复 trial 没有“变化”维度时，仅在整个坐标中恰有一个共同数值轴才可画。
+  if (varying.length === 0) {
+    const numeric = [...keys].filter((key) =>
+      points.every((point) => typeof point.coordinates[key] === 'number' && Number.isFinite(point.coordinates[key])),
+    )
+    return numeric.length === 1 ? numeric[0] : null
+  }
+  return null
 }
 
 export interface SweepChartPoint {
@@ -153,24 +302,64 @@ export interface SweepChartPoint {
   source: SweepPoint
 }
 
+export interface SweepPointGroup {
+  key: string
+  label: string
+  sweepId: string | null
+  sourceName: string | null
+  points: SweepPoint[]
+}
+
+/** Sweep ID is authoritative; legacy/no-ID exports are isolated by source file, never merged globally. */
+export function sweepPointGroupKey(point: SweepPoint): string {
+  const sweepId = point.sweepId?.trim()
+  if (sweepId) return `sweep:${sweepId}`
+  const sourceName = point.sourceName?.trim()
+  if (sourceName) return `source:${sourceName}`
+  // Missing both identifiers is ambiguous: isolate the point instead of inventing a shared experiment.
+  return `point:${point.key}`
+}
+
+export function groupSweepPoints(points: readonly SweepPoint[]): SweepPointGroup[] {
+  const groups = new Map<string, SweepPointGroup>()
+  for (const point of points) {
+    const key = sweepPointGroupKey(point)
+    const existing = groups.get(key)
+    if (existing) {
+      existing.points.push(point)
+      continue
+    }
+    const sweepId = point.sweepId?.trim() || null
+    const sourceName = point.sourceName?.trim() || null
+    groups.set(key, {
+      key,
+      label: sweepId ?? sourceName ?? `未标识 Sweep · ${point.key}`,
+      sweepId,
+      sourceName,
+      points: [point],
+    })
+  }
+  return [...groups.values()]
+}
+
 export function toSweepChartPoints(points: SweepPoint[]): SweepChartPoint[] {
-  return points
-    .filter((point) => point.valid)
+  const validPoints = points.filter((point) => point.valid)
+  const axis = sharedSweepAxis(validPoints)
+  if (axis === null) return []
+  return validPoints
     .map((point) => {
-      const coordinate = coordinateValue(point)
-      const e2e = findMetric(point.metrics, 'e2e')
       return {
         key: point.key,
-        x: coordinate.value,
-        xLabel: coordinate.label,
+        x: point.coordinates[axis] as number,
+        xLabel: axis,
         systemTps: tokenRatePerSecond(findMetric(point.metrics, 'systemTps')),
         rps: requestRatePerSecond(findMetric(point.metrics, 'rps')),
         goodput: requestRatePerSecond(findMetric(point.metrics, 'goodput')),
         goodFraction: fractionValue(findMetric(point.metrics, 'goodFraction')),
-        ttftP95: latencyPercentileMs(findMetric(point.metrics, 'ttft'), 'p95'),
-        tpotP95: latencyPercentileMs(findMetric(point.metrics, 'tpot'), 'p95'),
-        e2eP95: latencyPercentileMs(e2e, 'p95'),
-        e2eP99: latencyPercentileMs(e2e, 'p99'),
+        ttftP95: latencyStatisticMs(point.metrics, 'ttft', 'p95'),
+        tpotP95: latencyStatisticMs(point.metrics, 'tpot', 'p95'),
+        e2eP95: latencyStatisticMs(point.metrics, 'e2e', 'p95'),
+        e2eP99: latencyStatisticMs(point.metrics, 'e2e', 'p99'),
         source: point,
       }
     })
@@ -178,15 +367,34 @@ export function toSweepChartPoints(points: SweepPoint[]): SweepChartPoint[] {
 }
 
 export function getRunLabel(run: NormalizedBenchmarkRun): string {
-  const variation = run.variation || 'default'
+  // variation 缺失时回退来源文件名：多个无 variation 的 run 才能相互区分，不全叫 default
+  const variation = run.variation || run.sourceNames[0] || 'default'
   const trial = run.trial === undefined ? '' : ` · trial ${run.trial}`
   return `${variation}${trial}`
 }
 
+/** 渲染侧百分比取整（保留一位小数）：0.29 显示 29 而非 28.999999999999996。 */
+export function percentValue(fraction: number): number {
+  return Math.round(fraction * 1000) / 10
+}
+
+/** 图表点与引擎诊断点共用同一映射，图表口径与诊断口径不允许各自漂移。 */
+export function toSweepDiagnosticPoint(point: SweepChartPoint): SweepDiagnosticPoint {
+  return {
+    load: point.x,
+    systemOutputTps: point.systemTps,
+    rps: point.rps,
+    goodputRps: point.goodput,
+    ttftP95Ms: point.ttftP95,
+    tpotP95Ms: point.tpotP95,
+    e2eP95Ms: point.e2eP95,
+  }
+}
+
+/** 饱和判定只保留 kpiEngine 一份实现；这里仅做图表点到诊断点的映射与回指。 */
 export function saturationPoint(points: SweepChartPoint[]): SweepChartPoint | null {
-  const peak = Math.max(...points.map((point) => point.systemTps ?? -Infinity))
-  if (!Number.isFinite(peak) || peak <= 0) return null
-  return points.find((point) => (point.systemTps ?? 0) >= peak * 0.95) ?? null
+  const pair = findSaturationPair(points.map((point) => ({ ...toSweepDiagnosticPoint(point), chart: point })))
+  return pair === null ? null : pair[1].chart
 }
 
 export function paretoKeys(points: SweepChartPoint[]): Set<string> {
@@ -211,6 +419,42 @@ export function paretoKeys(points: SweepChartPoint[]): Set<string> {
   )
 }
 
+/** 进程级单调 counter：Prometheus counter 类型，或 *_total / cumulative 命名（如 vllm:num_preemptions_total）。 */
+export function isCumulativeCounter(metric: NormalizedMetric): boolean {
+  if (metric.metricType?.trim().toLowerCase() === 'counter') return true
+  const name = simplify(metric.name)
+  return name.endsWith('total') || name.includes('cumulative')
+}
+
+export interface PreemptionEvidence {
+  ratePerSecond: number | null
+  countInWindow: number | null
+}
+
+/**
+ * 抢占证据只有两条合法通路：真正的窗口速率（stats.rate 或单位含 /s），
+ * 以及非 counter 语义的采样窗口计数。单调累计 counter 是启动以来的总量，
+ * 拿不到窗口差分时宁可双双置 null 抑制规则，也不能当窗口计数误报。
+ */
+export function preemptionEvidence(metrics: readonly NormalizedMetric[]): PreemptionEvidence {
+  const rates = metrics.flatMap((metric) => {
+    if (Number.isFinite(metric.stats.rate)) return [metric.stats.rate]
+    const unit = metric.unit.toLowerCase()
+    const value = metricValue(metric)
+    return value !== null && (unit.includes('/s') || unit.includes('per second')) ? [value] : []
+  })
+  const ratePerSecond = rates.length > 0 ? Math.max(...rates) : null
+  const counts = ratePerSecond === null
+    ? metrics.flatMap((metric) => {
+        if (isCumulativeCounter(metric)) return []
+        const value = metricValue(metric)
+        return value === null ? [] : [value]
+      })
+    : []
+  return { ratePerSecond, countInWindow: counts.length > 0 ? Math.max(...counts) : null }
+}
+
 export function hasMetric(metrics: MetricRecord | undefined, alias: MetricAlias): boolean {
-  return Boolean(findMetric(metrics, alias))
+  const metric = findMetric(metrics, alias)
+  return Boolean(metric && metric.available !== false && metric.unit.trim() && metricValue(metric) !== null)
 }

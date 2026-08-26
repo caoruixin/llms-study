@@ -22,12 +22,14 @@ export default function MemoryCalculator() {
     batch,
     inputTokens,
     outputTokens,
+    systemTpsFingerprint,
     setModelId,
     setGpuId,
     setQuantId,
     setBatch,
     setInputTokens,
     setOutputTokens,
+    setGpusPerCapacityUnit,
     setSystemTps,
   } = useInferenceParams()
 
@@ -59,7 +61,20 @@ export default function MemoryCalculator() {
     return { bd, unsupported, baseGB, gpus, ttft, ttftBasis: cap.basis, stepMs, tps: tokensPerSecond(stepMs, batch) }
   }, [model, gpu, quant, inputTokens, contextTokens, batch])
 
-  useEffect(() => setSystemTps(r.tps), [r.tps, setSystemTps])
+  // 仅在场景 TPS 已失效（指纹为 null、无人认领）时自动写入 roofline 结果；
+  // 有效的手填 / 估算值不被挂载副作用静默覆盖（覆盖需走下方显式同步按钮）。
+  useEffect(() => {
+    if (r.unsupported) return
+    if (systemTpsFingerprint !== null) return
+    setGpusPerCapacityUnit(r.gpus)
+    setSystemTps(r.tps, 'estimated')
+  }, [r.gpus, r.tps, r.unsupported, systemTpsFingerprint, setGpusPerCapacityUnit, setSystemTps])
+
+  const syncRooflineToScenario = () => {
+    if (r.unsupported) return
+    setGpusPerCapacityUnit(r.gpus)
+    setSystemTps(r.tps, 'estimated')
+  }
 
   // 分段先给 2% 可见性下限，再整体归一化——三段之和恒为 100%，不会溢出
   const segs = (defs: { gb: number; color: string; label: string }[]) => {
@@ -201,6 +216,24 @@ export default function MemoryCalculator() {
           <div className="mt-1 font-mono text-2xl font-bold">{r.tps.toFixed(0)} tok/s</div>
           <div className="mt-1 text-[11px] text-dim">每步出 batch 个 token；MoE 用激活参数（{model.activeParamsB}B）</div>
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-panel shadow-sm p-4">
+        <button
+          type="button"
+          onClick={syncRooflineToScenario}
+          disabled={r.unsupported}
+          className="min-h-11 rounded-lg border border-line bg-panel-2 px-4 text-sm font-semibold shadow-sm hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          同步 roofline 结果到场景（{r.gpus} 卡/单元 + {r.tps.toFixed(0)} tok/s）
+        </button>
+        <span className="min-w-48 flex-1 text-[11px] leading-relaxed text-dim">
+          {r.unsupported
+            ? '该架构 KV 不可数值估算，无 roofline TPS 可同步。'
+            : systemTpsFingerprint === null
+              ? '共享场景的 TPS 已失效，本页估算结果会自动认领写入。'
+              : '共享场景已有有效 TPS（手填或估算），本页不会自动覆盖；确认口径后可点按钮显式同步。'}
+        </span>
       </div>
 
       <div className="rounded-xl border border-line bg-panel shadow-sm p-4 text-xs leading-relaxed text-dim">

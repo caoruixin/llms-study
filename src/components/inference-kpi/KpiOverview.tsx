@@ -83,14 +83,14 @@ export default function KpiOverview({ onJumpTo }: KpiOverviewProps) {
                       {metrics.map((item) => {
                         if ('value' in item) {
                           return (
-                            <button key={item.id} type="button" onClick={() => setSelectedId(item.id)} className={buttonClass(selectedId === item.id)}>
+                            <button key={item.id} type="button" aria-pressed={selectedId === item.id} onClick={() => setSelectedId(item.id)} className={buttonClass(selectedId === item.id)}>
                               <span className="block text-xs font-semibold">{item.name}</span>
                               <span className="mt-0.5 block break-words font-mono text-xs text-accent">{item.value}</span>
                             </button>
                           )
                         }
                         return (
-                          <button key={item.id} type="button" onClick={() => setSelectedId(item.id)} className={buttonClass(selectedId === item.id)}>
+                          <button key={item.id} type="button" aria-pressed={selectedId === item.id} onClick={() => setSelectedId(item.id)} className={buttonClass(selectedId === item.id)}>
                             <span className="block break-words text-xs font-semibold">{item.name}</span>
                             {item.englishName && <span className="mt-0.5 block truncate text-[10px] text-dim">{item.englishName}</span>}
                             <span className="mt-1 inline-block rounded bg-panel-2 px-1.5 py-0.5 font-mono text-[10px] text-dim">{item.unit}</span>

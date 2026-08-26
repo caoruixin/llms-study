@@ -6,6 +6,7 @@ import {
   KPI_CATEGORIES,
   KPI_IDS,
   type KpiCategory,
+  type KpiId,
   type MetricObservation,
 } from './inferenceKpis'
 
@@ -51,8 +52,49 @@ describe('inferenceKpis registry', () => {
     }
   })
 
+  it('mentions every declared formula dependency inside the formula text', () => {
+    // 公式字符串是注册表对外的事实源：声明了依赖却没出现在公式里（或反之）就是口径漂移。
+    // 每个可被依赖的 KPI 给出它在公式文案中的可接受写法。
+    const DEPENDENCY_TOKENS: Partial<Record<KpiId, readonly string[]>> = {
+      ttft: ['TTFT'],
+      tpot: ['TPOT'],
+      'e2e-latency': ['E2E'],
+      rps: ['RPS'],
+      goodput: ['Goodput'],
+      'system-output-tps': ['系统输出 TPS'],
+      'gpu-count': ['GPU 数'],
+      'server-count': ['服务器数'],
+    }
+    for (const metric of INFERENCE_KPIS) {
+      if (metric.formula === null) {
+        expect(metric.formulaDependencies, `${metric.id} has dependencies without a formula`).toEqual([])
+        continue
+      }
+      for (const dependency of metric.formulaDependencies) {
+        const tokens = DEPENDENCY_TOKENS[dependency]
+        expect(tokens, `no token mapping for dependency ${dependency}`).toBeDefined()
+        expect(
+          tokens!.some((token) => metric.formula!.includes(token)),
+          `${metric.id}.formula does not mention dependency ${dependency}`,
+        ).toBe(true)
+      }
+    }
+  })
+
+  it('keeps the cost formulas aligned with the engine implementation', () => {
+    // $/MTok 的分母包含有效利用率，且两个成本公式都写明集群成本 = GPU 数 × 单卡成本。
+    expect(KPI_BY_ID['cost-per-mtok'].formula).toContain('有效利用率')
+    expect(KPI_BY_ID['cost-per-mtok'].formula).toContain('GPU 数')
+    expect(KPI_BY_ID['cost-per-mtok'].formulaDependencies).toContain('gpu-count')
+    expect(KPI_BY_ID['cost-per-good-request'].formula).toContain('GPU 数')
+    expect(KPI_BY_ID['cost-per-good-request'].formula).toContain('Goodput')
+    expect(KPI_BY_ID['cost-per-good-request'].formulaDependencies).toContain('gpu-count')
+  })
+
   it('locks the easily-confused NIM and AIPerf semantics', () => {
-    expect(KPI_BY_ID['system-output-tps']).toMatchObject({ scope: 'system', measurementPoint: 'engine' })
+    expect(KPI_BY_ID['system-output-tps']).toMatchObject({ scope: 'system', measurementPoint: 'client' })
+    expect(KPI_BY_ID.rps).toMatchObject({ scope: 'system', measurementPoint: 'client' })
+    expect(KPI_BY_ID.concurrency.direction).toBe('informational')
     expect(KPI_BY_ID['single-user-output-tps'].formula).toContain('E2E')
     expect(KPI_BY_ID['single-user-output-tps'].formula).not.toContain('TPOT')
     expect(KPI_BY_ID.tpot.definition).toContain('不把 TTFT 计入')

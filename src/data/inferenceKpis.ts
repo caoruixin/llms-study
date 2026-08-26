@@ -100,6 +100,8 @@ export interface ExperienceSlo {
   ttftP95Ms: number | null
   tpotP95Ms: number | null
   e2eP95Ms: number | null
+  /** Customer-defined minimum joint per-request attainment; null means not configured. */
+  minimumAttainmentFraction: number | null
 }
 
 export type InferenceQuantization = 'fp16' | 'fp8' | 'int4'
@@ -293,7 +295,7 @@ export const INFERENCE_KPIS = [
     unit: 'output-token/s/system',
     direction: 'higher-is-better',
     scope: 'system',
-    measurementPoint: 'engine',
+    measurementPoint: 'client',
     statistics: ['mean', 'p50', 'p95', 'max'],
     formula: '总输出 token 数 ÷ (最后响应时间 - 第一请求时间)',
     formulaDependencies: [],
@@ -311,7 +313,7 @@ export const INFERENCE_KPIS = [
     unit: 'request/s/system',
     direction: 'higher-is-better',
     scope: 'system',
-    measurementPoint: 'gateway',
+    measurementPoint: 'client',
     statistics: ['mean', 'p50', 'p95', 'max'],
     formula: '成功完成请求数 ÷ (最后响应时间 - 第一请求时间)',
     formulaDependencies: [],
@@ -327,7 +329,7 @@ export const INFERENCE_KPIS = [
     shortName: 'Concurrency',
     definition: '某时刻系统中正在排队或执行的未完成请求数；稳态均值可用 Little 定律校验。',
     unit: 'request',
-    direction: 'higher-is-better',
+    direction: 'informational',
     scope: 'system',
     measurementPoint: 'scheduler',
     statistics: ['mean', 'p50', 'p95', 'max'],
@@ -583,7 +585,7 @@ export const INFERENCE_KPIS = [
     scope: 'system',
     measurementPoint: 'cost-model',
     statistics: ['value'],
-    formula: '集群每小时成本 ÷ (系统输出 TPS × 3600) × 1,000,000',
+    formula: '集群每小时成本（GPU 数 × 单卡 $/h）÷ (系统输出 TPS × 3600 × 有效利用率) × 1,000,000',
     formulaDependencies: ['system-output-tps', 'gpu-count'],
     relatedArchComponents: ['gpu', 'quantization', 'model-router'],
     diagnosticMeaning: '只有当吞吐口径、利用率和成本边界一致时，才能跨方案比较。',
@@ -601,7 +603,7 @@ export const INFERENCE_KPIS = [
     scope: 'system',
     measurementPoint: 'cost-model',
     statistics: ['value'],
-    formula: '集群每小时成本 ÷ (Goodput × 3600)',
+    formula: '集群每小时成本（GPU 数 × 单卡 $/h）÷ (Goodput × 3600)',
     formulaDependencies: ['goodput', 'gpu-count'],
     relatedArchComponents: ['gpu', 'sla-planner', 'tenant-gateway'],
     diagnosticMeaning: '把性能与体验约束一起折算为商业成本；Goodput 缺失时不得计算。',

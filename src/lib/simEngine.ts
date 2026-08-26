@@ -151,6 +151,13 @@ export function apiBlendedPerMTok(
   return inputShare * inputPrice + outputShare * outputPerMTok
 }
 
+// 将“输入+输出混合总 token 单价”归一到每百万输出 token，才能与系统输出 TPS 的自建口径同图比较。
+export function apiCostPerOutputMTok(blendedPerTotalMTok: number, outputShare: number): number | null {
+  if (!Number.isFinite(blendedPerTotalMTok) || blendedPerTotalMTok < 0) return null
+  if (!Number.isFinite(outputShare) || outputShare <= 0 || outputShare > 1) return null
+  return blendedPerTotalMTok / outputShare
+}
+
 // 盈亏平衡日均 MTok：自建每日固定成本 ÷ API 均价
 export function breakEvenDailyMTok(clusterHourlyUSD: number, apiPerMTok: number): number {
   return (clusterHourlyUSD * 24) / apiPerMTok

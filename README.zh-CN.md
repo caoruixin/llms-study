@@ -23,7 +23,7 @@
 
 - **数据驱动的扩展性。** 所有内容——模型、硬件、注意力阶段、题目、价格——都是 `src/data/` 下的类型化数据,组件只负责渲染。加一个模型或题目就是往数组里加一个对象,不碰组件。见 [EXTENDING.md](EXTENDING.md)。
 - **拒绝伪精确。** 模拟引擎(`src/lib/simEngine.ts`)是纯函数,配已知算例单测。没有公开公式参数的架构(DSA、KDA 等)显式标注「不支持数值估算」,只展示官方相对指标。易变事实(价格/规格)必须带 `sourceUrl` + `asOf`。
-- **Benchmark 来源始终可见。** 推理 KPI 工作台把业务目标、roofline 示意估算和 AIPerf 实测值建模为三种不同类型。AIPerf 汇总/Sweep/server-metrics JSON 或 CSV 全部在浏览器内解析，不上传、不持久化。
+- **Benchmark 来源始终可见。** 推理 KPI 工作台把业务目标、roofline 示意估算和 AIPerf 实测值建模为三种不同类型。AIPerf 汇总/Sweep/server-metrics JSON 或 CSV 全部在浏览器内解析，不上传、不持久化；按 Goodput 做 Sizing 还必须显式填写客户 SLO 与最低达标率，并确认 run 口径完全可比。
 - **Key 永不进前端产物。** LLM 调用走固定 allowlist 代理(`/api/moonshot`、`/api/zhipu`、`/api/deepseek`、`/api/openai-compat`)到后端网关注入凭据,多 key 按序故障转移(无效 key 永久剔除、配额/限流 key 冷却——`src/lib/keyRotation.ts`)。
 - **iOS WebKit 的 PDF 兼容层。** pdf.js v6 依赖三个 WebKit 尚未实现的 JS 特性(ReadableStream 异步迭代、`Map.getOrInsertComputed`、`Uint8Array.toHex/toBase64`)。`src/lib/paper/pdfCompat.ts` 在主线程与(经包装 worker 入口)pdf.js worker 线程内补齐 shim。回归由 Playwright 双引擎脚本守护:`node scripts/webkit-pdf-repro.mjs`(WebKit + Chromium,自起 dev server、种入 fixture 论文、断言 canvas 真实像素与 390px 移动布局)。
 - **构建期特性开关,零泄漏。** `VITE_ENABLE_PAPER_COPILOT` 门控整棵论文子树;flag-off 构建把相关模块虚模块化,产物中不含任何论文 chunk 或 pdf.js 资产。

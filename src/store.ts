@@ -83,7 +83,27 @@ export interface InferenceSlo {
   ttftMs: number | null
   tpotMs: number | null
   e2eMs: number | null
-  attainment: number // 0~1，默认 95%
+  attainment: number | null // 0~1；必须由客户场景显式输入，不设通用默认值
+}
+
+export type SystemTpsSource = 'estimated' | 'manual'
+
+type InferenceTpsContext = Pick<
+  InferenceParamsState,
+  'modelId' | 'gpuId' | 'quantId' | 'batch' | 'inputTokens' | 'outputTokens' | 'gpusPerCapacityUnit'
+>
+
+/** Identifies exactly which scenario a capacity-unit TPS value belongs to. */
+export function inferenceTpsFingerprint(context: InferenceTpsContext): string {
+  return JSON.stringify([
+    context.modelId,
+    context.gpuId,
+    context.quantId,
+    context.batch,
+    context.inputTokens,
+    context.outputTokens,
+    context.gpusPerCapacityUnit,
+  ])
 }
 
 export interface InferenceParamsState {
@@ -92,6 +112,9 @@ export interface InferenceParamsState {
   quantId: QuantId
   batch: number
   cacheRate: number // 前缀缓存命中率 0~0.95
+  // 诊断用的预期前缀命中率 0~1：cacheRate 是估算假设，不能自动当成诊断预期；
+  // 保持 null 直到用户显式设置，cache-hit-gap 规则才会启用
+  expectedPrefixHitRate: number | null
   inputTokens: number
   outputTokens: number
   peakRps: number
@@ -103,14 +126,17 @@ export interface InferenceParamsState {
   gpusPerServer: number | null // 不隐藏猜拓扑；用户未给则 server/rack 结果 N/A
   serversPerRack: number | null
   gpuCount: number
-  systemTps: number
+  systemTps: number // 每个容量单元的系统输出 TPS
+  systemTpsFingerprint: string | null
+  systemTpsSource: SystemTpsSource | null
   utilization: number // 成本模型的有效利用率，不等于 GPU utilization 遥测
-  hourlyCost: number // 当前容量单元的集群 $/h
+  hourlyCost: number // 当前 gpuCount 对应的整集群 $/h
   setModelId: (modelId: string) => void
   setGpuId: (gpuId: string) => void
   setQuantId: (quantId: QuantId) => void
   setBatch: (batch: number) => void
   setCacheRate: (cacheRate: number) => void
+  setExpectedPrefixHitRate: (expectedPrefixHitRate: number | null) => void
   setInputTokens: (inputTokens: number) => void
   setOutputTokens: (outputTokens: number) => void
   setPeakRps: (peakRps: number) => void
@@ -122,10 +148,22 @@ export interface InferenceParamsState {
   setGpusPerServer: (gpusPerServer: number | null) => void
   setServersPerRack: (serversPerRack: number | null) => void
   setGpuCount: (gpuCount: number) => void
-  setSystemTps: (systemTps: number) => void
+  setSystemTps: (systemTps: number, source?: SystemTpsSource) => void
   setUtilization: (utilization: number) => void
   setHourlyCost: (hourlyCost: number) => void
 }
+
+const INITIAL_TPS_CONTEXT = {
+  modelId: 'deepseek-v3',
+  gpuId: 'h100',
+  quantId: 'fp8' as QuantId,
+  batch: 16,
+  inputTokens: 16_000,
+  outputTokens: 512,
+  gpusPerCapacityUnit: 8,
+}
+
+const invalidateTps = { systemTpsFingerprint: null, systemTpsSource: null } as const
 
 export const useInferenceParams = create<InferenceParamsState>()((set) => ({
   modelId: 'deepseek-v3',
@@ -133,11 +171,12 @@ export const useInferenceParams = create<InferenceParamsState>()((set) => ({
   quantId: 'fp8',
   batch: 16,
   cacheRate: 0.7,
+  expectedPrefixHitRate: null,
   inputTokens: 16_000,
   outputTokens: 512,
   peakRps: 20,
   concurrency: 32,
-  slo: { ttftMs: null, tpotMs: null, e2eMs: null, attainment: 0.95 },
+  slo: { ttftMs: null, tpotMs: null, e2eMs: null, attainment: null },
   headroom: 0.2,
   spareUnits: 1,
   gpusPerCapacityUnit: 8,
@@ -145,15 +184,22 @@ export const useInferenceParams = create<InferenceParamsState>()((set) => ({
   serversPerRack: null,
   gpuCount: 8,
   systemTps: 5000,
+  systemTpsFingerprint: inferenceTpsFingerprint(INITIAL_TPS_CONTEXT),
+  systemTpsSource: 'manual',
   utilization: 0.4,
   hourlyCost: 27.2,
-  setModelId: (modelId) => set({ modelId }),
-  setGpuId: (gpuId) => set({ gpuId }),
-  setQuantId: (quantId) => set({ quantId }),
-  setBatch: (batch) => set({ batch: Math.max(1, Math.round(batch)) }),
+  setModelId: (modelId) => set({ modelId, ...invalidateTps }),
+  setGpuId: (gpuId) => set({ gpuId, ...invalidateTps }),
+  setQuantId: (quantId) => set({ quantId, ...invalidateTps }),
+  setBatch: (batch) => set({ batch: Math.max(1, Math.round(batch)), ...invalidateTps }),
   setCacheRate: (cacheRate) => set({ cacheRate: Math.min(0.95, Math.max(0, cacheRate)) }),
-  setInputTokens: (inputTokens) => set({ inputTokens: Math.max(1, Math.round(inputTokens)) }),
-  setOutputTokens: (outputTokens) => set({ outputTokens: Math.max(1, Math.round(outputTokens)) }),
+  setExpectedPrefixHitRate: (expectedPrefixHitRate) =>
+    set({
+      expectedPrefixHitRate:
+        expectedPrefixHitRate === null ? null : Math.min(1, Math.max(0, expectedPrefixHitRate)),
+    }),
+  setInputTokens: (inputTokens) => set({ inputTokens: Math.max(1, Math.round(inputTokens)), ...invalidateTps }),
+  setOutputTokens: (outputTokens) => set({ outputTokens: Math.max(1, Math.round(outputTokens)), ...invalidateTps }),
   setPeakRps: (peakRps) => set({ peakRps: Math.max(0, peakRps) }),
   setConcurrency: (concurrency) => set({ concurrency: Math.max(1, Math.round(concurrency)) }),
   setSlo: (next) =>
@@ -182,19 +228,26 @@ export const useInferenceParams = create<InferenceParamsState>()((set) => ({
         attainment:
           next.attainment === undefined
             ? state.slo.attainment
-            : Math.min(1, Math.max(0, next.attainment)),
+            : next.attainment === null
+              ? null
+              : Math.min(1, Math.max(0, next.attainment)),
       },
     })),
   setHeadroom: (headroom) => set({ headroom: Math.min(1, Math.max(0, headroom)) }),
   setSpareUnits: (spareUnits) => set({ spareUnits: Math.max(0, Math.round(spareUnits)) }),
   setGpusPerCapacityUnit: (gpusPerCapacityUnit) =>
-    set({ gpusPerCapacityUnit: Math.max(1, Math.round(gpusPerCapacityUnit)) }),
+    set({ gpusPerCapacityUnit: Math.max(1, Math.round(gpusPerCapacityUnit)), ...invalidateTps }),
   setGpusPerServer: (gpusPerServer) =>
     set({ gpusPerServer: gpusPerServer === null ? null : Math.max(1, Math.round(gpusPerServer)) }),
   setServersPerRack: (serversPerRack) =>
     set({ serversPerRack: serversPerRack === null ? null : Math.max(1, Math.round(serversPerRack)) }),
   setGpuCount: (gpuCount) => set({ gpuCount: Math.max(1, Math.round(gpuCount)) }),
-  setSystemTps: (systemTps) => set({ systemTps: Math.max(1, systemTps) }),
+  setSystemTps: (systemTps, source = 'manual') =>
+    set((state) => ({
+      systemTps: Math.max(1, systemTps),
+      systemTpsFingerprint: inferenceTpsFingerprint(state),
+      systemTpsSource: source,
+    })),
   setUtilization: (utilization) => set({ utilization: Math.min(0.99, Math.max(0.01, utilization)) }),
   setHourlyCost: (hourlyCost) => set({ hourlyCost: Math.max(0, hourlyCost) }),
 }))

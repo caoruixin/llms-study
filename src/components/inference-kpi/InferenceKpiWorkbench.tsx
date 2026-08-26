@@ -1,18 +1,17 @@
-import { useState } from 'react'
 import SegmentedTabs from '../ui/SegmentedTabs'
 import BenchmarkAnalysis from './BenchmarkAnalysis'
 import KpiDictionary from './KpiDictionary'
 import KpiOverview from './KpiOverview'
 import SizingDerivation from './SizingDerivation'
+import { useKpiUiStore, type KpiWorkbenchView } from './kpiUiStore'
 
-const VIEWS = [
+const VIEWS: readonly { id: KpiWorkbenchView; label: string }[] = [
   { id: 'overview', label: '全景因果图' },
   { id: 'benchmark', label: 'Benchmark 分析' },
   { id: 'sizing', label: 'Sizing 推导' },
   { id: 'dictionary', label: '指标词典' },
 ] as const
 
-type ViewId = (typeof VIEWS)[number]['id']
 export type InferenceKpiJumpTarget = 'atlas' | 'lifecycle' | 'memory' | 'economics'
 
 export interface InferenceKpiWorkbenchProps {
@@ -20,7 +19,9 @@ export interface InferenceKpiWorkbenchProps {
 }
 
 export default function InferenceKpiWorkbench({ onJumpTo }: InferenceKpiWorkbenchProps) {
-  const [view, setView] = useState<ViewId>('overview')
+  // 二级视图放 kpiUiStore（会话内存）：切去显存墙等一级 tab 卸载组件后回来仍停留原视图
+  const view = useKpiUiStore((state) => state.view)
+  const setView = useKpiUiStore((state) => state.setView)
 
   return (
     <section className="min-w-0 space-y-4" aria-labelledby="inference-kpi-heading">
@@ -39,7 +40,7 @@ export default function InferenceKpiWorkbench({ onJumpTo }: InferenceKpiWorkbenc
         </div>
       </div>
 
-      <SegmentedTabs tabs={VIEWS} value={view} onChange={setView} />
+      <SegmentedTabs tabs={VIEWS} value={view} onChange={setView} ariaLabel="KPI 工作台视图" />
 
       {view === 'overview' && <KpiOverview onJumpTo={onJumpTo} />}
       {view === 'benchmark' && <BenchmarkAnalysis />}

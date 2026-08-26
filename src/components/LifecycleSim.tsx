@@ -43,6 +43,7 @@ export default function LifecycleSim() {
     cacheRate,
     inputTokens,
     outputTokens,
+    systemTpsFingerprint,
     setModelId,
     setGpuId,
     setQuantId,
@@ -50,6 +51,7 @@ export default function LifecycleSim() {
     setCacheRate,
     setInputTokens,
     setOutputTokens,
+    setGpusPerCapacityUnit,
     setSystemTps,
   } = useInferenceParams()
   const [priceKey, setPriceKey] = useState('DeepSeek|deepseek-v4-pro')
@@ -70,15 +72,17 @@ export default function LifecycleSim() {
   const cacheHitTokens = Math.round(inputTokens * cacheRate)
 
   const calc = useMemo(() => {
-    const bd = memoryBreakdown(model.totalParamsB, quant.bytesPerParam, model.kvSpec, inputTokens + 512, batch)
+    const bd = memoryBreakdown(model.totalParamsB, quant.bytesPerParam, model.kvSpec, inputTokens + outputTokens, batch)
     const gpus = bd.totalGB === null ? 1 : minGpus(bd.totalGB, gpu.memoryGB)
     // 量化对应算力口径（无官方对应精度数据时回退 FP8，与显存计算器同口径）
     const ttft = estTTFTms(model.activeParamsB, inputTokens - cacheHitTokens, tflopsForQuant(gpu, quant.id).tflops, gpus)
+    // KV 序列口径与上方 memoryBreakdown、显存墙计算器一致：ISL+OSL；
+    // 只用 ISL 会与显存墙写入互相矛盾的共享 systemTps。
     const stepMs = estStepMs(
       model.activeParamsB,
       quant.bytesPerParam,
       kvBytesPerToken(model.kvSpec),
-      inputTokens,
+      inputTokens + outputTokens,
       batch,
       gpu.bandwidthTBs,
       gpus,
@@ -96,7 +100,21 @@ export default function LifecycleSim() {
   }
 
   useEffect(() => clearTimers, [])
-  useEffect(() => setSystemTps(calc.tps), [calc.tps, setSystemTps])
+  // 仅在场景 TPS 已失效（指纹为 null、无人认领）时自动写入；有效的手填 / 估算值
+  // 不被挂载副作用静默覆盖（覆盖需走指标面板的显式同步按钮）。
+  useEffect(() => {
+    // 退回展示模型时不能把另一模型的 roofline TPS 写回共享场景。
+    if (!sharedModel) return
+    if (systemTpsFingerprint !== null) return
+    setGpusPerCapacityUnit(calc.gpus)
+    setSystemTps(calc.tps, 'estimated')
+  }, [calc.gpus, calc.tps, systemTpsFingerprint, setGpusPerCapacityUnit, setSystemTps, sharedModel])
+
+  const syncRooflineToScenario = () => {
+    if (!sharedModel) return
+    setGpusPerCapacityUnit(calc.gpus)
+    setSystemTps(calc.tps, 'estimated')
+  }
 
   function run() {
     clearTimers()
@@ -313,6 +331,21 @@ export default function LifecycleSim() {
             </dl>
             <p className="mt-2 text-[11px] leading-relaxed text-dim">
               缓存命中率 ↑ → prefill 量 ↓ → TTFT ↓；batch ↑ → 吞吐 ↑（权重读取被摊薄）、TPOT 略 ↑
+            </p>
+            <button
+              type="button"
+              onClick={syncRooflineToScenario}
+              disabled={!sharedModel}
+              className="mt-3 min-h-11 w-full rounded-lg border border-line bg-panel-2 px-3 text-sm font-semibold shadow-sm hover:border-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              同步 roofline 结果到场景（{calc.gpus} 卡/单元 + {calc.tps.toFixed(0)} tok/s）
+            </button>
+            <p className="mt-1.5 text-[10px] leading-relaxed text-dim">
+              {!sharedModel
+                ? '当前为退回展示模型，估算结果不写回共享场景。'
+                : systemTpsFingerprint === null
+                  ? '共享场景的 TPS 已失效，本页估算结果会自动认领写入。'
+                  : '共享场景已有有效 TPS（手填或估算），本页不自动覆盖；确认口径后可显式同步。'}
             </p>
           </div>
           <div className="rounded-xl border border-line bg-panel shadow-sm p-4">

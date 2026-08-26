@@ -25,7 +25,7 @@ export default function InferencePage() {
 
   return (
     <div className="space-y-5">
-      <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
+      <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} ariaLabel="推理链路视图" />
       {tab === 'kpi' && (
         <Suspense
           fallback={

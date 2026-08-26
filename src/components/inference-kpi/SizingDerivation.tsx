@@ -1,12 +1,27 @@
-import { useMemo, useState } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import { MODELS } from '../../data/models'
 import { GPUS } from '../../data/hardware'
+import type { NormalizedBenchmarkRun } from '../../lib/aiperfImport'
 import { QUANTS } from '../../lib/simEngine'
-import { calculateSizing, littleLawConcurrency, requiredSystemOutputTps } from '../../lib/kpiEngine'
-import { useInferenceScenario, type QuantId } from '../../store'
+import {
+  calculateSizing,
+  checkLittleLaw,
+  costPerGoodRequest,
+  costPerMillionOutputTokens,
+  observed,
+  requiredSystemOutputTps,
+  validateMeasuredSizingGate,
+} from '../../lib/kpiEngine'
+import { fingerprintFor } from './BenchmarkAnalysis'
+import {
+  inferenceTpsFingerprint,
+  useInferenceScenario,
+  type InferenceParamsState,
+  type QuantId,
+} from '../../store'
 import { EmptyState, MetricTile, Panel, StatusBadge, inputClass } from './KpiPrimitives'
 import { useKpiUiStore } from './kpiUiStore'
-import { findMetric, formatMetric, fractionValue, requestRatePerSecond } from './metricUi'
+import { findMetric, formatMetric, fractionValue, meanLatencyMs, percentValue, requestRatePerSecond } from './metricUi'
 
 type JumpTarget = 'atlas' | 'lifecycle' | 'memory' | 'economics'
 
@@ -22,41 +37,104 @@ const nullableNumber = (value: string): number | null => {
 
 const resultTone = (basis: string) => basis === 'measured-goodput' ? 'measured' : basis === 'estimated-throughput' ? 'estimated' : 'neutral'
 
+export const runConcurrency = (run: NormalizedBenchmarkRun | null): number | null => {
+  // This deliberately reads only explicit AIPerf configuration fields; labels/filenames are not evidence.
+  const config = run?.inputConfig
+  if (!config) return null
+  const direct = config.concurrency
+  if (typeof direct === 'number' && Number.isFinite(direct) && direct >= 0) return direct
+  const phases = config.phases
+  if (!Array.isArray(phases)) return null
+  const objects = phases.filter((phase): phase is Record<string, unknown> => Boolean(phase && typeof phase === 'object' && !Array.isArray(phase)))
+  const ordered = [
+    ...objects.filter((phase) => String(phase.name ?? '').toLowerCase() === 'profiling'),
+    ...objects.filter((phase) => String(phase.name ?? '').toLowerCase() !== 'profiling'),
+  ]
+  for (const phase of ordered) {
+    const value = phase.concurrency
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  }
+  return null
+}
+
+type MeasurementConfirmationContext = Pick<
+  InferenceParamsState,
+  | 'modelId'
+  | 'gpuId'
+  | 'quantId'
+  | 'batch'
+  | 'cacheRate'
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'concurrency'
+  | 'gpusPerCapacityUnit'
+  | 'slo'
+>
+
+/** Any workload/deployment assumption change invalidates the manual run-comparability confirmation. */
+export function measurementConfirmationKey(
+  runKey: string | null,
+  scenario: MeasurementConfirmationContext,
+): string | null {
+  if (runKey === null) return null
+  return JSON.stringify([
+    runKey,
+    scenario.modelId,
+    scenario.gpuId,
+    scenario.quantId,
+    scenario.batch,
+    scenario.cacheRate,
+    scenario.inputTokens,
+    scenario.outputTokens,
+    scenario.concurrency,
+    scenario.gpusPerCapacityUnit,
+    scenario.slo,
+  ])
+}
+
 export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
   const scenario = useInferenceScenario()
   const batch = useKpiUiStore((state) => state.batch)
   const selectedRunKey = useKpiUiStore((state) => state.selectedRunKey)
+  const metadataDrafts = useKpiUiStore((state) => state.metadataDrafts)
   const requestedRun = batch?.runs.find((candidate) => candidate.key === selectedRunKey)
   const run = requestedRun?.valid && !requestedRun.cancelled
     ? requestedRun
     : batch?.runs.find((candidate) => candidate.valid && !candidate.cancelled) ?? null
   const measuredGoodput = requestRatePerSecond(findMetric(run?.metrics, 'goodput'))
   const goodFraction = fractionValue(findMetric(run?.metrics, 'goodFraction'))
-  const [confirmedMeasurementKey, setConfirmedMeasurementKey] = useState<string | null>(null)
-  const estimatedRpsPerUnit = scenario.outputTokens > 0 ? scenario.systemTps / scenario.outputTokens : null
+  // 人工确认提升到 kpiUiStore：切 tab 卸载组件不再丢勾选（会话内存，不持久化）
+  const confirmedMeasurementKey = useKpiUiStore((state) => state.confirmedMeasurementKey)
+  const setConfirmedMeasurementKey = useKpiUiStore((state) => state.setConfirmedMeasurementKey)
+  const tpsContextValid = scenario.systemTpsFingerprint === inferenceTpsFingerprint(scenario)
+  const estimatedRpsPerUnit = tpsContextValid && scenario.outputTokens > 0 ? scenario.systemTps / scenario.outputTokens : null
+  const hourlyCostPerGpu = scenario.hourlyCost / scenario.gpuCount
+  const capacityUnitHourlyCost = hourlyCostPerGpu * scenario.gpusPerCapacityUnit
   const targetGoodRps = scenario.peakRps
   const hasExperienceSlo = scenario.slo.ttftMs !== null || scenario.slo.tpotMs !== null || scenario.slo.e2eMs !== null
-  const attainmentVerified = goodFraction !== null && goodFraction >= scenario.slo.attainment
+  const attainmentTarget = scenario.slo.attainment
+  const attainmentVerified = attainmentTarget !== null && goodFraction !== null && goodFraction >= attainmentTarget
+  // Goodput 只相对 run 自己的 --goodput 约束成立：run 阈值必须不宽于场景 SLO，
+  // GPU 拓扑也要一致，否则实测容量对当前场景就是高估，直接禁用 measured 路径。
+  const runFingerprint = run === null ? null : fingerprintFor(run, metadataDrafts[run.key])
+  const sloGate = runFingerprint === null
+    ? null
+    : validateMeasuredSizingGate({
+        runSlo: runFingerprint.slo,
+        runGpuCount: runFingerprint.gpuCount,
+        scenarioSlo: scenario.slo,
+        scenarioGpusPerUnit: scenario.gpusPerCapacityUnit,
+      })
+  const sloGatePassed = sloGate !== null && sloGate.eligible
   // 任一场景口径变更都会自动使人工确认失效，避免拿旧 run 套新场景。
-  const measurementKey = run
-    ? JSON.stringify([
-        run.key,
-        scenario.modelId,
-        scenario.gpuId,
-        scenario.quantId,
-        scenario.inputTokens,
-        scenario.outputTokens,
-        scenario.gpusPerCapacityUnit,
-        scenario.slo,
-      ])
-    : null
+  const measurementKey = measurementConfirmationKey(run?.key ?? null, scenario)
   const measurementConfirmed = measurementKey !== null && confirmedMeasurementKey === measurementKey
   const measuredSizingEligible =
-    measuredGoodput !== null && hasExperienceSlo && attainmentVerified && measurementConfirmed
+    measuredGoodput !== null && hasExperienceSlo && attainmentVerified && sloGatePassed && measurementConfirmed
   const sizingMeasuredGoodput = measuredSizingEligible ? measuredGoodput : null
   const sizing = useMemo(
     () => calculateSizing({
-      measuredGoodputRpsPerUnit: sizingMeasuredGoodput,
+      goodputRpsPerUnit: observed(sizingMeasuredGoodput, 'measured'),
       estimatedRpsPerUnit,
       targetGoodRps,
       headroom: scenario.headroom,
@@ -79,13 +157,17 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
     ],
   )
   const requiredTps = requiredSystemOutputTps(scenario.peakRps, scenario.outputTokens)
-  const concurrencyCheck = scenario.slo.e2eMs === null ? null : littleLawConcurrency(scenario.peakRps, scenario.slo.e2eMs)
-  const costPerMTok = scenario.systemTps > 0 && scenario.utilization > 0
-    ? (scenario.hourlyCost / (scenario.systemTps * 3600 * scenario.utilization)) * 1_000_000
+  const measuredRps = requestRatePerSecond(findMetric(run?.metrics, 'rps'))
+  const measuredMeanE2eMs = meanLatencyMs(run?.metrics, 'e2e')
+  const observedRunConcurrency = runConcurrency(run)
+  const concurrencyCheck = measuredRps === null || measuredMeanE2eMs === null
+    ? null
+    : checkLittleLaw(measuredRps, measuredMeanE2eMs, observedRunConcurrency ?? Number.NaN)
+  // 成本公式以注册表/kpiEngine 为唯一事实源，UI 不再各自内联一份分母口径。
+  const costPerMTok = tpsContextValid
+    ? costPerMillionOutputTokens(capacityUnitHourlyCost, scenario.systemTps, scenario.utilization)
     : null
-  const goodRequestCost = sizingMeasuredGoodput && sizingMeasuredGoodput > 0
-    ? scenario.hourlyCost / (sizingMeasuredGoodput * 3600)
-    : null
+  const goodRequestCost = costPerGoodRequest(capacityUnitHourlyCost, sizingMeasuredGoodput)
 
   return (
     <div className="min-w-0 space-y-4">
@@ -120,11 +202,34 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
           <NumberField label="输出长度 OSL" value={scenario.outputTokens} unit="token" min={1} onChange={scenario.setOutputTokens} />
           <NumberField label="峰值 Good RPS 目标" value={scenario.peakRps} unit="req/s" min={0} step={0.1} onChange={scenario.setPeakRps} />
           <NumberField label="并发度" value={scenario.concurrency} unit="request" min={1} onChange={scenario.setConcurrency} />
-          <NumberField label="当前系统输出 TPS" value={scenario.systemTps} unit="tok/s" min={1} onChange={scenario.setSystemTps} />
+          <NumberField
+            label="当前系统输出 TPS"
+            value={scenario.systemTps}
+            unit="tok/s"
+            min={1}
+            onChange={scenario.setSystemTps}
+            badge={
+              // 三源区分：roofline 估算不能显示得像实测，来源徽标常驻输入旁
+              !tpsContextValid ? (
+                <StatusBadge tone="warn">已失效</StatusBadge>
+              ) : scenario.systemTpsSource === 'estimated' ? (
+                <StatusBadge tone="estimated">公式估算（显存墙 roofline）</StatusBadge>
+              ) : (
+                <StatusBadge tone="target">手工输入</StatusBadge>
+              )
+            }
+          />
           <NumberField label="容量单元 GPU 数" value={scenario.gpusPerCapacityUnit} unit="GPU" min={1} onChange={scenario.setGpusPerCapacityUnit} />
-          <NumberField label="容量余量" value={scenario.headroom * 100} unit="%" min={0} max={100} step={1} onChange={(value) => scenario.setHeadroom(value / 100)} />
+          <NumberField label="容量余量" value={percentValue(scenario.headroom)} unit="%" min={0} max={100} step={1} onChange={(value) => scenario.setHeadroom(value / 100)} />
           <NumberField label="冗余单元" value={scenario.spareUnits} unit="unit" min={0} onChange={scenario.setSpareUnits} />
-          <NumberField label="容量单元时成本" value={scenario.hourlyCost} unit="USD/h" min={0} step={0.1} onChange={scenario.setHourlyCost} />
+          <NumberField
+            label="容量单元时成本"
+            value={capacityUnitHourlyCost}
+            unit="USD/h"
+            min={0}
+            step={0.1}
+            onChange={(value) => scenario.setHourlyCost((value / scenario.gpusPerCapacityUnit) * scenario.gpuCount)}
+          />
         </div>
       </Panel>
 
@@ -140,7 +245,13 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
           <NullableField label="TTFT p95" value={scenario.slo.ttftMs} unit="ms" onChange={(value) => scenario.setSlo({ ttftMs: value })} />
           <NullableField label="TPOT p95" value={scenario.slo.tpotMs} unit="ms/token" onChange={(value) => scenario.setSlo({ tpotMs: value })} />
           <NullableField label="E2E p95" value={scenario.slo.e2eMs} unit="ms" onChange={(value) => scenario.setSlo({ e2eMs: value })} />
-          <NumberField label="最低逐请求达标率" value={scenario.slo.attainment * 100} unit="%" min={0} max={100} step={1} onChange={(value) => scenario.setSlo({ attainment: value / 100 })} />
+          <NullableField
+            label="最低逐请求达标率"
+            value={attainmentTarget === null ? null : percentValue(attainmentTarget)}
+            unit="%"
+            max={100}
+            onChange={(value) => scenario.setSlo({ attainment: value === null ? null : value / 100 })}
+          />
         </div>
       </Panel>
 
@@ -152,22 +263,36 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
           note="峰值 RPS × 每请求输出 token；这是容量需求，不是 Benchmark 结果。"
         />
         <MetricTile
-          label="Little’s Law 并发校验"
-          value={formatMetric(concurrencyCheck, 'request')}
-          badge={<StatusBadge tone="estimated">公式估算</StatusBadge>}
-          note={scenario.slo.e2eMs === null ? '需先填写 E2E SLO。' : `输入并发 ${scenario.concurrency}；估算仅适用于稳态窗口。`}
+          label="Little’s Law 稳态并发校验"
+          value={formatMetric(concurrencyCheck?.expectedConcurrency, 'request')}
+          badge={<StatusBadge tone={concurrencyCheck?.consistent === false ? 'warn' : concurrencyCheck ? 'measured' : 'neutral'}>{concurrencyCheck ? '实测均值 × 公式' : 'N/A'}</StatusBadge>}
+          note={
+            concurrencyCheck === null
+              ? '需导入同一稳态窗口的实测 RPS 与 mean E2E；p95 SLO 不能代替均值。'
+              : observedRunConcurrency === null
+                ? `RPS × mean E2E；run 未显式携带 concurrency，无法做偏差判定。`
+                : `run 并发 ${observedRunConcurrency}；相对偏差 ${concurrencyCheck.relativeError === null ? 'N/A' : `${(concurrencyCheck.relativeError * 100).toFixed(1)}%`}。`
+          }
         />
         <MetricTile
           label="实测单元 Goodput"
           value={formatMetric(measuredGoodput, 'req/s')}
           badge={<StatusBadge tone={measuredGoodput === null ? 'neutral' : 'measured'}>{measuredGoodput === null ? 'N/A' : 'AIPerf 实测'}</StatusBadge>}
-          note={measuredGoodput === null ? '未导入带 --goodput 的有效 run。' : attainmentVerified ? `逐请求达标率 ${(goodFraction! * 100).toFixed(1)}%，达到目标。` : 'Goodput 已实测，但缺少或未达到当前 attainment gate。'}
+          note={
+            measuredGoodput === null
+              ? '未导入带 --goodput 的有效 run。'
+              : attainmentTarget === null
+                ? 'Goodput 已实测；请先显式填写最低逐请求达标率，才能用于 Sizing。'
+                : attainmentVerified
+                  ? `逐请求达标率 ${(goodFraction! * 100).toFixed(1)}%，达到目标。`
+                  : 'Goodput 已实测，但缺少或未达到当前 attainment gate。'
+          }
         />
         <MetricTile
           label="方向性单元 RPS"
           value={formatMetric(estimatedRpsPerUnit, 'req/s')}
           badge={<StatusBadge tone="estimated">未验证 SLO</StatusBadge>}
-          note="当前系统输出 TPS ÷ OSL；只在缺少 Goodput 时作为方向性估算。"
+          note={tpsContextValid ? '当前容量单元系统输出 TPS ÷ OSL；只在缺少 Goodput 时作为方向性估算。' : '模型/GPU/量化/长度或单元拓扑已变化，请重新输入 TPS 或从显存墙刷新。'}
         />
       </div>
 
@@ -183,19 +308,34 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
               <div className="mt-2 flex flex-wrap gap-2">
                 <StatusBadge tone={hasExperienceSlo ? 'ok' : 'warn'}>{hasExperienceSlo ? '已设体验 SLO' : '缺体验 SLO'}</StatusBadge>
                 <StatusBadge tone={attainmentVerified ? 'ok' : 'warn'}>
-                  {goodFraction === null
+                  {attainmentTarget === null
+                    ? '缺最低逐请求达标率'
+                    : goodFraction === null
                     ? '缺 good_request_fraction'
                     : `达标率 ${(goodFraction * 100).toFixed(1)}% ${attainmentVerified ? '通过' : '未通过'}`}
                 </StatusBadge>
+                <StatusBadge tone={sloGatePassed ? 'ok' : 'warn'}>
+                  {sloGatePassed ? '--goodput 约束与 GPU 拓扑一致' : 'run 约束与场景不一致'}
+                </StatusBadge>
                 <StatusBadge tone={measurementConfirmed ? 'ok' : 'warn'}>{measurementConfirmed ? '口径已确认' : '待确认 run 口径'}</StatusBadge>
               </div>
+              {sloGate !== null && sloGate.mismatches.length > 0 && (
+                <ul className="mt-2 space-y-1 text-xs leading-relaxed text-warn">
+                  {sloGate.mismatches.map((mismatch) => (
+                    <li key={mismatch.key}>
+                      △ {mismatch.label}：run {mismatch.runValue === null ? '未声明该约束' : `${mismatch.runValue}${mismatch.key === 'gpuCount' ? ' GPU' : ' ms'}`}
+                      {' '}vs 场景 {mismatch.scenarioValue}{mismatch.key === 'gpuCount' ? ' GPU' : ' ms'}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
             <label className="flex min-h-11 max-w-md cursor-pointer items-start gap-2 rounded-lg border border-line bg-panel px-3 py-2 text-xs leading-relaxed">
               <input
                 type="checkbox"
                 className="mt-0.5 h-4 w-4 shrink-0 accent-accent"
                 checked={measurementConfirmed}
-                disabled={!hasExperienceSlo || !attainmentVerified || measurementKey === null}
+                disabled={!hasExperienceSlo || !attainmentVerified || !sloGatePassed || measurementKey === null}
                 onChange={(event) => setConfirmedMeasurementKey(event.target.checked ? measurementKey : null)}
               />
               <span>我已核对导入 run 与当前场景完全可比，且该 run 的部署单元恰为 {scenario.gpusPerCapacityUnit} GPU。</span>
@@ -244,7 +384,7 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
         <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <NullableField label="每服务器 GPU 数" value={scenario.gpusPerServer} unit="GPU/server" integer onChange={scenario.setGpusPerServer} />
           <NullableField label="每机架服务器数" value={scenario.serversPerRack} unit="server/rack" integer onChange={scenario.setServersPerRack} />
-          <NumberField label="有效利用率" value={scenario.utilization * 100} unit="%" min={1} max={99} onChange={(value) => scenario.setUtilization(value / 100)} />
+          <NumberField label="有效利用率" value={percentValue(scenario.utilization)} unit="%" min={1} max={99} onChange={(value) => scenario.setUtilization(value / 100)} />
           <div className="rounded-lg border border-line bg-panel-2/50 p-3 text-xs leading-relaxed text-dim">
             拓扑来源需要在正式方案中记录。机架数之外还要单独核对网络、供电、散热与 NVLink 域边界。
           </div>
@@ -255,7 +395,11 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
         <MetricTile
           label="每百万输出 Token 成本"
           value={costPerMTok === null ? 'N/A' : `$${costPerMTok.toFixed(2)}`}
-          badge={<StatusBadge tone="estimated">成本假设</StatusBadge>}
+          badge={
+            <StatusBadge tone="estimated">
+              {tpsContextValid && scenario.systemTpsSource === 'estimated' ? '成本假设 · 基于公式估算吞吐' : '成本假设'}
+            </StatusBadge>
+          }
           note="容量单元 $/h ÷（系统输出 TPS × 3600 × 有效利用率）× 10⁶。"
         />
         <MetricTile
@@ -273,7 +417,6 @@ export default function SizingDerivation({ onJumpTo }: SizingDerivationProps) {
           disabled={sizing.gpuCount === null}
           onClick={() => {
             if (sizing.gpuCount === null) return
-            const hourlyCostPerGpu = scenario.hourlyCost / scenario.gpuCount
             scenario.setGpuCount(sizing.gpuCount)
             scenario.setHourlyCost(hourlyCostPerGpu * sizing.gpuCount)
             onJumpTo('economics')
@@ -295,6 +438,7 @@ function NumberField({
   min,
   max,
   step = 1,
+  badge,
   onChange,
 }: {
   label: string
@@ -303,11 +447,17 @@ function NumberField({
   min?: number
   max?: number
   step?: number
+  badge?: ReactNode
   onChange: (value: number) => void
 }) {
   return (
     <label className="min-w-0 text-xs text-dim">
-      {label} <span className="font-mono text-[10px]">({unit})</span>
+      <span className="flex flex-wrap items-center gap-1.5">
+        <span>
+          {label} <span className="font-mono text-[10px]">({unit})</span>
+        </span>
+        {badge}
+      </span>
       <input
         type="number"
         value={value}
@@ -329,12 +479,14 @@ function NullableField({
   value,
   unit,
   integer = false,
+  max,
   onChange,
 }: {
   label: string
   value: number | null
   unit: string
   integer?: boolean
+  max?: number
   onChange: (value: number | null) => void
 }) {
   return (
@@ -343,6 +495,7 @@ function NullableField({
       <input
         type="number"
         min={0}
+        max={max}
         step={integer ? 1 : 0.1}
         value={value ?? ''}
         placeholder="未设置"

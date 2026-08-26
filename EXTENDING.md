@@ -26,7 +26,14 @@
 > 数量/规格差异写 `badge`（不参与 diff），图内风味补充写 `detail`（不参与 diff）。措辞漂移会造成琥珀误报，不确定就不写。
 
 > AIPerf 导入的口径约束：`unit` 以 artifact 内容为准；系统输出 TPS、单用户 tok/s、RPS 与 Goodput 是四个不同指标。
-> Goodput 只接受 AIPerf 已按逐请求 SLO 计算的值，禁止用多个 p95 汇总值二次伪造。
+> Goodput 只接受 AIPerf 已按逐请求 SLO 计算的值，禁止用多个 p95 汇总值二次伪造。分析层只转换明确识别的时间/速率/比例单位，
+> 未知单位与官方 collated 中未携带 unit 的统计都显示 N/A；缺 unit 的 Server/Telemetry series 仅保留原始审计值，不能进入诊断。
+> 多维 Sweep 不会被静默混成单轴曲线，不同 `sweep_id`（或无 ID 时不同来源文件）也必须分组选择，绝不跨实验连线。
+> 实测 Goodput 进入 Sizing 前还必须显式填写客户体验 SLO 与最低逐请求达标率，并核对模型、量化、ISL/OSL、引擎版本、
+> 负载、GPU 拓扑、原始 SLO 与容量单元完全一致；两类 SLO 都没有通用默认值。
+
+> `/inference` 成本状态口径：`systemTps` 是“每容量单元的系统输出 TPS”，`hourlyCost` 是当前 `gpuCount` 对应的整集群时成本。
+> 场景的模型/GPU/量化/batch/ISL/OSL/容量单元变化会使旧 TPS 指纹失效；API 与自建比较统一使用“每百万输出 token”。
 
 ## 演练 ①：新增一个模型（例：Qwen4 发布了）
 

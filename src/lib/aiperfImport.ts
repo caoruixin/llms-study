@@ -39,6 +39,10 @@ export interface NormalizedMetric {
   labels?: Record<string, string>
   seriesKey?: string
   rawValue?: string
+  /** False means the artifact preserved the numbers but omitted information required to interpret them. */
+  available?: boolean
+  /** Finite source statistics retained for audit when `available` is false. */
+  rawStats?: Record<string, number>
   /** True when the metric is not one of AIPerf's commonly-known benchmark tags. */
   unknown: boolean
 }
@@ -270,13 +274,37 @@ function asBoolean(value: unknown): boolean | undefined {
   return undefined
 }
 
-function parseScalar(value: string): unknown {
+/**
+ * CSV metadata/坐标标量的类型推断。数字必须先于布尔判定："0"/"1" 同时命中
+ * asBoolean 的宽松正则，但在 sweep 坐标（concurrency=1）与计数（Successful Runs=0）
+ * 语境里它们是数值；布尔只兜非数字的 true/yes/no 文本。导出以便表驱动单测锁定该顺序。
+ */
+export function parseScalar(value: string): unknown {
   const trimmed = value.trim()
   if (!trimmed) return ''
-  const booleanValue = asBoolean(trimmed)
-  if (booleanValue !== undefined) return booleanValue
   const numberValue = toFiniteNumber(trimmed)
-  return numberValue === undefined ? trimmed : numberValue
+  if (numberValue !== undefined) return numberValue
+  const booleanValue = asBoolean(trimmed)
+  return booleanValue === undefined ? trimmed : booleanValue
+}
+
+/**
+ * benchmark_id/sweep_id 是不透明标识符：metadata 里的纯数字 ID 会被 parseScalar
+ * 推断成 number，这里还原为原始文本，否则数字 ID 无法参与 run key 与 server metrics 关联。
+ */
+function asIdentifier(value: unknown): string | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : undefined
+  if (typeof value === 'boolean') return String(value)
+  return asString(value)
+}
+
+/**
+ * 计数类 metadata 取值不依赖 parseScalar 的推断类型：number/数字文本直接解析，
+ * 1/0 若被推断成 boolean 也按原文还原，保证零成功运行检测始终成立。
+ */
+function metadataFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === 'boolean') return value ? 1 : 0
+  return toFiniteNumber(value)
 }
 
 function stableValue(value: unknown): unknown {
@@ -387,19 +415,140 @@ function extractMetricBlocks(container: unknown): Record<string, NormalizedMetri
   return metrics
 }
 
+/**
+ * 已知 tag 缺 unit 是硬错误：这些是本工作台的核心口径，数值无法解释即不可用。
+ * 未知块（未来 1.x 新增顶层字段、vendor 扩展）缺 unit 则按"忽略未知字段"原则
+ * 走 quarantineUnitlessTelemetry 同款降级：保留原始值、标记 N/A、不判 artifact 无效。
+ */
 function validateMetricUnits(
   metrics: Iterable<NormalizedMetric>,
   artifactName: string,
   errors: ImportIssue[],
+  warnings: ImportIssue[],
 ): void {
   const seen = new Set<string>()
   for (const metric of metrics) {
     if (metric.unit.trim() || seen.has(metric.name)) continue
     seen.add(metric.name)
+    if (metric.unknown) {
+      metric.rawStats = { ...(metric.rawStats ?? {}), ...metric.stats }
+      metric.stats = {}
+      metric.available = false
+      warnings.push(
+        issue(
+          'unknown-metric-unit-unavailable',
+          `未知指标 ${metric.name} 缺少 unit，已保留原始值但标记为 N/A。`,
+          artifactName,
+          metric.name,
+        ),
+      )
+      continue
+    }
     errors.push(
       issue(
         'missing-unit',
         `指标 ${metric.name} 缺少 unit；不会根据指标名猜测单位。`,
+        artifactName,
+        metric.name,
+      ),
+    )
+  }
+}
+
+const DISPERSION_STAT_NAMES = new Set(['std', 'cv', 'se', 'ci_low', 'ci_high', 't_critical', 'rate_std'])
+
+/** 均值/极值/百分位/计数类统计量；离散度与置信区间（ci_low 在均值贴近 0 时可合法为负）不参与符号校验。 */
+const SIGN_CHECKED_STAT_NAMES = new Set(
+  [...PROFILE_STAT_NAMES].filter((name) => !DISPERSION_STAT_NAMES.has(name)),
+)
+
+function fractionRangeLimit(unit: string): number | null {
+  const normalized = unit.trim().toLowerCase().replace(/\s+/g, '')
+  if (normalized === '%' || normalized.includes('percent')) return 100
+  if (normalized === '1' || normalized.includes('ratio') || normalized.includes('fraction') || normalized.includes('proportion')) {
+    return 1
+  }
+  return null
+}
+
+/**
+ * 数值合理性校验：已知 tag 全部是计数/速率/延迟/长度类，核心统计量为负说明数据损坏，
+ * 判 error；ratio/percent 语义的已知指标超出 0..1 / 0..100 时数值不可解释，降级 N/A；
+ * 未知 tag 无法断言语义，不据此否定 artifact，只提示。
+ */
+function validateMetricValues(
+  metrics: Iterable<NormalizedMetric>,
+  artifactName: string,
+  errors: ImportIssue[],
+  warnings: ImportIssue[],
+): void {
+  for (const metric of metrics) {
+    if (metric.available === false) continue
+    const checked = Object.entries(metric.stats).filter(([stat]) => SIGN_CHECKED_STAT_NAMES.has(stat))
+    const negatives = checked.filter(([, value]) => value < 0)
+    if (metric.unknown) {
+      if (negatives.length > 0) {
+        warnings.push(
+          issue(
+            'negative-value',
+            `未知指标 ${metric.name} 存在负值统计量：${negatives.map(([stat]) => stat).join('/')}。`,
+            artifactName,
+            metric.name,
+          ),
+        )
+      }
+      continue
+    }
+    const limit = fractionRangeLimit(metric.unit)
+    if (limit !== null) {
+      const outOfRange = checked.filter(([, value]) => value < 0 || value > limit)
+      if (outOfRange.length === 0) continue
+      metric.rawStats = { ...(metric.rawStats ?? {}), ...metric.stats }
+      metric.stats = {}
+      metric.available = false
+      warnings.push(
+        issue(
+          'fraction-out-of-range',
+          `指标 ${metric.name} 的 ${outOfRange.map(([stat]) => stat).join('/')} 超出 ${limit === 100 ? '0..100' : '0..1'} 区间，已标记为 N/A。`,
+          artifactName,
+          metric.name,
+        ),
+      )
+      continue
+    }
+    if (negatives.length > 0) {
+      errors.push(
+        issue(
+          'negative-value',
+          `指标 ${metric.name} 的 ${negatives.map(([stat]) => stat).join('/')} 为负值，计数/速率/延迟不可能为负。`,
+          artifactName,
+          metric.name,
+        ),
+      )
+    }
+  }
+}
+
+/**
+ * Server/GPU telemetry is auxiliary evidence, so a missing unit must not
+ * invalidate the benchmark artifact. Keep finite source values for audit, but
+ * clear interpreted stats so downstream diagnostics cannot guess whether e.g.
+ * 0.8 or 80 means 80 percent.
+ */
+function quarantineUnitlessTelemetry(
+  metrics: Iterable<NormalizedMetric>,
+  artifactName: string,
+  warnings: ImportIssue[],
+): void {
+  for (const metric of metrics) {
+    if (metric.unit.trim() || metric.available === false) continue
+    metric.rawStats = { ...(metric.rawStats ?? {}), ...metric.stats }
+    metric.stats = {}
+    metric.available = false
+    warnings.push(
+      issue(
+        'server-unit-unavailable',
+        `Server/Telemetry 指标 ${metric.name} 未携带权威 unit，已保留原始值但标记为 N/A。`,
         artifactName,
         metric.name,
       ),
@@ -463,12 +612,14 @@ function buildRunKey(
   fallback: string,
 ): string {
   if (!benchmarkId && !sweepId) return `run:fallback=${fallback}`
+  // 哨兵不得与真实取值重合：trial=0 的单次 run 与"无 trial 的跨 trial 聚合"是两种
+  // 统计口径，variation 'base' 同理，合并会混杂口径。
   return [
     'run',
     `benchmark=${benchmarkId ?? '-'}`,
     `sweep=${sweepId ?? '-'}`,
-    `variation=${variation ?? 'base'}`,
-    `trial=${trial ?? 0}`,
+    `variation=${variation ?? '__none__'}`,
+    `trial=${trial === undefined ? 'none' : trial}`,
   ].join('|')
 }
 
@@ -576,15 +727,42 @@ function runFromArtifact(
   }
 }
 
+function populateSweepRuns(
+  artifact: ImportedArtifact,
+  fingerprint: string,
+  pointScopedErrors: ReadonlySet<ImportIssue>,
+): void {
+  const globalErrors = artifact.errors.filter((entry) => !pointScopedErrors.has(entry))
+  if (globalErrors.length > 0) {
+    artifact.sweepPoints.forEach((point) => (point.valid = false))
+    artifact.runs = []
+    return
+  }
+  artifact.runs = artifact.sweepPoints
+    .filter((point) => point.valid)
+    .map((point) =>
+      runFromArtifact(artifact, fingerprint, point.metrics, {
+        benchmarkId: point.benchmarkId,
+        sweepId: point.sweepId,
+        variation: point.variation,
+        variationIndex: point.variationIndex,
+        trial: point.trial,
+        valid: true,
+        metadata: { ...artifact.metadata, parameters: point.coordinates },
+        errors: [],
+      }),
+    )
+}
+
 function jsonIdentity(artifact: ImportedArtifact, payload: JsonObject): void {
   const runInfo = asObject(payload.run_info)
   const metadata = asObject(payload.metadata)
   artifact.schemaVersion = asString(payload.schema_version)
   artifact.aiperfVersion = asString(payload.aiperf_version)
   artifact.benchmarkId =
-    asString(payload.benchmark_id) ?? asString(runInfo?.benchmark_id) ?? asString(metadata?.benchmark_id)
+    asIdentifier(payload.benchmark_id) ?? asIdentifier(runInfo?.benchmark_id) ?? asIdentifier(metadata?.benchmark_id)
   artifact.sweepId =
-    asString(payload.sweep_id) ?? asString(runInfo?.sweep_id) ?? asString(metadata?.sweep_id)
+    asIdentifier(payload.sweep_id) ?? asIdentifier(runInfo?.sweep_id) ?? asIdentifier(metadata?.sweep_id)
   artifact.variation =
     asString(runInfo?.variation_label) ??
     (isObject(runInfo?.variation_values) && Object.keys(runInfo.variation_values).length > 0
@@ -688,10 +866,12 @@ function parseProfileJson(name: string, payload: JsonObject, fingerprint: string
   validateSchemaVersion(artifact.schemaVersion, name, artifact.errors)
   artifact.metrics = extractMetricBlocks(payload)
   artifact.serverMetrics = flattenGpuTelemetry(payload.telemetry_data)
+  quarantineUnitlessTelemetry(artifact.serverMetrics, name, artifact.warnings)
   if (Object.keys(artifact.metrics).length === 0) {
     artifact.errors.push(issue('empty-profile', 'Profile JSON 不包含可用 Benchmark 指标。', name))
   }
-  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors)
+  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
+  validateMetricValues(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
   checkZeroRequests(artifact.metrics, name, artifact.errors)
   finalizeArtifact(artifact, fingerprint)
   artifact.runs = [runFromArtifact(artifact, fingerprint)]
@@ -719,7 +899,8 @@ function parseConfidenceJson(name: string, payload: JsonObject, fingerprint: str
   if (Object.keys(artifact.metrics).length === 0) {
     artifact.errors.push(issue('empty-aggregate', 'Confidence aggregate JSON 不包含可用指标。', name))
   }
-  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors)
+  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
+  validateMetricValues(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
   checkZeroRequests(artifact.metrics, name, artifact.errors)
   const successfulRuns = toFiniteNumber(payload.num_successful_runs ?? artifact.metadata.num_successful_runs)
   if (successfulRuns !== undefined && successfulRuns <= 0) {
@@ -741,12 +922,37 @@ function parseCollatedJson(name: string, payload: JsonObject, fingerprint: strin
     const combined = asObject(block.combined) ?? block
     const metric = normalizeMetric(metricName, combined)
     metric.unit = asString(combined.unit) ?? asString(block.unit) ?? ''
+    if (!metric.unit) {
+      // Official profile_export_aiperf_collated.json 1.x stores `combined`
+      // statistics and `per_run` entries without a unit field. There is no
+      // authoritative unit elsewhere in that artifact, so retain the finite
+      // numbers for audit but expose the normalized metric as N/A. A matching
+      // profile/confidence artifact may later contribute a unit during batch
+      // merge; we never derive one from the metric tag.
+      metric.rawStats = metric.stats
+      metric.stats = {}
+      metric.available = false
+      artifact.warnings.push(
+        issue(
+          'collated-unit-unavailable',
+          `Collated 指标 ${metricName} 未携带权威 unit，已保留原始统计但标记为 N/A。`,
+          name,
+          metricName,
+        ),
+      )
+    }
     artifact.metrics[metricName] = metric
   }
   if (Object.keys(artifact.metrics).length === 0) {
     artifact.errors.push(issue('empty-collated', 'Collated JSON 不包含可用指标。', name))
   }
-  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors)
+  validateMetricUnits(
+    Object.values(artifact.metrics).filter((metric) => metric.available !== false),
+    name,
+    artifact.errors,
+    artifact.warnings,
+  )
+  validateMetricValues(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
   const successfulRuns = toFiniteNumber(artifact.metadata.num_successful_runs)
   if (successfulRuns !== undefined && successfulRuns <= 0) {
     artifact.errors.push(issue('zero-successful-runs', '成功运行数为 0，collated 结果无效。', name))
@@ -782,6 +988,7 @@ function parseSweepJson(name: string, payload: JsonObject, fingerprint: string):
       .filter(isObject)
       .map((entry) => stableStringify(entry)),
   )
+  const pointScopedErrors = new Set<ImportIssue>()
   combinations.forEach((entry, index) => {
     if (!isObject(entry)) return
     const coordinates = asObject(entry.parameters) ?? {}
@@ -789,8 +996,10 @@ function parseSweepJson(name: string, payload: JsonObject, fingerprint: string):
     const metrics: Record<string, NormalizedMetric> = {}
     for (const [metricName, raw] of Object.entries(rawMetrics)) metrics[metricName] = sweepMetric(metricName, raw)
     const pointErrors: ImportIssue[] = []
-    validateMetricUnits(Object.values(metrics), name, pointErrors)
+    validateMetricUnits(Object.values(metrics), name, pointErrors, artifact.warnings)
+    validateMetricValues(Object.values(metrics), name, pointErrors, artifact.warnings)
     checkZeroRequests(metrics, name, pointErrors)
+    pointErrors.forEach((entry) => pointScopedErrors.add(entry))
     artifact.errors.push(...pointErrors)
     const variation = asString(entry.variation_label) ?? stableStringify(coordinates)
     const trial = asIndex(entry.trial)
@@ -813,7 +1022,7 @@ function parseSweepJson(name: string, payload: JsonObject, fingerprint: string):
     artifact.errors.push(issue('zero-successful-runs', '成功运行数为 0，Sweep 结果无效。', name))
   }
   finalizeArtifact(artifact, fingerprint)
-  if (!artifact.valid) artifact.sweepPoints.forEach((point) => (point.valid = false))
+  populateSweepRuns(artifact, fingerprint, pointScopedErrors)
   return artifact
 }
 
@@ -823,7 +1032,7 @@ function flattenServerJsonMetrics(payload: JsonObject): NormalizedMetric[] {
   for (const [name, rawBlock] of Object.entries(blocks)) {
     const block = asObject(rawBlock)
     if (!block) continue
-    const unit = asString(block.unit) ?? ''
+    const blockUnit = asString(block.unit) ?? ''
     const metricType = asString(block.type)
     const seriesList = Array.isArray(block.series) ? block.series : []
     if (seriesList.length === 0 && isObject(block.stats)) seriesList.push(block)
@@ -837,6 +1046,8 @@ function flattenServerJsonMetrics(payload: JsonObject): NormalizedMetric[] {
         for (const [key, value] of Object.entries(labelsObject)) labels[key] = String(value)
       }
       const endpoint = asString(series.endpoint_url)
+      const unit = asString(series.unit) ?? blockUnit
+      const rawSeriesValue = series.value ?? asObject(series.stats)?.value
       const metric: NormalizedMetric = {
         name,
         unit,
@@ -846,6 +1057,7 @@ function flattenServerJsonMetrics(payload: JsonObject): NormalizedMetric[] {
         metricType,
         labels,
         seriesKey: serverSeriesKey(name, endpoint, metricType, labels),
+        ...(rawSeriesValue === undefined ? {} : { rawValue: String(rawSeriesValue) }),
         unknown: !isKnownMetric(name),
       }
       result.push(metric)
@@ -859,12 +1071,12 @@ function parseServerJson(name: string, payload: JsonObject, fingerprint: string)
   jsonIdentity(artifact, payload)
   validateSchemaVersion(artifact.schemaVersion, name, artifact.errors)
   artifact.serverMetrics = flattenServerJsonMetrics(payload)
+  quarantineUnitlessTelemetry(artifact.serverMetrics, name, artifact.warnings)
   artifact.inputConfig = asObject(payload.input_config)
   artifact.metadata = asObject(payload.summary) ?? {}
   if (artifact.serverMetrics.length === 0) {
     artifact.errors.push(issue('empty-server-metrics', 'Server metrics 文件不包含可用指标。', name))
   }
-  validateMetricUnits(artifact.serverMetrics, name, artifact.errors)
   finalizeArtifact(artifact, fingerprint)
   return artifact
 }
@@ -969,21 +1181,28 @@ function isServerCsv(rows: string[][]): boolean {
     (row) =>
       findHeaderIndex(row, 'Endpoint') >= 0 &&
       findHeaderIndex(row, 'Type') >= 0 &&
-      findHeaderIndex(row, 'Metric') >= 0 &&
-      findHeaderIndex(row, 'Unit') >= 0,
+      findHeaderIndex(row, 'Metric') >= 0,
   )
 }
 
 function isSweepCsv(rows: string[][]): boolean {
+  // Metadata/Pareto/Best Configurations 是 sweep 导出特有的分节标记；
+  // 只导出单个 KPI 列的官方 sweep 宽表要靠它们识别。
   if (
     rows.some((row) =>
-      ['best_configurations', 'pareto_optimal_points'].includes(normalizedHeader(row[0] ?? '')),
+      ['best_configurations', 'pareto_optimal_points', 'metadata'].includes(normalizedHeader(row[0] ?? '')),
     )
   )
     return true
-  return rows.some(
-    (row) => row.some((cell, index) => Boolean(sweepCsvColumn(cell, index))) && findHeaderIndex(row, 'metric') < 0,
-  )
+  // 宽表兜底判定只认表头行：tag 式指标名（time_to_first_token_p99 等）也会出现在
+  // confidence/profile 的数据行并命中 sweepCsvColumn 正则，因此要求同一行 ≥2 个
+  // 指标列且整行是非数值文本，才能断定这是 sweep 宽表表头而不是别家的数据行。
+  return rows.some((row) => {
+    if (findHeaderIndex(row, 'metric') >= 0) return false
+    const metricColumns = row.filter((cell, index) => Boolean(sweepCsvColumn(cell, index)))
+    if (metricColumns.length < 2) return false
+    return row.every((cell) => !cell.trim() || toFiniteNumber(cell) === undefined)
+  })
 }
 
 function isConfidenceCsv(rows: string[][]): boolean {
@@ -1012,6 +1231,11 @@ function extractDisplayUnit(value: string): { displayName: string; unit: string 
 }
 
 function officialSuppressedCsvUnit(metricName: string): string {
+  // AIPerf MetricsCsvExporter intentionally omits the `(unit)` suffix when a
+  // built-in metric's unit is exactly `requests`/`count`. Restore only the two
+  // canonical request counters consumed by this workbench. This is format
+  // compatibility for known exporter rows, not a name-based fallback for
+  // arbitrary or future metrics; every other missing unit remains invalid.
   if (metricName === 'request_count' || metricName === 'good_request_count') return 'requests'
   return ''
 }
@@ -1105,7 +1329,9 @@ function parseProfileCsv(name: string, rows: string[][], fingerprint: string): I
   if (Object.keys(artifact.metrics).length === 0) {
     artifact.errors.push(issue('empty-profile', 'Profile CSV 不包含可用 Benchmark 指标。', name))
   }
-  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors)
+  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
+  validateMetricValues(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
+  quarantineUnitlessTelemetry(artifact.serverMetrics, name, artifact.warnings)
   checkZeroRequests(artifact.metrics, name, artifact.errors)
   finalizeArtifact(artifact, fingerprint)
   artifact.runs = [runFromArtifact(artifact, fingerprint)]
@@ -1142,15 +1368,16 @@ function parseConfidenceCsv(name: string, rows: string[][], fingerprint: string)
     }
     artifact.metadata = metadataFromTwoColumnRows(rows.slice(index))
   }
-  artifact.benchmarkId = artifact.benchmarkId ?? asString(artifact.metadata.benchmark_id)
-  artifact.sweepId = artifact.sweepId ?? asString(artifact.metadata.sweep_id)
+  artifact.benchmarkId = artifact.benchmarkId ?? asIdentifier(artifact.metadata.benchmark_id)
+  artifact.sweepId = artifact.sweepId ?? asIdentifier(artifact.metadata.sweep_id)
   artifact.cancelled = artifact.cancelled || (asBoolean(artifact.metadata.was_cancelled) ?? false)
   if (Object.keys(artifact.metrics).length === 0) {
     artifact.errors.push(issue('empty-aggregate', 'Confidence aggregate CSV 不包含可用指标。', name))
   }
-  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors)
+  validateMetricUnits(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
+  validateMetricValues(Object.values(artifact.metrics), name, artifact.errors, artifact.warnings)
   checkZeroRequests(artifact.metrics, name, artifact.errors)
-  const successfulRuns = toFiniteNumber(artifact.metadata.successful_runs)
+  const successfulRuns = metadataFiniteNumber(artifact.metadata.successful_runs)
   if (successfulRuns !== undefined && successfulRuns <= 0) {
     artifact.errors.push(issue('zero-successful-runs', '成功运行数为 0，聚合结果无效。', name))
   }
@@ -1203,8 +1430,8 @@ function parseSweepCsv(name: string, rows: string[][], fingerprint: string): Imp
   validateSchemaVersion(artifact.schemaVersion, name, artifact.errors)
   addMetadataRequiredWarning(artifact)
   artifact.metadata = parseSweepCsvMetadata(rows)
-  artifact.sweepId = artifact.sweepId ?? asString(artifact.metadata.sweep_id)
-  artifact.benchmarkId = artifact.benchmarkId ?? asString(artifact.metadata.benchmark_id)
+  artifact.sweepId = artifact.sweepId ?? asIdentifier(artifact.metadata.sweep_id)
+  artifact.benchmarkId = artifact.benchmarkId ?? asIdentifier(artifact.metadata.benchmark_id)
   artifact.cancelled = artifact.cancelled || (asBoolean(artifact.metadata.was_cancelled) ?? false)
   const tableIndex = rows.findIndex((row) => row.some((cell, index) => sweepCsvColumn(cell, index)))
   if (tableIndex < 0) {
@@ -1222,6 +1449,7 @@ function parseSweepCsv(name: string, rows: string[][], fingerprint: string): Imp
     .map((parameter, index) => ({ name: parameter.trim(), index }))
     .filter((entry) => entry.name)
   const pareto = parseParetoCoordinateSet(rows)
+  const pointScopedErrors = new Set<ImportIssue>()
   let rowIndex = tableIndex + 1
   let pointIndex = 0
   while (rowIndex < rows.length && !rowIsBlank(rows[rowIndex])) {
@@ -1247,8 +1475,10 @@ function parseSweepCsv(name: string, rows: string[][], fingerprint: string): Imp
       metrics[column.metricName] = metric
     }
     const pointErrors: ImportIssue[] = []
-    validateMetricUnits(Object.values(metrics), name, pointErrors)
+    validateMetricUnits(Object.values(metrics), name, pointErrors, artifact.warnings)
+    validateMetricValues(Object.values(metrics), name, pointErrors, artifact.warnings)
     checkZeroRequests(metrics, name, pointErrors)
+    pointErrors.forEach((entry) => pointScopedErrors.add(entry))
     artifact.errors.push(...pointErrors)
     artifact.sweepPoints.push({
       key: buildSweepPointKey(artifact.sweepId, artifact.benchmarkId, coordinates, undefined, fingerprint),
@@ -1268,12 +1498,12 @@ function parseSweepCsv(name: string, rows: string[][], fingerprint: string): Imp
   if (artifact.sweepPoints.length === 0) {
     artifact.errors.push(issue('empty-sweep', 'Sweep CSV 不包含任何参数组合。', name))
   }
-  const successfulRuns = toFiniteNumber(artifact.metadata.number_of_successful_runs)
+  const successfulRuns = metadataFiniteNumber(artifact.metadata.number_of_successful_runs)
   if (successfulRuns !== undefined && successfulRuns <= 0) {
     artifact.errors.push(issue('zero-successful-runs', '成功运行数为 0，Sweep 结果无效。', name))
   }
   finalizeArtifact(artifact, fingerprint)
-  if (!artifact.valid) artifact.sweepPoints.forEach((point) => (point.valid = false))
+  populateSweepRuns(artifact, fingerprint, pointScopedErrors)
   return artifact
 }
 
@@ -1335,7 +1565,7 @@ function parseServerCsv(name: string, rows: string[][], fingerprint: string): Im
     const typeColumn = findHeaderIndex(header, 'Type')
     const metricColumn = findHeaderIndex(header, 'Metric')
     const unitColumn = findHeaderIndex(header, 'Unit')
-    if (endpointColumn >= 0 && typeColumn >= 0 && metricColumn >= 0 && unitColumn >= 0) {
+    if (endpointColumn >= 0 && typeColumn >= 0 && metricColumn >= 0) {
       index += 1
       while (index < rows.length && !rowIsBlank(rows[index])) {
         const metric = serverCsvMetric(
@@ -1384,7 +1614,7 @@ function parseServerCsv(name: string, rows: string[][], fingerprint: string): Im
   if (artifact.serverMetrics.length === 0) {
     artifact.errors.push(issue('empty-server-metrics', 'Server metrics CSV 不包含可用指标。', name))
   }
-  validateMetricUnits(artifact.serverMetrics, name, artifact.errors)
+  quarantineUnitlessTelemetry(artifact.serverMetrics, name, artifact.warnings)
   finalizeArtifact(artifact, fingerprint)
   return artifact
 }
@@ -1398,9 +1628,11 @@ function parseCsvArtifact(name: string, text: string): ImportedArtifact {
     return finalizeArtifact(artifact, fingerprint)
   }
   if (isServerCsv(rows)) return parseServerCsv(name, rows, fingerprint)
-  if (isSweepCsv(rows)) return parseSweepCsv(name, rows, fingerprint)
+  // confidence/profile 的数据行可能含 tag 式指标名并命中 sweep 宽表正则，
+  // 先做列结构判据更强的 confidence/profile 判定，sweep 兜底放最后。
   if (isConfidenceCsv(rows)) return parseConfidenceCsv(name, rows, fingerprint)
   if (isProfileCsv(rows)) return parseProfileCsv(name, rows, fingerprint)
+  if (isSweepCsv(rows)) return parseSweepCsv(name, rows, fingerprint)
   const artifact = baseArtifact(name, 'csv', 'unknown')
   artifact.errors.push(issue('unrecognized-artifact', '无法按内容识别 AIPerf CSV artifact 类型。', name))
   return finalizeArtifact(artifact, fingerprint)
@@ -1427,32 +1659,278 @@ export function parseAiperfArtifact(name: string, text: string): ImportedArtifac
   return parseCsvArtifact(name, text)
 }
 
-function chooseBetterRun(a: NormalizedBenchmarkRun, b: NormalizedBenchmarkRun): NormalizedBenchmarkRun {
-  if (a.valid !== b.valid) return a.valid ? a : b
-  const aMetricCount = Object.keys(a.metrics).length + a.serverMetrics.length
-  const bMetricCount = Object.keys(b.metrics).length + b.serverMetrics.length
-  return bMetricCount > aMetricCount ? b : a
+function informationScore(value: unknown): number {
+  if (value === undefined || value === null) return 0
+  if (Array.isArray(value)) return 100 + value.length
+  if (isObject(value)) return 200 + Object.keys(value).length
+  if (typeof value === 'string') return 10 + Math.min(value.length, 50)
+  return 10
+}
+
+function mergeUnknownDeterministically(a: unknown, b: unknown): unknown {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  const aText = stableStringify(a)
+  const bText = stableStringify(b)
+  if (aText === bText) return a
+  if (isObject(a) && isObject(b)) {
+    const merged: JsonObject = {}
+    const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()
+    for (const key of keys) {
+      const value = mergeUnknownDeterministically(a[key], b[key])
+      if (value !== undefined) merged[key] = value
+    }
+    return merged
+  }
+  const aScore = informationScore(a)
+  const bScore = informationScore(b)
+  if (aScore !== bScore) return aScore > bScore ? a : b
+  return aText <= bText ? a : b
+}
+
+function mergeOptionalObjects(
+  a: Record<string, unknown> | undefined,
+  b: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!a) return b ? { ...b } : undefined
+  if (!b) return { ...a }
+  return mergeUnknownDeterministically(a, b) as Record<string, unknown>
+}
+
+function mergeNumberRecords(
+  primary: Record<string, number>,
+  secondary: Record<string, number>,
+): Record<string, number> {
+  const merged: Record<string, number> = {}
+  for (const key of [...new Set([...Object.keys(primary), ...Object.keys(secondary)])].sort()) {
+    merged[key] = primary[key] ?? secondary[key]
+  }
+  return merged
+}
+
+function metricQuality(metric: NormalizedMetric): number {
+  return (
+    (metric.available === false ? 0 : 1_000_000) +
+    (metric.unit ? 100_000 : 0) +
+    Object.keys(metric.stats).length * 100 +
+    Object.keys(metric.rawStats ?? {}).length
+  )
+}
+
+function mergeNormalizedMetric(
+  a: NormalizedMetric,
+  b: NormalizedMetric,
+  conflictedUnits?: Set<string>,
+): NormalizedMetric {
+  const aQuality = metricQuality(a)
+  const bQuality = metricQuality(b)
+  const primary =
+    aQuality !== bQuality
+      ? aQuality > bQuality
+        ? a
+        : b
+      : stableStringify(a) <= stableStringify(b)
+        ? a
+        : b
+  const secondary = primary === a ? b : a
+  const compatibleUnits = !primary.unit || !secondary.unit || primary.unit === secondary.unit
+  const labels = mergeOptionalObjects(primary.labels, secondary.labels) as Record<string, string> | undefined
+  if (!compatibleUnits) {
+    // 同名指标单位矛盾时数值不可解释：不静默偏袒任何一方，保留双方统计供审计，
+    // 对齐 sweep 去重路径显式上报冲突的做法。
+    conflictedUnits?.add(primary.name)
+    return {
+      ...secondary,
+      ...primary,
+      name: primary.name,
+      unit: primary.unit,
+      stats: {},
+      rawStats: mergeNumberRecords(
+        { ...(primary.rawStats ?? {}), ...primary.stats },
+        { ...(secondary.rawStats ?? {}), ...secondary.stats },
+      ),
+      available: false,
+      ...(labels ? { labels } : {}),
+      unknown: primary.unknown && secondary.unknown,
+    }
+  }
+  const resolvedUnit = primary.unit || secondary.unit
+  const resolvedAvailability = resolvedUnit
+    ? primary.available !== false || secondary.available !== false
+    : primary.available === false || secondary.available === false
+      ? false
+      : undefined
+  return {
+    ...secondary,
+    ...primary,
+    name: primary.name,
+    unit: resolvedUnit,
+    stats: mergeNumberRecords(primary.stats, secondary.stats),
+    ...(primary.rawStats || secondary.rawStats
+      ? {
+          rawStats: mergeNumberRecords(primary.rawStats ?? {}, secondary.rawStats ?? {}),
+        }
+      : {}),
+    ...(resolvedAvailability === undefined ? {} : { available: resolvedAvailability }),
+    ...(labels ? { labels } : {}),
+    unknown: primary.unknown && secondary.unknown,
+  }
+}
+
+function mergeMetricRecords(
+  a: Record<string, NormalizedMetric>,
+  b: Record<string, NormalizedMetric>,
+  conflictedUnits?: Set<string>,
+): Record<string, NormalizedMetric> {
+  const merged: Record<string, NormalizedMetric> = {}
+  for (const key of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
+    const left = a[key]
+    const right = b[key]
+    merged[key] = left && right ? mergeNormalizedMetric(left, right, conflictedUnits) : (left ?? right)
+  }
+  return merged
+}
+
+function conflictingUnitWarnings(conflictedUnits: Set<string>, artifactName: string): ImportIssue[] {
+  return [...conflictedUnits].sort().map((metricName) =>
+    issue(
+      'conflicting-metric-unit',
+      `指标 ${metricName} 在不同来源中单位不一致，数值不可解释，已标记为 N/A。`,
+      artifactName,
+      metricName,
+    ),
+  )
+}
+
+function normalizedServerMetricKey(metric: NormalizedMetric): string {
+  return `${metric.name}:${metric.seriesKey ?? stableHash(stableStringify(metric))}`
+}
+
+function mergeServerMetricLists(
+  a: NormalizedMetric[],
+  b: NormalizedMetric[],
+  conflictedUnits?: Set<string>,
+): NormalizedMetric[] {
+  const merged = new Map<string, NormalizedMetric>()
+  for (const metric of [...a, ...b]) {
+    const key = normalizedServerMetricKey(metric)
+    const existing = merged.get(key)
+    merged.set(key, existing ? mergeNormalizedMetric(existing, metric, conflictedUnits) : metric)
+  }
+  return [...merged.entries()]
+    .sort(([aKey], [bKey]) => aKey.localeCompare(bKey))
+    .map(([, metric]) => metric)
+}
+
+function mergeIssues(a: ImportIssue[], b: ImportIssue[]): ImportIssue[] {
+  const byKey = new Map<string, ImportIssue>()
+  for (const entry of [...a, ...b]) byKey.set(stableStringify(entry), entry)
+  return [...byKey.entries()]
+    .sort(([aKey], [bKey]) => aKey.localeCompare(bKey))
+    .map(([, entry]) => entry)
+}
+
+function deterministicOptional<T>(a: T | undefined, b: T | undefined): T | undefined {
+  return mergeUnknownDeterministically(a, b) as T | undefined
+}
+
+function mergeRuns(a: NormalizedBenchmarkRun, b: NormalizedBenchmarkRun): NormalizedBenchmarkRun {
+  const errors = mergeIssues(a.errors, b.errors)
+  const conflictedUnits = new Set<string>()
+  const metrics = mergeMetricRecords(a.metrics, b.metrics, conflictedUnits)
+  const serverMetrics = mergeServerMetricLists(a.serverMetrics, b.serverMetrics, conflictedUnits)
+  const sourceNames = [...new Set([...a.sourceNames, ...b.sourceNames])].sort()
+  return {
+    key: a.key,
+    benchmarkId: deterministicOptional(a.benchmarkId, b.benchmarkId),
+    sweepId: deterministicOptional(a.sweepId, b.sweepId),
+    variation: deterministicOptional(a.variation, b.variation),
+    variationIndex: deterministicOptional(a.variationIndex, b.variationIndex),
+    trial: deterministicOptional(a.trial, b.trial),
+    valid: a.valid && b.valid && errors.length === 0,
+    cancelled: a.cancelled || b.cancelled,
+    sourceNames,
+    metrics,
+    serverMetrics,
+    inputConfig: mergeOptionalObjects(a.inputConfig, b.inputConfig),
+    metadata: mergeOptionalObjects(a.metadata, b.metadata) ?? {},
+    errors,
+    warnings: mergeIssues(
+      mergeIssues(a.warnings, b.warnings),
+      conflictingUnitWarnings(conflictedUnits, sourceNames.join(', ')),
+    ),
+  }
 }
 
 function mergeServerMetrics(target: NormalizedBenchmarkRun, artifact: ImportedArtifact): void {
-  const known = new Set(
-    target.serverMetrics.map((metric) => `${metric.name}:${metric.seriesKey ?? stableHash(stableStringify(metric))}`),
-  )
-  for (const metric of artifact.serverMetrics) {
-    const key = `${metric.name}:${metric.seriesKey ?? stableHash(stableStringify(metric))}`
-    if (!known.has(key)) {
-      known.add(key)
-      target.serverMetrics.push(metric)
-      const recordKey = target.metrics[metric.name]
-        ? `${metric.name}#${metric.seriesKey ?? stableHash(stableStringify(metric))}`
-        : metric.name
-      target.metrics[recordKey] = metric
+  const conflictedUnits = new Set<string>()
+  target.serverMetrics = mergeServerMetricLists(target.serverMetrics, artifact.serverMetrics, conflictedUnits)
+  for (const [key, metric] of Object.entries(target.metrics)) {
+    if (metric.scope === 'server' || metric.scope === 'gpu') delete target.metrics[key]
+  }
+  for (const [index, metric] of target.serverMetrics.entries()) {
+    const recordKey = target.metrics[metric.name]
+      ? `${metric.name}#${metric.seriesKey ?? index}`
+      : metric.name
+    target.metrics[recordKey] = metric
+  }
+  target.sourceNames = [...new Set([...target.sourceNames, artifact.name])].sort()
+  target.warnings = mergeIssues(target.warnings, [
+    ...artifact.warnings,
+    ...conflictingUnitWarnings(conflictedUnits, artifact.name),
+  ])
+}
+
+function sweepMetricConflicts(a: SweepPoint, b: SweepPoint): string[] {
+  const conflicts: string[] = []
+  for (const metricName of Object.keys(a.metrics).filter((name) => b.metrics[name]).sort()) {
+    const left = a.metrics[metricName]
+    const right = b.metrics[metricName]
+    if (left.unit && right.unit && left.unit !== right.unit) conflicts.push(`${metricName}.unit`)
+    for (const statistic of Object.keys(left.stats).filter((name) => name in right.stats).sort()) {
+      if (left.stats[statistic] !== right.stats[statistic]) conflicts.push(`${metricName}.${statistic}`)
     }
   }
-  if (!target.sourceNames.includes(artifact.name)) target.sourceNames.push(artifact.name)
+  if (a.paretoOptimal !== undefined && b.paretoOptimal !== undefined && a.paretoOptimal !== b.paretoOptimal) {
+    conflicts.push('paretoOptimal')
+  }
+  return conflicts
+}
+
+function mergeSweepPoints(a: SweepPoint, b: SweepPoint): SweepPoint {
+  const sourceNames = [a.sourceName, b.sourceName].filter((name): name is string => Boolean(name)).sort()
+  const metrics = mergeMetricRecords(a.metrics, b.metrics)
+  const requestCount = Object.values(metrics).find((metric) => metricBaseName(metric.name) === 'request_count')
+  const requestCountValue = requestCount
+    ? requestCount.stats.avg ?? requestCount.stats.mean ?? requestCount.stats.value ?? requestCount.stats.total ?? requestCount.stats.count
+    : undefined
+  const metricsRemainValid =
+    Object.values(metrics).every((metric) => Boolean(metric.unit.trim())) &&
+    (requestCountValue === undefined || requestCountValue > 0)
+  const paretoOptimal = deterministicOptional(a.paretoOptimal, b.paretoOptimal)
+  return {
+    key: a.key,
+    sweepId: deterministicOptional(a.sweepId, b.sweepId),
+    benchmarkId: deterministicOptional(a.benchmarkId, b.benchmarkId),
+    variation: deterministicOptional(a.variation, b.variation) ?? a.variation,
+    variationIndex: deterministicOptional(a.variationIndex, b.variationIndex),
+    trial: deterministicOptional(a.trial, b.trial),
+    coordinates: mergeOptionalObjects(a.coordinates, b.coordinates) ?? {},
+    metrics,
+    valid: (a.valid || b.valid) && metricsRemainValid,
+    ...(paretoOptimal === undefined ? {} : { paretoOptimal }),
+    sourceName: sourceNames[0],
+  }
 }
 
 function duplicateWarning(duplicate: ImportDuplicate): ImportIssue {
+  if (duplicate.type === 'run') {
+    return issue(
+      'duplicate-run',
+      `同 identity 的 run 已确定性合并：${duplicate.kept}（合并来源 ${duplicate.dropped}）。`,
+      duplicate.dropped,
+    )
+  }
   return issue(
     `duplicate-${duplicate.type}`,
     `已去重 ${duplicate.type} ${duplicate.key}；保留 ${duplicate.kept}，忽略 ${duplicate.dropped}。`,
@@ -1489,17 +1967,16 @@ function batchFromArtifacts(parsedArtifacts: ImportedArtifact[]): ImportBatch {
         runMap.set(run.key, run)
         continue
       }
-      const chosen = chooseBetterRun(existing, run)
-      const dropped = chosen === existing ? run : existing
+      const merged = mergeRuns(existing, run)
       const duplicate: ImportDuplicate = {
         type: 'run',
         key: run.key,
-        kept: chosen.sourceNames.join(', '),
-        dropped: dropped.sourceNames.join(', '),
+        kept: merged.sourceNames.join(', '),
+        dropped: run.sourceNames.join(', '),
       }
       duplicates.push(duplicate)
       warnings.push(duplicateWarning(duplicate))
-      runMap.set(run.key, chosen)
+      runMap.set(run.key, merged)
     }
   }
 
@@ -1511,15 +1988,27 @@ function batchFromArtifacts(parsedArtifacts: ImportedArtifact[]): ImportBatch {
         sweepPointMap.set(point.key, point)
         continue
       }
+      const sourceNames = [existing.sourceName ?? '已导入 Sweep', point.sourceName ?? artifact.name].sort()
+      const conflicts = sweepMetricConflicts(existing, point)
+      const merged = mergeSweepPoints(existing, point)
       const duplicate: ImportDuplicate = {
         type: 'sweep-point',
         key: point.key,
-        kept: existing.sourceName ?? '已导入 Sweep',
-        dropped: point.sourceName ?? artifact.name,
+        kept: sourceNames[0],
+        dropped: sourceNames[1],
       }
       duplicates.push(duplicate)
       warnings.push(duplicateWarning(duplicate))
-      if (!existing.valid && point.valid) sweepPointMap.set(point.key, point)
+      if (conflicts.length > 0) {
+        warnings.push(
+          issue(
+            'conflicting-sweep-point',
+            `同 identity 的 Sweep point 存在冲突字段，已稳定选择：${conflicts.join(', ')}。`,
+            sourceNames[1],
+          ),
+        )
+      }
+      sweepPointMap.set(point.key, merged)
     }
   }
 

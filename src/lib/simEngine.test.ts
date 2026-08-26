@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   apiBlendedPerMTok,
+  apiCostPerOutputMTok,
   apiRequestCost,
   breakEvenDailyMTok,
   estimateTokens,
@@ -116,6 +117,11 @@ describe('经济模型', () => {
     expect(blended).toBeCloseTo(0.8 * (2 * 0.5 + 0.2 * 0.5) + 0.2 * 8)
     // 集群 $50/h、API $2/MTok → 日均 600 MTok 打平
     expect(breakEvenDailyMTok(50, 2)).toBeCloseTo(600)
+  })
+
+  it('将 API 混合总 token 单价归一为输出 token 口径', () => {
+    expect(apiCostPerOutputMTok(3, 0.15)).toBeCloseTo(20)
+    expect(apiCostPerOutputMTok(3, 0)).toBeNull()
   })
 })
 
