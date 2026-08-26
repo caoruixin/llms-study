@@ -5,7 +5,7 @@ import type { BriefData } from '../../lib/paper/briefPipeline'
 import type { BriefUiState } from '../../pages/papers/paperUiStore'
 import type { PaperBlock, SourceAnchor } from '../../lib/paper/types'
 
-/** 左栏：目录 + 阅读进度 + 论文地图（§3.4）+ 本地全文搜索 */
+/** 左栏：目录 + 阅读进度 + 论文地图（§3.4）+ 本地全文搜索 + 高亮回查列表 */
 
 export interface OutlineItem {
   blockIndex: number
@@ -35,12 +35,23 @@ export function buildOutline(blocks: readonly PaperBlock[]): OutlineItem[] {
   return items
 }
 
-export type OutlineTab = 'outline' | 'search'
+export type OutlineTab = 'outline' | 'search' | 'highlights'
 
 const TABS = [
   { id: 'outline', label: '目录' },
   { id: 'search', label: '搜索' },
+  { id: 'highlights', label: '高亮' },
 ] as const satisfies readonly { readonly id: OutlineTab; readonly label: string }[]
+
+/** 高亮列表项：工作台侧从 PaperHighlight 排好序、补上 section 后传入 */
+export interface HighlightListItem {
+  id: string
+  blockIndex: number
+  lang: 'orig' | 'zh'
+  /** 快照文本：原文重解析后失配也照常展示，跳块仍可用 */
+  text: string
+  section?: string
+}
 
 interface Props {
   outline: OutlineItem[]
@@ -57,6 +68,9 @@ interface Props {
   searchHits: SearchHit[]
   searchBusy: boolean
   searchRan: boolean
+  /** 本篇全部高亮（已按 blockIndex, start 排序），点击跳回原文并闪烁定位 */
+  highlights: readonly HighlightListItem[]
+  onRemoveHighlight: (id: string) => void
   /** 论文地图（Phase 3）：数据 + 进度由 CopilotPanel 写入 store，经工作台传入 */
   brief: BriefData | null
   briefUi: BriefUiState | null
@@ -170,6 +184,8 @@ export default function OutlinePane({
   searchHits,
   searchBusy,
   searchRan,
+  highlights,
+  onRemoveHighlight,
   brief,
   briefUi,
   onGenerateBrief,
@@ -227,7 +243,7 @@ export default function OutlinePane({
 
           <BriefCard brief={brief} briefUi={briefUi} onGenerate={onGenerateBrief} />
         </nav>
-      ) : (
+      ) : tab === 'search' ? (
         <div className="flex min-h-0 flex-1 flex-col gap-2">
           <form
             onSubmit={(e) => {
@@ -288,6 +304,48 @@ export default function OutlinePane({
               </ul>
             )}
           </div>
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+          {highlights.length === 0 ? (
+            <p className="text-xs leading-relaxed text-dim">
+              还没有高亮。阅读时选中文字，点『高亮』即可标记不熟悉的部分。
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {highlights.map((h) => (
+                // ✕ 不能嵌在跳转按钮里（button 套 button 非法 HTML）：绝对定位成兄弟节点
+                <li key={h.id} className="relative">
+                  <button
+                    type="button"
+                    onClick={() => onJumpBlock(h.blockIndex)}
+                    className="w-full rounded-lg border border-line bg-panel-2 p-2 pr-7 text-left transition-colors hover:border-accent/50"
+                  >
+                    {(h.section !== undefined || h.lang === 'zh') && (
+                      <div className="mb-1 flex items-center gap-2 text-[0.65rem] text-dim">
+                        {h.section !== undefined && <span className="truncate">{h.section}</span>}
+                        {h.lang === 'zh' && (
+                          <span className="shrink-0 rounded border border-line px-1 text-[0.65rem] text-dim">译</span>
+                        )}
+                      </div>
+                    )}
+                    <p className="line-clamp-3 text-xs leading-relaxed break-words text-fg">{h.text}</p>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="删除这条高亮"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onRemoveHighlight(h.id)
+                    }}
+                    className="absolute top-1.5 right-1.5 rounded px-1 text-xs text-dim transition-colors hover:bg-panel hover:text-fg"
+                  >
+                    ✕
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
     </div>

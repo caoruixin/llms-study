@@ -20,6 +20,8 @@ interface Props {
   anchorFromElement: (el: Element) => SourceAnchor | null
   /** opts.translated：选区起点落在应用内译文（[data-translated]）里 */
   onAction: (action: PaperAskAction, text: string, anchor: SourceAnchor | null, opts: { translated: boolean }) => void
+  /** 有值才渲染「高亮」按钮（仅文本视图传入——原版 PDF 锚点只到页，不支持高亮） */
+  onHighlight?: (range: Range) => void
 }
 
 interface BarState {
@@ -29,11 +31,13 @@ interface BarState {
   anchor: SourceAnchor | null
   /** 选区起点是否在译文元素内（Copilot 侧据此提示「以原文语义为准」） */
   translated: boolean
+  /** 选区快照（cloneRange）：点按钮时 selection 可能已塌陷，高亮捕获只能靠它 */
+  range: Range
 }
 
-const BAR_WIDTH = 336
+const BAR_WIDTH = 400
 
-export default function SelectionActions({ containerRef, anchorFromElement, onAction }: Props) {
+export default function SelectionActions({ containerRef, anchorFromElement, onAction, onHighlight }: Props) {
   const [bar, setBar] = useState<BarState | null>(null)
   // 容器 ref 在渲染期同步进来：选区 effect 空依赖，不能因为父组件重渲染就重挂监听
   const containerRefRef = useRef(containerRef)
@@ -71,12 +75,13 @@ export default function SelectionActions({ containerRef, anchorFromElement, onAc
         const anchorEl = asElement(sel.anchorNode)
         if (!anchorEl || !box.contains(anchorEl)) return
 
-        const r = sel.getRangeAt(0).getBoundingClientRect()
+        const range = sel.getRangeAt(0)
+        const r = range.getBoundingClientRect()
         const x = Math.min(Math.max(r.left + r.width / 2 - BAR_WIDTH / 2, 8), window.innerWidth - BAR_WIDTH - 8)
         const y = r.top > 108 ? r.top - 44 : r.bottom + 10
         // 以选区起点判定「引用的是译文」：跨原文/译文的混合选区按起点归类（精确切分不值得）
         const translated = anchorEl.closest('[data-translated]') != null
-        setBar({ x, y, text, anchor: anchorFnRef.current(anchorEl), translated })
+        setBar({ x, y, text, anchor: anchorFnRef.current(anchorEl), translated, range: range.cloneRange() })
       }, 0)
     }
 
@@ -132,6 +137,19 @@ export default function SelectionActions({ containerRef, anchorFromElement, onAc
           {a.label}
         </button>
       ))}
+      {onHighlight && (
+        <button
+          type="button"
+          onPointerDown={(e) => e.preventDefault()}
+          onClick={() => {
+            onHighlight(bar.range)
+            setBar(null)
+          }}
+          className="flex-1 rounded-md px-2 py-1 text-xs whitespace-nowrap text-accent transition-colors hover:bg-panel-2"
+        >
+          高亮
+        </button>
+      )}
     </div>
   )
 }

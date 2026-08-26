@@ -314,6 +314,30 @@ export interface BlockTranslation {
   updatedAt: number
 }
 
+/**
+ * 划词高亮：按块存储的字符区间（schema v4 新表 highlights）。
+ * 偏移相对源字符串（block.text 或该块译文）而非 DOM——重渲染/切语言三态不失效。
+ * 容错不用 parserVersion：渲染前校验 `source.slice(start, end) === text`，
+ * 失配（重解析/译文重生成）不渲染正文 mark，列表仍展示快照并可跳块。
+ * 本地 IndexedDB 持久化，不进云同步（要同步再加 outbox 白名单）。
+ */
+export interface PaperHighlight {
+  /** uuid：合并会改写区间，确定性拼接键无意义 */
+  id: string
+  paperId: string
+  blockIndex: number
+  /** 容错/调试，沿 BlockTranslation 惯例 */
+  blockId: string
+  /** 原文高亮只渲染在原文上，译文高亮只在译文上 */
+  lang: 'orig' | 'zh'
+  /** [start, end) 相对源字符串 */
+  start: number
+  end: number
+  /** 快照：列表展示 + 渲染前一致性校验 */
+  text: string
+  createdAt: number
+}
+
 /** Phase 3 落地：按 provider 独立的文档片段外发授权，不跨 provider 继承 */
 export interface ProviderConsent {
   provider: string

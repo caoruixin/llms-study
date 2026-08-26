@@ -1,8 +1,9 @@
 import { useEffect, type RefObject } from 'react'
 import { CURRENT_PAGE_EPSILON, blockDomId } from '../../lib/paper/anchors'
+import { splitByRanges, validRanges } from '../../lib/paper/highlight/highlightModel'
 import { sanitizeDocxHtml } from '../../lib/paper/sanitize'
 import { isTranslatableBlock } from '../../lib/paper/translate/translateBatch'
-import type { LangMode, PaperBlock } from '../../lib/paper/types'
+import type { LangMode, PaperBlock, PaperHighlight } from '../../lib/paper/types'
 
 /**
  * 语义化正文视图：PDF 的「文本视图」与 DOCX 的唯一视图都是它。
@@ -16,6 +17,11 @@ import type { LangMode, PaperBlock } from '../../lib/paper/types'
  * 全文翻译（三态 langMode）只改变**容器内**渲染什么：外层容器的 id / data-block-index
  * 永远不变，锚点与 [[cite]] 跳转在三态下全部照常。译文元素带 `data-translated="zh"`，
  * 供选区快捷条识别「引用的是译文」。
+ *
+ * 划词高亮的宿主约定：每个 textContent 恰好等于源字符串（block.text 或该块译文）的
+ * 元素带 `data-hl-host="orig" | "zh"`——list 加在内层第二个 span（避开 '·' 前缀），
+ * table 分支（dangerouslySetInnerHTML）不加即天然排除。selectionOffsets 按它算偏移，
+ * HlText 按它渲染 mark；快照失配（重解析/译文重生成）的行渲染前被 validRanges 过滤。
  */
 
 interface Props {
@@ -31,6 +37,8 @@ interface Props {
   /** 修复/对分后仍失败的块：显示原文 + 重试 chip */
   failedTranslations?: ReadonlySet<number>
   onRetryTranslation?: (blockIndex: number) => void
+  /** blockIndex → 该块全部高亮行（含两种 lang，渲染端按宿主语言过滤） */
+  highlights?: ReadonlyMap<number, readonly PaperHighlight[]>
 }
 
 /** heading 字号映射：原文与译文共用，中文模式下标题「沿用原字号类」靠它 */
@@ -39,19 +47,54 @@ const headingSize = (level: number | undefined): string => {
   return l <= 1 ? 'text-xl' : l === 2 ? 'text-lg' : 'text-base'
 }
 
-function BlockBody({ block }: { block: PaperBlock }) {
+/**
+ * 宿主内文本渲染：快照校验 → 区间切分 → 逐段建节点（纯函数切分返回段数组，
+ * 禁止 HTML 字符串注入）。rows 是该块的全部高亮行，按宿主语言在这里过滤——
+ * 原文高亮只进原文宿主，译文高亮只进译文宿主。
+ */
+function HlText({ text, rows, host }: { text: string; rows: readonly PaperHighlight[] | undefined; host: 'orig' | 'zh' }) {
+  const mine = rows?.length ? validRanges(text, rows.filter((r) => r.lang === host)) : []
+  if (!mine.length) return <>{text}</>
+  return (
+    <>
+      {splitByRanges(text, mine).map((seg, i) =>
+        seg.id !== undefined ? (
+          <mark
+            key={i}
+            data-highlight-id={seg.id}
+            className="cursor-pointer rounded-[3px] bg-amber/30 text-fg transition-colors hover:bg-amber/45"
+          >
+            {seg.text}
+          </mark>
+        ) : (
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </>
+  )
+}
+
+function BlockBody({ block, rows }: { block: PaperBlock; rows?: readonly PaperHighlight[] | undefined }) {
   switch (block.kind) {
     case 'heading':
-      return <h3 className={`${headingSize(block.level)} mt-6 font-semibold text-fg first:mt-0`}>{block.text}</h3>
+      return (
+        <h3 data-hl-host="orig" className={`${headingSize(block.level)} mt-6 font-semibold text-fg first:mt-0`}>
+          <HlText text={block.text} rows={rows} host="orig" />
+        </h3>
+      )
     case 'list':
       return (
         <p className="flex gap-2 text-[0.95rem] leading-7 text-fg">
           <span className="shrink-0 text-dim">·</span>
-          <span>{block.text}</span>
+          {/* 宿主是内层 span：外层 textContent 混着 '·'，偏移口径会被污染 */}
+          <span data-hl-host="orig">
+            <HlText text={block.text} rows={rows} host="orig" />
+          </span>
         </p>
       )
     case 'table':
-      // DOCX 表格保留了结构化 HTML：渲染前**再清洗一次**（纵深防御，正文永远是不可信输入）
+      // DOCX 表格保留了结构化 HTML：渲染前**再清洗一次**（纵深防御，正文永远是不可信输入）；
+      // 不带 data-hl-host——高亮偏移相对源字符串的约定在富结构 HTML 上不成立
       return block.html ? (
         <div
           className="paper-table overflow-x-auto text-sm"
@@ -64,21 +107,32 @@ function BlockBody({ block }: { block: PaperBlock }) {
       )
     case 'code':
       return (
-        <pre className="overflow-x-auto rounded-lg border border-line bg-panel-2 p-3 font-mono text-xs leading-relaxed text-fg">
-          {block.text}
+        <pre
+          data-hl-host="orig"
+          className="overflow-x-auto rounded-lg border border-line bg-panel-2 p-3 font-mono text-xs leading-relaxed text-fg"
+        >
+          <HlText text={block.text} rows={rows} host="orig" />
         </pre>
       )
     default:
-      return <p className="text-[0.95rem] leading-7 text-fg">{block.text}</p>
+      return (
+        <p data-hl-host="orig" className="text-[0.95rem] leading-7 text-fg">
+          <HlText text={block.text} rows={rows} host="orig" />
+        </p>
+      )
   }
 }
 
 /** 中文模式的译文主体：heading 沿用原字号类，list 保留项目符号，其余按正文段落 */
-function TranslatedBody({ block, text }: { block: PaperBlock; text: string }) {
+function TranslatedBody({ block, text, rows }: { block: PaperBlock; text: string; rows?: readonly PaperHighlight[] | undefined }) {
   if (block.kind === 'heading') {
     return (
-      <h3 data-translated="zh" className={`${headingSize(block.level)} mt-6 font-semibold text-fg first:mt-0`}>
-        {text}
+      <h3
+        data-translated="zh"
+        data-hl-host="zh"
+        className={`${headingSize(block.level)} mt-6 font-semibold text-fg first:mt-0`}
+      >
+        <HlText text={text} rows={rows} host="zh" />
       </h3>
     )
   }
@@ -86,13 +140,15 @@ function TranslatedBody({ block, text }: { block: PaperBlock; text: string }) {
     return (
       <p data-translated="zh" className="flex gap-2 text-[0.95rem] leading-7 text-fg">
         <span className="shrink-0 text-dim">·</span>
-        <span>{text}</span>
+        <span data-hl-host="zh">
+          <HlText text={text} rows={rows} host="zh" />
+        </span>
       </p>
     )
   }
   return (
-    <p data-translated="zh" className="text-[0.95rem] leading-7 text-fg">
-      {text}
+    <p data-translated="zh" data-hl-host="zh" className="text-[0.95rem] leading-7 text-fg">
+      <HlText text={text} rows={rows} host="zh" />
     </p>
   )
 }
@@ -132,6 +188,7 @@ export default function BlockReader({
   translations,
   failedTranslations,
   onRetryTranslation,
+  highlights,
 }: Props) {
   useEffect(() => {
     const root = containerRef.current
@@ -161,17 +218,18 @@ export default function BlockReader({
 
   /** 单块内容：orig / 中文 / 对照三态；不可译块（公式/代码/表格）三态下都渲染原文 */
   const renderContent = (b: PaperBlock) => {
-    if (langMode === 'orig' || !isTranslatableBlock(b.kind)) return <BlockBody block={b} />
+    const rows = highlights?.get(b.index)
+    if (langMode === 'orig' || !isTranslatableBlock(b.kind)) return <BlockBody block={b} rows={rows} />
     const zh = translations?.get(b.index)
     const failed = failedTranslations?.has(b.index) === true
     const retry = onRetryTranslation ? () => onRetryTranslation(b.index) : undefined
 
     if (langMode === 'zh') {
-      if (zh !== undefined) return <TranslatedBody block={b} text={zh} />
+      if (zh !== undefined) return <TranslatedBody block={b} text={zh} rows={rows} />
       if (failed)
         return (
           <>
-            <BlockBody block={b} />
+            <BlockBody block={b} rows={rows} />
             <TranslationError onRetry={retry} />
           </>
         )
@@ -180,13 +238,14 @@ export default function BlockReader({
     // 对照：原文块下紧跟译文（accent 左边线区分层次）
     return (
       <>
-        <BlockBody block={b} />
+        <BlockBody block={b} rows={rows} />
         {zh !== undefined ? (
           <div
             data-translated="zh"
+            data-hl-host="zh"
             className="mt-1.5 border-l-2 border-accent/40 bg-accent/5 pl-3 text-[0.95rem] leading-7 text-fg"
           >
-            {zh}
+            <HlText text={zh} rows={rows} host="zh" />
           </div>
         ) : failed ? (
           <TranslationError onRetry={retry} />

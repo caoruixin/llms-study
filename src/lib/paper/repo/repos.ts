@@ -4,6 +4,7 @@ import type { PaperRepository } from './paperRepo'
 import type { CopilotRepository } from './copilotRepo'
 import type { LearnerRepository } from './learnerRepo'
 import { createTranslationRepository, type TranslationRepository } from './translationRepo'
+import { createHighlightRepository, type HighlightRepository } from './highlightRepo'
 import {
   createSyncedCopilotRepository,
   createSyncedLearnerRepository,
@@ -24,6 +25,7 @@ export interface Repos {
   copilot: CopilotRepository
   learner: LearnerRepository
   translation: TranslationRepository
+  highlight: HighlightRepository
 }
 
 interface Bundle {
@@ -31,6 +33,7 @@ interface Bundle {
   copilot: CopilotRepository
   learner: LearnerRepository
   translation: TranslationRepository
+  highlight: HighlightRepository
 }
 
 /** 每个库一套装饰后的仓储：按库名缓存，避免每次调用重建装饰器对象 */
@@ -49,6 +52,8 @@ function bundleFor(db: PaperDb): Bundle {
       learner: createSyncedLearnerRepository(db, deps),
       // 译文 V1 不入 outbox（可再生派生物，不占同步配额），挂裸实现即可
       translation: createTranslationRepository(db),
+      // 高亮 V1 同样不入 outbox（本地阅读标记，照 translation 先例），挂裸实现
+      highlight: createHighlightRepository(db),
     }
     bundles.set(db.name, b)
   }
@@ -78,6 +83,7 @@ const repos: Repos = {
   copilot: makeFacade((b) => b.copilot),
   learner: makeFacade((b) => b.learner),
   translation: makeFacade((b) => b.translation),
+  highlight: makeFacade((b) => b.highlight),
 }
 
 /** 稳定引用：任何时刻返回同一组门面对象，可安全作为 hook 依赖 */

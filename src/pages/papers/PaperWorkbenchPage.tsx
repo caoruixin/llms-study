@@ -2,7 +2,8 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import BlockReader from '../../components/papers/BlockReader'
 import ConsentDialog from '../../components/papers/ConsentDialog'
-import OutlinePane, { buildOutline, type OutlineTab } from '../../components/papers/OutlinePane'
+import HighlightActions from '../../components/papers/HighlightActions'
+import OutlinePane, { buildOutline, type HighlightListItem, type OutlineTab } from '../../components/papers/OutlinePane'
 import PdfViewer from '../../components/papers/PdfViewer'
 import SelectionActions from '../../components/papers/SelectionActions'
 import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
@@ -19,6 +20,8 @@ import { bootstrapSyncEngine, fetchRemoteFileToLocal, getSyncEngine } from '../.
 import { useAuthStore } from '../../lib/auth/authStore'
 import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 import { DEEPSEEK_V4_PRO } from '../../data/paperPolicy'
+import { captureHighlightRanges } from '../../lib/paper/highlight/selectionOffsets'
+import { useHighlights } from '../../lib/paper/highlight/useHighlights'
 import { estimateTranslationCost } from '../../lib/paper/translate/translateBatch'
 import { useTranslations } from '../../lib/paper/translate/useTranslations'
 import { formatUsd } from '../../lib/paper/usage'
@@ -593,6 +596,38 @@ export default function PaperWorkbenchPage() {
     }
   }, [])
 
+  // 划词高亮：Dexie 持久化 + 内存态（localStorage 一律不存高亮数据）
+  const { highlights: highlightRows, byBlock: highlightsByBlock, addCaptured, remove: removeHighlight } = useHighlights(paperId)
+
+  /** 左栏「高亮」tab 的列表：按出现顺序（blockIndex, start）排好并补上 section */
+  const highlightItems = useMemo<HighlightListItem[]>(
+    () =>
+      [...highlightRows]
+        .sort((a, b) => a.blockIndex - b.blockIndex || a.start - b.start)
+        .map((h) => {
+          const section = blockByIndex[h.blockIndex]?.anchor.section
+          return { id: h.id, blockIndex: h.blockIndex, lang: h.lang, text: h.text, ...(section ? { section } : {}) }
+        }),
+    [highlightRows, blockByIndex],
+  )
+
+  const handleHighlight = useCallback(
+    (range: Range) => {
+      const container = readerRef.current
+      if (!container) return
+      const captured = captureHighlightRanges(range, container)
+      if (captured.length && addCaptured(captured, (i) => blockByIndexRef.current[i]?.id) > 0) {
+        setToast('已高亮，可在左栏『高亮』里回查')
+      } else {
+        // 起点不在高亮宿主内（表格等），或选中的全是空白
+        setToast('这段内容暂不支持高亮')
+      }
+      // 无论成败都清选区：快捷条已关闭，残留选区只会挡住刚生效的 mark
+      window.getSelection()?.removeAllRanges()
+    },
+    [addCaptured],
+  )
+
   const handleAskAction = useCallback(
     (action: PaperAskAction, text: string, anchor: SourceAnchor | null, opts: { translated: boolean }) => {
       if (!paperId) return
@@ -714,6 +749,8 @@ export default function PaperWorkbenchPage() {
       searchHits={searchHits}
       searchBusy={searchBusy}
       searchRan={searchRan}
+      highlights={highlightItems}
+      onRemoveHighlight={removeHighlight}
       brief={briefData && briefData.paperId === paperId ? briefData.data : null}
       briefUi={briefUi && briefUi.paperId === paperId ? briefUi : null}
       onGenerateBrief={requestBrief}
@@ -951,6 +988,7 @@ export default function PaperWorkbenchPage() {
                   translations={translations}
                   failedTranslations={failedTranslations}
                   onRetryTranslation={retryBlock}
+                  highlights={highlightsByBlock}
                 />
               </>
             )}
@@ -1009,7 +1047,10 @@ export default function PaperWorkbenchPage() {
           containerRef={readerRef}
           anchorFromElement={anchorFromElement}
           onAction={handleAskAction}
+          // 仅文本视图支持高亮：原版 PDF 的锚点只到页，捕获不出块内偏移
+          onHighlight={mode === 'text' ? handleHighlight : undefined}
         />
+        <HighlightActions onRemove={removeHighlight} />
       </div>
     </ReaderProvider>
   )

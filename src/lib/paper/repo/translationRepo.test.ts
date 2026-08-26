@@ -138,7 +138,8 @@ describe('db v2 → v3 迁移', () => {
 
     const db = new PaperDb(name, { indexedDB: factory, IDBKeyRange })
     await db.open()
-    expect(db.verno).toBe(3)
+    // v4（highlights）加入后，老库一次跳到当前版本
+    expect(db.verno).toBe(4)
 
     // 新表可用（空表 + 读写正常）
     expect(await db.translations.count()).toBe(0)

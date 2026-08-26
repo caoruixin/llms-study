@@ -98,6 +98,7 @@ export function createPaperRepository(db: PaperDb): PaperRepository {
     db.consents,
     db.usage,
     db.translations,
+    db.highlights,
   ]
 
   /** 同步更新 jobs 表的当前阶段（jobs 是导入过程的可观测镜像，papers 才是权威状态） */
@@ -256,6 +257,7 @@ export function createPaperRepository(db: PaperDb): PaperRepository {
             db.evidence.where('paperId').equals(paperId).delete(),
             db.usage.where('paperId').equals(paperId).delete(),
             db.translations.where('paperId').equals(paperId).delete(),
+            db.highlights.where('paperId').equals(paperId).delete(),
           ])
           await db.papers.delete(paperId)
         })

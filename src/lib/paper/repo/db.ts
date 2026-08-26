@@ -12,6 +12,7 @@ import type {
   PaperBrief,
   PaperChunk,
   PaperFileBytes,
+  PaperHighlight,
   PaperRecord,
   ProviderConsent,
 } from '../types'
@@ -74,6 +75,7 @@ export interface SyncMetaRow {
  * 既有 12 张表的索引与数据零变动——老库升级只是建三张空表。
  * v3（全文翻译）纯加法：translations 一张表（[paperId+blockIndex] 供按块查询），
  * 老库升级同样只是建一张空表，无数据迁移。
+ * v4（划词高亮）纯加法：highlights 一张表，索引形状照 translations。
  * sha256 用普通索引而非 &unique：去重由 findBySha256 显式判定后交给用户选择
  * （打开已有 / 替换导入），不依赖 ConstraintError 做控制流。
  */
@@ -94,6 +96,7 @@ export class PaperDb extends Dexie {
   syncState!: Table<SyncStateRow, string>
   syncMeta!: Table<SyncMetaRow, string>
   translations!: Table<BlockTranslation, string>
+  highlights!: Table<PaperHighlight, string>
 
   constructor(name = PAPER_DB_NAME, options?: { indexedDB: IDBFactory; IDBKeyRange: typeof IDBKeyRange }) {
     super(name, options)
@@ -118,6 +121,9 @@ export class PaperDb extends Dexie {
     })
     this.version(3).stores({
       translations: 'id, paperId, [paperId+blockIndex]',
+    })
+    this.version(4).stores({
+      highlights: 'id, paperId, [paperId+blockIndex]',
     })
   }
 }
