@@ -19,7 +19,7 @@ const ERROR_MESSAGES: Partial<Record<ApiFailureCode, string>> = {
   'fetch-denied': '该地址不允许抓取（内网或受限目标）',
   'fetch-failed': '抓取失败（目标站点无法访问或超时）',
   'fetch-too-large': '目标内容超过大小上限',
-  'unsupported-content': '不支持的内容类型（仅支持网页与 PDF）',
+  'unsupported-content': '不支持的内容类型（仅支持网页、PDF 与常见图片）',
   'rate-limited': '抓取请求过于频繁，请稍后重试',
   'invalid-input': '链接格式不合法',
   unauthenticated: '登录状态已失效，请重新登录后重试',

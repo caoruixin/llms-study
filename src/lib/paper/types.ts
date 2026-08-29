@@ -58,7 +58,7 @@ export interface SourceAnchor {
   section?: string
 }
 
-export type PaperBlockKind = 'heading' | 'paragraph' | 'list' | 'table' | 'code' | 'formula' | 'caption'
+export type PaperBlockKind = 'heading' | 'paragraph' | 'list' | 'table' | 'code' | 'formula' | 'caption' | 'image'
 
 export interface PaperBlock {
   id: string
@@ -68,8 +68,10 @@ export interface PaperBlock {
   /** heading 的层级 1-6 */
   level?: number
   text: string
-  /** 仅 DOCX 表格等需要保留结构时携带（已过 sanitize 白名单） */
+  /** 表格等需要保留结构时携带（已过 sanitize 白名单） */
   html?: string
+  /** image 块的图片远程 URL（https）；text 存 `[图: alt]` 占位供检索。Dexie 非索引字段，零迁移 */
+  src?: string
   anchor: SourceAnchor
 }
 

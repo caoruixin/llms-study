@@ -39,12 +39,20 @@ const fetchUrlSchema = z.object({
   url: z.string().min(1).max(FETCH_URL_MAX_LENGTH),
 })
 
-/** 内容类型白名单:陪读管线只认这四种;其余(图片/视频/压缩包)抓回来也没用 */
+/**
+ * 内容类型白名单:正文四种 + 位图四种(阅读视图断图时的「通过代理加载」兜底)。
+ * 不放行 image/svg+xml——svg 是可执行文档(script/foreignObject),与 sanitize 侧 FORBID svg 对齐。
+ * 图片与正文共用同一套令牌桶/并发闸/字节上限,不做类型专属限额。
+ */
 const ALLOWED_MEDIA_TYPES = new Set([
   'text/html',
   'application/xhtml+xml',
   'text/plain',
   'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
 ])
 
 /** 上游没给 content-type(或给了万能的 octet-stream)时才做嗅探 */
@@ -82,7 +90,8 @@ function parseContentType(raw: string | null): { mediaType: string; charset: str
 
 /**
  * 内容类型闸门:返回最终对外声明的 media type,或 null 表示拒绝(415)。
- * 嗅探只在上游没表态时启用——上游明确说了是 image/png 就不该被字节内容"翻案"。
+ * 白名单类型(含 image/*)原样放行;嗅探只在上游没表态时启用——上游明确说了是
+ * video/mp4 就不该被字节内容"翻案"(嗅探也只认 PDF 魔数与 HTML 文本,不嗅图片)。
  */
 function resolveMediaType(declared: string, bytes: Buffer): string | null {
   if (ALLOWED_MEDIA_TYPES.has(declared)) return declared

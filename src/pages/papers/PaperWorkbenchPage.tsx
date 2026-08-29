@@ -500,6 +500,7 @@ export default function PaperWorkbenchPage() {
   const {
     texts: translations,
     failed: failedTranslations,
+    authIssue: translationAuthIssue,
     retryBlock,
     consentAsk,
   } = useTranslations({ paper, blocks, langMode, currentBlockIndex: position.blockIndex })
@@ -987,6 +988,7 @@ export default function PaperWorkbenchPage() {
                   langMode={langMode}
                   translations={translations}
                   failedTranslations={failedTranslations}
+                  translationAuthIssue={translationAuthIssue}
                   onRetryTranslation={retryBlock}
                   highlights={highlightsByBlock}
                 />

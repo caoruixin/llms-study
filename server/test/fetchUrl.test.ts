@@ -279,13 +279,48 @@ describe('正常抓取', () => {
 })
 
 describe('内容类型闸门', () => {
-  it('图片等非白名单类型 → 415 unsupported-content', async () => {
+  it('白名单位图类型(png/jpeg/gif/webp)放行,字节与 content-type 原样回传', async () => {
+    const f = await setup()
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(32, 7),
+    ])
+    f.origin.respond((url, res) => {
+      if (url === '/x1.png') {
+        res.writeHead(200, { 'content-type': 'image/png' })
+        res.end(png)
+      } else {
+        res.writeHead(200, { 'content-type': 'image/webp' })
+        res.end(Buffer.from('RIFF0000WEBP'))
+      }
+    })
+    const asPng = await f.post('http://origin.test/x1.png')
+    expect(asPng.status).toBe(200)
+    expect(asPng.headers.get('content-type')).toBe('image/png')
+    expect(Buffer.from(await asPng.arrayBuffer()).equals(png)).toBe(true)
+    const asWebp = await f.post('http://origin.test/x2.webp')
+    expect(asWebp.status).toBe(200)
+    expect(asWebp.headers.get('content-type')).toBe('image/webp')
+  })
+
+  it('image/svg+xml 刻意不放行(可执行文档)→ 415 unsupported-content', async () => {
     const f = await setup()
     f.origin.respond((_url, res) => {
-      res.writeHead(200, { 'content-type': 'image/png' })
-      res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+      res.writeHead(200, { 'content-type': 'image/svg+xml' })
+      res.end('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
     })
-    const res = await f.post('http://origin.test/a.png')
+    const res = await f.post('http://origin.test/a.svg')
+    expect(res.status).toBe(415)
+    expect(await res.json()).toMatchObject({ error: 'unsupported-content' })
+  })
+
+  it('视频等非白名单类型 → 415 unsupported-content', async () => {
+    const f = await setup()
+    f.origin.respond((_url, res) => {
+      res.writeHead(200, { 'content-type': 'video/mp4' })
+      res.end(Buffer.from([0x00, 0x00, 0x00, 0x18]))
+    })
+    const res = await f.post('http://origin.test/a.mp4')
     expect(res.status).toBe(415)
     expect(await res.json()).toMatchObject({ error: 'unsupported-content' })
   })

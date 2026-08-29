@@ -52,6 +52,28 @@ describe('normalizeDocxHtml', () => {
     })
   })
 
+  it('空 text 但带结构 html 的表格（纯图/空单元格表格）不再被整块丢弃', () => {
+    const blocks = normalizeDocxHtml('<p>A</p><table><tr><td></td></tr></table><p>B</p>')
+    expect(blocks.map((b) => [b.kind, b.text])).toEqual([
+      ['paragraph', 'A'],
+      ['table', ''],
+      ['paragraph', 'B'],
+    ])
+    expect(blocks[1].html).toContain('<table>')
+    blocks.forEach((b, i) => {
+      expect(b.index).toBe(i)
+      expect(b.anchor.blockIndex).toBe(i)
+    })
+  })
+
+  it('figure 在 DOCX 管线落 default → 段落化（不产 image 块，行为不回归）', () => {
+    const blocks = normalizeDocxHtml('<figure><figcaption>图 1 说明</figcaption></figure><p>正文</p>')
+    expect(blocks.map((b) => [b.kind, b.text])).toEqual([
+      ['paragraph', '图 1 说明'],
+      ['paragraph', '正文'],
+    ])
+  })
+
   describe('伪标题（整段加粗）', () => {
     // scripts/paper-eval/fixtures/kv-cache-note.docx 经 mammoth 转换后的真实 HTML 形状
     const KV_NOTE_HTML =

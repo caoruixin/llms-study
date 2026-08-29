@@ -35,6 +35,10 @@ export const DEEPSEEK_V4_PRO: ModelCapability = {
   maxOutputParam: 'max_tokens',
   streamUsage: true,
   pricing: {
+    // ⚠️ 2026-08-29 核对官方定价页：此组数字与现价不符（V4-Pro-0813 高峰 $1.32/$3.96，错峰 $0.66/$1.98），
+    // 疑似 0813 改版前的旧价残留，与 src/data/pricing.ts 也不一致。
+    // 暂不改数值：它驱动 deep 任务的成本二次确认阈值（usage.ts $0.02 门槛），改价会显著提高确认弹窗频率，
+    // 是否同步现价+调阈值留作独立决策（follow-up）。
     inPerMTok: 0.435,
     outPerMTok: 0.87,
     sourceUrl: 'https://api-docs.deepseek.com/quick_start/pricing/',

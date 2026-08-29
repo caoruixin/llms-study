@@ -1,4 +1,4 @@
-import { detectPseudoHeading, extractBlocks, listItems, tableToText, toText } from './normalizeDocx'
+import { decodeEntities, detectPseudoHeading, extractBlocks, listItems, tableToText, toText } from './normalizeDocx'
 import type { NormalizedBlock, PaperBlockKind } from './types'
 
 /**
@@ -9,7 +9,8 @@ import type { NormalizedBlock, PaperBlockKind } from './types'
  * 与 DOCX 管线的唯一区别在于「多节合并」语义（一节 = 一个 URL 抽取出的正文）：
  * - 单节（单 URL 导入）：原样输出，不下压标题、不合成任何 heading——与 DOCX 行为一致，
  *   这也是为什么单节调用与 normalizeDocxHtml(html) 的输出在 kind/level/text 上完全等价
- *   （唯一区别是 anchor.kind 是 'html' 而不是 'docx'）。
+ *   （区别只有二：anchor.kind 是 'html' 而不是 'docx'；figure 在这里落 image/caption 块，
+ *   在 DOCX 管线落 default→paragraph——DOCX 的 img 早被 sanitize 剥掉，没有图片通道）。
  * - 多节（多 URL 合并成一篇）：每节最前面插入一个 level-1 heading（该节的页面标题），
  *   节内原有标题统一下压一级（cap 到 6，避免 h6 下压后无级可用），
  *   若节内第一个标题恰好与节标题文本相同（Readability 抽取时常把 <title> 重复成正文首个
@@ -22,11 +23,25 @@ import type { NormalizedBlock, PaperBlockKind } from './types'
 export interface HtmlSectionInput {
   /** 该节（该 URL）抽取出的页面标题；单节时不参与输出，仅多节合并时用作合成 heading */
   title?: string
-  /** 已净化的正文 HTML（调用方负责在这之前完成 sanitizeDocxHtml，本函数不做 XSS 防护） */
+  /** 已净化的正文 HTML（调用方负责在这之前完成 sanitizeArticleHtml，本函数不做 XSS 防护） */
   html: string
 }
 
 const HEADING_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+
+const IMG_TAG_RE = /<img\b[^>]*>/gi
+const FIGCAPTION_RE = /<figcaption\b[^>]*>([\s\S]*?)<\/figcaption\s*>/i
+
+/**
+ * 从单个 `<img ...>` 标签字符串里抠属性值（双引号/单引号/无引号三种写法）。
+ * 属性值做 HTML 实体解码（src 里的 &amp; 等）——保持本文件「正则实现、不碰 DOM」的纯函数设计。
+ */
+function imgAttr(tag: string, name: string): string | undefined {
+  const m = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, 'i').exec(tag)
+  if (!m) return undefined
+  const raw = m[1] ?? m[2] ?? m[3] ?? ''
+  return decodeEntities(raw)
+}
 
 export function normalizeHtmlSections(sections: readonly HtmlSectionInput[]): NormalizedBlock[] {
   const blocks: NormalizedBlock[] = []
@@ -34,8 +49,9 @@ export function normalizeHtmlSections(sections: readonly HtmlSectionInput[]): No
   const multi = sections.length > 1
   const levelShift = multi ? 1 : 0
 
-  const push = (kind: PaperBlockKind, text: string, extra?: { level?: number; html?: string }) => {
-    if (!text) return
+  const push = (kind: PaperBlockKind, text: string, extra?: { level?: number; html?: string; src?: string }) => {
+    // 空 text 但带结构 html（纯图表格）或图片 src 的块保留——修「纯图表格被整块丢弃」bug + 放行 image 块
+    if (!text && !extra?.html && !extra?.src) return
     const index = blocks.length
     const block: NormalizedBlock = {
       index,
@@ -45,6 +61,7 @@ export function normalizeHtmlSections(sections: readonly HtmlSectionInput[]): No
     }
     if (extra?.level !== undefined) block.level = extra.level
     if (extra?.html) block.html = extra.html
+    if (extra?.src) block.src = extra.src
     blocks.push(block)
   }
 
@@ -89,6 +106,23 @@ export function normalizeHtmlSections(sections: readonly HtmlSectionInput[]): No
         const text = toText(b.inner)
         if (text) dedupPending = false
         push('code', text)
+        continue
+      }
+      if (b.tag === 'figure') {
+        // 每张图独立成 image 块：text 是 [图: alt] 占位（供检索/翻译兜底展示），src 是远程 https URL
+        for (const tag of b.inner.match(IMG_TAG_RE) ?? []) {
+          const src = imgAttr(tag, 'src')
+          const alt = imgAttr(tag, 'alt')?.trim()
+          dedupPending = false
+          push('image', alt ? `[图: ${alt}]` : '[图]', src ? { src } : undefined)
+        }
+        // 图注独立落为既有 caption kind：可译/可高亮/可检索全部走既有机制
+        const capText = toText(FIGCAPTION_RE.exec(b.inner)?.[1] ?? '')
+        if (capText) {
+          dedupPending = false
+          push('caption', capText)
+        }
+        // figure 内其余内容（非 img/figcaption）忽略
         continue
       }
       const text = toText(b.inner)

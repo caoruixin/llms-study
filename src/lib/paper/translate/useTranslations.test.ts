@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { LlmError } from '../../llmClient'
 import { GatewayError, type CompletePaperJsonRequest, type CompletePaperJsonResult } from '../modelGateway'
 import { createTranslationScheduler, type TranslationSchedulerDeps, type TranslationSnapshot } from './useTranslations'
 import { TRANSLATE_PROMPT_VERSION, srcHash } from './translateBatch'
@@ -43,7 +44,7 @@ function makeHarness(opts: {
   let maxConcurrent = 0
   let consentAsks = 0
   const saved: BlockTranslation[][] = []
-  let snapshot: TranslationSnapshot = { texts: new Map(), failed: new Set() }
+  let snapshot: TranslationSnapshot = { texts: new Map(), failed: new Set(), authIssue: null }
 
   const respond = opts.respond ?? ((req) => okRaw(req))
 
@@ -284,6 +285,40 @@ describe('createTranslationScheduler', () => {
     h.scheduler.setWindow(1)
     await h.settle()
     expect(h.calls).toHaveLength(1) // 停机后不再出包
+  })
+
+  it('auth 失败（no-user-key）→ 停机 + 该包标失败 + authIssue 记码；retryBlock 清码后恢复', async () => {
+    const blocks = [blk(0, 'a'), blk(1, 'b')]
+    let first = true
+    const h = makeHarness({
+      blocks,
+      respond: (req) => {
+        if (first) {
+          first = false
+          const e = new LlmError('auth', '该账号尚未配置此服务商的 API key')
+          e.code = 'no-user-key'
+          return e
+        }
+        return okRaw(req)
+      },
+    })
+
+    await h.scheduler.activate()
+    h.scheduler.setWindow(0)
+    await h.settle()
+
+    expect(h.calls).toHaveLength(1)
+    expect(h.snapshot.authIssue).toBe('no-user-key')
+    expect(h.snapshot.failed.size).toBeGreaterThan(0) // 该包的块标失败 → 失败 chip 有宿主
+    h.scheduler.setWindow(1)
+    await h.settle()
+    expect(h.calls).toHaveLength(1) // 停机后不再出包（防 403 风暴）
+
+    // 用户配好 key 后单块重试：authIssue 清除、恢复出包并成功
+    h.scheduler.retryBlock(0)
+    await h.settle()
+    expect(h.snapshot.authIssue).toBeNull()
+    expect(h.snapshot.texts.has(0)).toBe(true)
   })
 
   it('长块分片跨包收齐后按分片号拼接落库', async () => {

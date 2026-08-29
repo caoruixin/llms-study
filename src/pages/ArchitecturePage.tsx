@@ -4,7 +4,8 @@ import SegmentedTabs from '../components/ui/SegmentedTabs'
 import TransformerDiagram from '../components/TransformerDiagram'
 import ModelEvolution from '../components/ModelEvolution'
 import { ATTENTION_EVOLUTION, ATTENTION_SUMMARY } from '../data/attention'
-import { isPromoExpired, PRICING, PRICING_NOTES } from '../data/pricing'
+import { isPromoExpired, PRICING, PRICING_NOTES, PRICING_VERIFIED_ON } from '../data/pricing'
+import type { PriceRow } from '../data/types'
 
 const TABS = [
   { id: 'transformer', label: '经典 Transformer' },
@@ -26,6 +27,23 @@ function fmtContextK(k: number | null) {
 function fmtMaxOutputK(k: number | null) {
   return k === null ? 'N/A' : `${k}K`
 }
+
+// 每行价格来源标注：桌面表与移动卡片共用（modelId 超链之外的显式来源入口）
+function SourceLink({ p }: { p: PriceRow }) {
+  return (
+    <a
+      href={p.sourceUrl}
+      target="_blank"
+      rel="noreferrer"
+      className="mt-0.5 block text-[11px] text-dim underline underline-offset-2 hover:text-accent"
+    >
+      来源 · {p.asOf} ↗
+    </a>
+  )
+}
+
+// 脚注「数据时点」从数据派生，避免与行内 asOf 漂移
+const MAX_AS_OF = PRICING.reduce((m, p) => (p.asOf > m ? p.asOf : m), PRICING[0].asOf)
 
 export default function ArchitecturePage() {
   // ?tab= 仅作初值（如 /kda 页返回链接落在「注意力演进」）；切 tab 不写回 URL，保持现有轻量行为
@@ -134,6 +152,7 @@ export default function ArchitecturePage() {
                       <a href={p.sourceUrl} target="_blank" rel="noreferrer" className="font-mono font-semibold text-accent hover:underline">
                         {p.modelId}
                       </a>
+                      <SourceLink p={p} />
                     </td>
                     <td className="px-3 py-3 text-right font-mono">{fmtPrice(p.currency, p.inputPerMTok)}</td>
                     <td className="px-3 py-3 text-right font-mono">{fmtPrice(p.currency, p.outputPerMTok)}</td>
@@ -162,6 +181,7 @@ export default function ArchitecturePage() {
                     <a href={p.sourceUrl} target="_blank" rel="noreferrer" className="font-mono font-semibold text-accent hover:underline">
                       {p.modelId}
                     </a>
+                    <SourceLink p={p} />
                   </div>
                   {p.openWeights && (
                     <span className="shrink-0 rounded bg-ok/15 px-1.5 py-0.5 text-xs font-semibold text-ok">开源 ✓</span>
@@ -209,7 +229,7 @@ export default function ArchitecturePage() {
               ))}
             </ul>
             <p className="mt-3 text-xs text-dim">
-              数据时点 2026-08-22，均来自各家官方定价页（点模型 ID 跳转）；价格月月变，报价前务必再核对。
+              数据时点 {MAX_AS_OF}，核对于 {PRICING_VERIFIED_ON}，均来自各家官方定价页（每行「来源」可跳转）；价格月月变，报价前务必再核对。
             </p>
           </div>
         </div>

@@ -19,8 +19,13 @@ import type {
 
 export const PAPER_DB_NAME = 'paper-copilot'
 
-/** 解析器版本：升级后写入的 PaperRecord.parserVersion 变化，可据此提示用户重建索引 */
-export const PARSER_VERSION = 1
+/**
+ * 解析器版本：升级后写入的 PaperRecord.parserVersion 变化，可据此提示用户重建索引。
+ * v2：URL 导入图片保留——normalize 行为变化（纯图表格从丢弃变保留 + 新增 image 块），
+ * 同一 HTML 的 blockIndex 可能位移；存量论文不自动重解析，仅用户主动 reingest 时生效
+ * （译文靠 srcHash 失配自动失效、高亮靠 text 快照校验兜底）。
+ */
+export const PARSER_VERSION = 2
 
 // ---------------------------------------------------------------------------
 // P4 同步域本地表类型（v2 纯加法）

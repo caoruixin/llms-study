@@ -36,11 +36,14 @@ Object.defineProperty(Node.prototype, 'nodeName', {
  * 多危险元素混排的行为归 §11.2 浏览器回归覆盖。
  */
 let sanitizeDocxHtml: (html: string) => string
+let sanitizeArticleHtml: (html: string) => string
 let DOCX_ALLOWED_TAGS: string[]
 let DOCX_ALLOWED_ATTR: string[]
+let ARTICLE_ALLOWED_TAGS: string[]
 
 beforeAll(async () => {
-  ;({ sanitizeDocxHtml, DOCX_ALLOWED_TAGS, DOCX_ALLOWED_ATTR } = await import('./sanitize'))
+  ;({ sanitizeDocxHtml, sanitizeArticleHtml, DOCX_ALLOWED_TAGS, DOCX_ALLOWED_ATTR, ARTICLE_ALLOWED_TAGS } =
+    await import('./sanitize'))
 })
 
 describe('sanitizeDocxHtml', () => {
@@ -98,5 +101,68 @@ describe('sanitizeDocxHtml', () => {
     }
     expect(DOCX_ALLOWED_ATTR.every((a) => !a.startsWith('on'))).toBe(true)
     expect(DOCX_ALLOWED_ATTR).toEqual(['colspan', 'rowspan', 'start', 'href'])
+  })
+})
+
+describe('sanitizeArticleHtml（URL 导入变体：放行 img/figure/figcaption）', () => {
+  it('https 的 img 连同 figure/figcaption 结构与 src/alt 属性保留', () => {
+    const out = sanitizeArticleHtml(
+      '<figure><img src="https://arxiv.org/html/2406.00001v1/x1.png" alt="Figure 1"><figcaption>图注</figcaption></figure>',
+    )
+    // DOMPurify 重建属性时顺序可能翻转，不做整串等值断言
+    expect(out).toContain('<figure>')
+    expect(out).toContain('<img')
+    expect(out).toContain('src="https://arxiv.org/html/2406.00001v1/x1.png"')
+    expect(out).toContain('alt="Figure 1"')
+    expect(out).toContain('<figcaption>图注</figcaption>')
+  })
+
+  it('javascript: 的 img src 被 ALLOWED_URI_REGEXP 剥除，元素与 alt 保留', () => {
+    const out = sanitizeArticleHtml('<img src="javascript:alert(1)" alt="x">')
+    expect(out).toContain('<img')
+    expect(out).toContain('alt="x"')
+    expect(out).not.toContain('src')
+    expect(out).not.toContain('javascript')
+  })
+
+  it('data: 的 img src 同样被剥除（图片只允许远程 https 引用）', () => {
+    const out = sanitizeArticleHtml('<img src="data:image/png;base64,AAAA" alt="d">')
+    expect(out).toContain('<img')
+    expect(out).not.toContain('src')
+    expect(out).not.toContain('data:')
+  })
+
+  it('alt 不是 URI 属性：alt="2x" 这类值不被 ALLOWED_URI_REGEXP 误校验剥掉', () => {
+    // 护栏：DOMPurify 默认 URI_SAFE_ATTRIBUTES 含 alt；这条防止未来收紧配置时静默丢 alt
+    const out = sanitizeArticleHtml('<img src="https://x.org/a.png" alt="2x">')
+    expect(out).toContain('alt="2x"')
+  })
+
+  it('srcset 不在属性白名单：被剥除，src 是唯一图源', () => {
+    const out = sanitizeArticleHtml('<img src="https://x.org/a.png" srcset="https://x.org/a2.png 2x">')
+    expect(out).toContain('src="https://x.org/a.png"')
+    expect(out).not.toContain('srcset')
+  })
+
+  it('svg 仍被整体剥除（tikz-svg 图不放行）', () => {
+    expect(sanitizeArticleHtml('<p>A<svg><circle /></svg>B</p>')).toBe('<p>AB</p>')
+  })
+
+  it('math 仍被整体剥除（公式现状不动）', () => {
+    expect(sanitizeArticleHtml('<p>A<math><mi>x</mi></math>B</p>')).toBe('<p>AB</p>')
+  })
+
+  it('script 类可执行面与 DOCX 变体同规格剥除', () => {
+    expect(sanitizeArticleHtml('<p>正文</p><script>fetch("//evil")</script>')).toBe('<p>正文</p>')
+  })
+
+  it('sanitizeDocxHtml 行为不受变体影响：img 在 DOCX 管线仍被剥除', () => {
+    expect(sanitizeDocxHtml('<p>A<img src="https://x.org/a.png" alt="f">B</p>')).toBe('<p>AB</p>')
+  })
+
+  it('文章白名单 = DOCX 白名单 + 图片三件套，且不含 svg/math/script', () => {
+    for (const t of DOCX_ALLOWED_TAGS) expect(ARTICLE_ALLOWED_TAGS).toContain(t)
+    for (const t of ['img', 'figure', 'figcaption']) expect(ARTICLE_ALLOWED_TAGS).toContain(t)
+    for (const bad of ['svg', 'math', 'script', 'iframe', 'object']) expect(ARTICLE_ALLOWED_TAGS).not.toContain(bad)
   })
 })

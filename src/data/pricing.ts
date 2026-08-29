@@ -16,7 +16,7 @@ export const PRICING: PriceRow[] = [
     modality: '文本（推理模型）',
     toolCalling: true,
     openWeights: false,
-    notes: '输入 >272K 按长上下文档：输入 $8 / 输出 $30（输入 2×、输出 1.5×）；缓存写入 1.25×（$5）；Batch 5 折',
+    notes: '表内为促销价，官方承诺至少持续至 2026-11-21（无固定截止日，以官方定价页为准）；输入 >272K 按长上下文档：输入 $8 / 输出 $30（输入 2×、输出 1.5×）；缓存写入 1.25×（$5）；Batch 5 折',
     sourceUrl: 'https://developers.openai.com/api/docs/pricing',
     asOf: '2026-08',
   },
@@ -176,7 +176,8 @@ export const PRICING: PriceRow[] = [
   },
   {
     provider: '智谱 Z.ai（国际）',
-    modelId: 'glm-5.2',
+    // 2026-08-29 替换：GLM-5.3 发布（同价接棒 5.2 成为旗舰）；GLM-5.2 仍在售同价
+    modelId: 'glm-5.3',
     inputPerMTok: 1.4,
     outputPerMTok: 4.4,
     cachedInputPerMTok: 0.26,
@@ -187,13 +188,14 @@ export const PRICING: PriceRow[] = [
     modality: '文本',
     toolCalling: true,
     openWeights: true,
-    notes: '缓存存储限时免费（截止日期未公布，时限以官方定价页为准）；MIT 开源可自建',
+    notes: '缓存存储限时免费（截止日期未公布，时限以官方定价页为准）；权重开放可自建，但为 GLM-5.3 自定义许可证（非 5.2 的 MIT，法务需审原文）',
     sourceUrl: 'https://docs.z.ai/guides/overview/pricing',
     asOf: '2026-08',
   },
   {
     provider: '智谱 bigmodel.cn（国内）',
-    modelId: 'glm-5.2',
+    // 2026-08-29 替换：GLM-5.3 新品与 5.2 同价（8/28/2 元），5.2 仍在售
+    modelId: 'glm-5.3',
     inputPerMTok: 8,
     outputPerMTok: 28,
     cachedInputPerMTok: 2,
@@ -204,28 +206,32 @@ export const PRICING: PriceRow[] = [
     modality: '文本',
     toolCalling: true,
     openWeights: true,
-    notes: '旗舰不分档一口价；GLM-5 按 32K 输入分档（4/18 → 6/22 元）',
+    notes: '旗舰不分档一口价（上代 GLM-5.2 同价仍在售）；GLM-5 按 32K 输入分档（4/18 → 6/22 元）；权重为 GLM-5.3 自定义许可证',
     sourceUrl: 'https://open.bigmodel.cn/pricing',
     asOf: '2026-08',
   },
   {
     provider: '阿里云 Qwen（国际）',
-    modelId: 'qwen3.7-max',
-    inputPerMTok: 2.5,
-    outputPerMTok: 7.5,
-    cachedInputPerMTok: 0.5,
+    // 2026-08-29 替换：Qwen3.8-Max 发布，标价 $2/$6 直接低于 3.7-Max 标价（且不再是限时折扣）
+    modelId: 'qwen3.8-max',
+    inputPerMTok: 2.0,
+    outputPerMTok: 6.0,
+    cachedInputPerMTok: 0.25,
     currency: 'USD',
     contextK: 1000,
     maxOutputK: 131,
     practicalContextNote: null,
-    modality: '文本',
+    modality: '多模态（图/文/视频输入）',
     toolCalling: true,
     openWeights: false,
-    notes: '限时 5 折（$1.25/$3.75，截止日期未公布，时限以官方定价页为准）；隐式缓存命中=输入 20% + 显式缓存（写 1.25×/读 0.1×）；闭源（开源最大杯为 Qwen3.5-397B）',
-    sourceUrl: 'https://www.qwencloud.com/models/qwen3.7-max',
+    notes: '标准价无促销（3.7-Max 时代的 5 折促销已由直接降价取代）；隐式缓存命中 $0.25（=输入 12.5%）+ 显式缓存（写 1.25× $2.5 / 读 $0.17）；闭源（开源最大杯为 Qwen3.5-397B）',
+    sourceUrl: 'https://www.qwencloud.com/models/qwen3.8-max',
     asOf: '2026-08',
   },
 ]
+
+// 最近一次逐行核对官方定价页的日期（刷新流程更新此值；asOf 是月粒度数据时点，这里是核对动作的日期）
+export const PRICING_VERIFIED_ON = '2026-08-29'
 
 // 限时价是否已过期（validUntil 当天仍有效）；无 validUntil 视为未过期，时限见该行 sourceUrl
 export function isPromoExpired(validUntil: string | null | undefined, now: Date = new Date()): boolean {
@@ -235,9 +241,9 @@ export function isPromoExpired(validUntil: string | null | undefined, now: Date 
 
 // 长上下文与商务要点（售前速记）
 export const PRICING_NOTES: string[] = [
-  '长上下文分档：OpenAI >272K 输入 2×/输出 1.5×、Gemini 3.1 Pro >200K 分档、智谱国内 GLM-5 按 32K 分档；Anthropic 1M 标准价不加价、DeepSeek/Kimi/GLM-5.2 1M 统一价',
+  '长上下文分档：OpenAI >272K 输入 2×/输出 1.5×、Gemini 3.1 Pro >200K 分档、智谱国内 GLM-5 按 32K 分档；Anthropic 1M 标准价不加价、DeepSeek/Kimi/GLM-5.3/Qwen3.8 1M 统一价',
   'Batch 折扣：OpenAI / Anthropic / Gemini 均 5 折（异步、约 24h/1h SLA）；Kimi 6 折但旗舰 K3 不支持；DeepSeek 无 Batch，但有错峰定价——高峰仅 UTC 01–04、06–10，其余时段一律 5 折',
-  '缓存经济学两种模式：显式（Anthropic/Qwen：写入 1.25~2×、读取 0.1×）vs 自动隐式（DeepSeek/Kimi/OpenAI：直接命中低价）；DeepSeek 命中价约为未命中的 3.3%，Kimi/OpenAI/Anthropic 为 10%',
-  '国产开源旗舰 API 价格比国际旗舰低 3~13 倍（GLM-5.2 $1.4/$4.4、DeepSeek V4-Pro 高峰 $1.32/$3.96 vs Claude Fable 5 $10/$50），且 MIT/Apache 开源可自建是议价筹码',
+  '缓存经济学两种模式：显式（Anthropic/Qwen：写入 1.25~2×、读取 0.085~0.1×）vs 自动隐式（DeepSeek/Kimi/OpenAI：直接命中低价）；DeepSeek 命中价约为未命中的 3.3%，Kimi/OpenAI/Anthropic 为 10%',
+  '国产开源旗舰 API 价格比国际旗舰低 3~13 倍（GLM-5.3 $1.4/$4.4、DeepSeek V4-Pro 高峰 $1.32/$3.96 vs Claude Fable 5 $10/$50），且开源可自建是议价筹码（DeepSeek 为 MIT；GLM-5.3 为自定义许可证，法务需审原文）',
   'Gemini 缓存另收按小时存储费，长会话缓存要算总账；免费层数据会用于产品改进，toB 场景注意',
 ]

@@ -27,7 +27,7 @@ export const PROVIDERS: ProviderPreset[] = [
     label: '智谱 GLM',
     proxyPrefix: '/api/zhipu',
     chatPath: '/api/paas/v4/chat/completions',
-    defaultModel: 'glm-5.2',
+    defaultModel: 'glm-5.3', // 与 src/data/pricing.ts 现有条目对齐（2026-08-29 随 GLM-5.3 发布同步）
     supportsJsonMode: false,
   },
   {

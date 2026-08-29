@@ -19,7 +19,7 @@ export interface UrlBundleSource {
   url: string
   /** 页面标题；单节时不参与规范化，仅多节合并时用于合成节标题 */
   title?: string
-  /** 已净化的正文 HTML（extractArticle.ts 在抓取时用 sanitizeDocxHtml 处理过） */
+  /** 已净化的正文 HTML（extractArticle.ts 在抓取时用 sanitizeArticleHtml 处理过） */
   html: string
 }
 

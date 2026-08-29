@@ -41,6 +41,8 @@ describe('isTranslatableBlock', () => {
     expect(isTranslatableBlock('formula')).toBe(false)
     expect(isTranslatableBlock('code')).toBe(false)
     expect(isTranslatableBlock('table')).toBe(false)
+    // image 不进 allowlist：图不翻译，三态下都渲染原图（占位 text 也不进翻译包）
+    expect(isTranslatableBlock('image')).toBe(false)
   })
 })
 

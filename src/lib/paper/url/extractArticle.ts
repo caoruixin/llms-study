@@ -1,4 +1,4 @@
-import { sanitizeDocxHtml } from '../sanitize'
+import { sanitizeArticleHtml } from '../sanitize'
 
 /**
  * URL 导入的正文抽取：运行时层，浏览器 only（依赖 DOMParser + @mozilla/readability），
@@ -8,11 +8,11 @@ import { sanitizeDocxHtml } from '../sanitize'
  * 因此单测只 import { decodeHtmlBytes } 不会连带把 readability/DOM 依赖拖进 node 环境。
  *
  * 抽取阶梯（§Track 1）：
- *   预处理（删脚本类标签、链接绝对化、图片转文本占位、figcaption 提为段落）
+ *   预处理（删脚本类标签、链接/图片绝对化、图片包 figure 规整；保不住的图降级为文本占位）
  *   → isProbablyReaderable + Readability
  *   → 都不行时启发式后备（main/article/[role=main] 里取文本最长的一个，先删导航类噪声）
  *   → 正文过短（<200 字符）判定为「依赖脚本渲染，抓不到正文」
- *   → 复用 sanitizeDocxHtml 做最终白名单清洗（与 DOCX 正文同一套信任边界）
+ *   → sanitizeArticleHtml 做最终白名单清洗（DOCX 白名单 + img/figure/figcaption，见 sanitize.ts）
  */
 
 export interface ExtractedArticle {
@@ -69,15 +69,29 @@ export function decodeHtmlBytes(bytes: ArrayBuffer, contentType: string): string
 // 预处理 / 启发式后备（碰 DOM，只在 extractArticle 内部调用）
 // ---------------------------------------------------------------------------
 
-/** 删脚本类标签 + 链接绝对化 + 图片转文本占位 + figcaption 提为段落。不下载任何外部资源 */
+/** 删脚本类标签 + 链接/图片绝对化 + 图片包 figure 规整。不下载任何外部资源 */
 function preprocess(doc: Document, finalUrl: string): void {
+  // svg 照删：tikz-svg 图已知缺失，本期只处理 img（ar5iv 公式主体是 MathML，math 由 sanitize FORBID，公式现状不变）
   doc.querySelectorAll('script,style,noscript,iframe,svg').forEach((el) => el.remove())
+
+  // 解析基准：文档内 <base href>（相对 finalUrl 解析）→ 否则 finalUrl。
+  // 陷阱：arxiv HTML 的图片是相对路径（x1.png），new URL('x1.png', finalUrl) 会丢 URL 末段，
+  // 必须尊重文档内 <base href>；DOMParser 产出的 doc.baseURI 不反映它，须手动查。
+  let base = finalUrl
+  const baseHref = doc.querySelector('base[href]')?.getAttribute('href')
+  if (baseHref) {
+    try {
+      base = new URL(baseHref, finalUrl).toString()
+    } catch {
+      // 非法 <base href>：忽略，退回 finalUrl
+    }
+  }
 
   doc.querySelectorAll('a[href]').forEach((a) => {
     const href = a.getAttribute('href')
     if (!href) return
     try {
-      a.setAttribute('href', new URL(href, finalUrl).toString())
+      a.setAttribute('href', new URL(href, base).toString())
     } catch {
       a.removeAttribute('href')
     }
@@ -85,20 +99,49 @@ function preprocess(doc: Document, finalUrl: string): void {
 
   doc.querySelectorAll('img').forEach((img) => {
     const alt = img.getAttribute('alt')?.trim()
-    if (alt) {
-      const span = doc.createElement('span')
-      span.textContent = `[图: ${alt}]`
-      img.replaceWith(span)
-    } else {
-      img.remove()
+    /** 保不住的图按旧逻辑降级：有 alt 换成文本占位，无 alt 直接删 */
+    const degrade = (): void => {
+      if (alt) {
+        const span = doc.createElement('span')
+        span.textContent = `[图: ${alt}]`
+        img.replaceWith(span)
+      } else {
+        img.remove()
+      }
+    }
+
+    // src 缺失试 data-src（懒加载兜底），仍无 → 降级
+    const rawSrc = img.getAttribute('src') || img.getAttribute('data-src')
+    if (!rawSrc) return degrade()
+    let abs: URL
+    try {
+      abs = new URL(rawSrc, base)
+    } catch {
+      return degrade()
+    }
+    // 只保留 https 图（http 图在 https 站内是混合内容，浏览器会拦；其余协议不该出现）
+    if (abs.protocol !== 'https:') return degrade()
+
+    img.setAttribute('src', abs.toString())
+    // srcset/sizes 不进白名单也不想让浏览器另选源：显式移除，src 是唯一事实
+    img.removeAttribute('srcset')
+    img.removeAttribute('sizes')
+
+    // 无 figure 祖先的图包一层 <figure>，让 normalizeHtml 的 figure 分支统一接住
+    let fig = img.closest('figure')
+    if (!fig) {
+      fig = doc.createElement('figure')
+      img.replaceWith(fig)
+      fig.appendChild(img)
+    }
+    // figure 是块级元素，不能留在 <p> 里（extractBlocks 只扫顶层块）：
+    // 逐层移到最近 <p> 祖先之后，循环处理直到无 p 祖先（DOM 操作可造出嵌套 p）
+    for (let p = fig.closest('p'); p; p = fig.closest('p')) {
+      // afterend 需要 p 有父节点；万一 p 已游离（返回 null），停止避免死循环
+      if (!p.insertAdjacentElement('afterend', fig)) break
     }
   })
-
-  doc.querySelectorAll('figcaption').forEach((cap) => {
-    const p = doc.createElement('p')
-    p.innerHTML = cap.innerHTML
-    cap.replaceWith(p)
-  })
+  // figcaption 不再提为段落：它进了文章白名单，保持与 figure 的关联（normalizeHtml 落为 caption 块）
 }
 
 const NOISE_SELECTOR = 'nav,header,footer,aside,form,[role="navigation"],[aria-hidden="true"],.breadcrumb,.sidebar,.toc'
@@ -155,7 +198,7 @@ export async function extractArticle(input: { html: string; finalUrl: string }):
   if (!contentHtml) contentHtml = fallbackExtract(doc)
   if (!title) title = doc.title || doc.querySelector('h1')?.textContent?.trim() || hostnameAndPath(input.finalUrl)
 
-  const cleaned = sanitizeDocxHtml(contentHtml)
+  const cleaned = sanitizeArticleHtml(contentHtml)
   const plainLength = cleaned.replace(/<[^>]+>/g, '').trim().length
   if (plainLength < MIN_ARTICLE_CHARS) {
     throw new Error('页面依赖脚本渲染，无法抓取正文')

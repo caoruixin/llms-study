@@ -8,14 +8,19 @@ import type { NormalizedBlock, PaperBlockKind } from './types'
  * 不会有任何可执行标记进入 IndexedDB 或渲染层。
  */
 
-const BLOCK_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'table', 'pre', 'blockquote'])
+// figure 进块级集合是给 URL 管线（normalizeHtml 的 figure 分支）用的；
+// DOCX 管线里 figure 落 default → toText → paragraph（DOCX 的 img 早被 sanitize 剥掉，行为实际不变）
+const BLOCK_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'table', 'pre', 'blockquote', 'figure'])
 
 const NAMED_ENTITIES: Record<string, string> = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ensp: ' ', emsp: ' ', hellip: '…', mdash: '—', ndash: '–',
 }
 
-/** 实体解码在「去标签之后」执行：`&lt;script&gt;` 只会还原成普通文本，不会变回可执行标记 */
-function decodeEntities(s: string): string {
+/**
+ * 实体解码在「去标签之后」执行：`&lt;script&gt;` 只会还原成普通文本，不会变回可执行标记。
+ * export：normalizeHtml.ts 的 figure 分支解码 img 属性值（src 里的 &amp; 等）复用同一份实现。
+ */
+export function decodeEntities(s: string): string {
   return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (full, body: string) => {
     if (body[0] === '#') {
       const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10)
@@ -156,7 +161,9 @@ export function normalizeDocxHtml(html: string): NormalizedBlock[] {
   let section = ''
 
   const push = (kind: PaperBlockKind, text: string, extra?: { level?: number; html?: string }) => {
-    if (!text) return // 空块（例如只含被剥掉的图片的段落）直接跳过
+    // 空块（例如只含被剥掉的图片的段落）直接跳过；但带结构 html 的块（纯图表格）保留，
+    // 与 normalizeHtml 的同款早退对齐（两管线行为对齐惯例）
+    if (!text && !extra?.html) return
     const index = blocks.length
     const block: NormalizedBlock = {
       index,

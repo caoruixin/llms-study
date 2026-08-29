@@ -129,6 +129,88 @@ describe('normalizeHtmlSections', () => {
     })
   })
 
+  describe('figure → image / caption 块', () => {
+    it('figure 拆成 image 块 + caption 块：顺序、text 占位与 src 字段', () => {
+      const html =
+        '<p>前文</p>' +
+        '<figure><img src="https://arxiv.org/html/2406.00001v1/x1.png" alt="Overview"><figcaption>图 1：总览</figcaption></figure>' +
+        '<p>后文</p>'
+      const blocks = normalizeHtmlSections([{ html }])
+      expect(blocks.map((b) => [b.kind, b.text])).toEqual([
+        ['paragraph', '前文'],
+        ['image', '[图: Overview]'],
+        ['caption', '图 1：总览'],
+        ['paragraph', '后文'],
+      ])
+      expect(blocks[1].src).toBe('https://arxiv.org/html/2406.00001v1/x1.png')
+      expect(blocks[2].src).toBeUndefined()
+    })
+
+    it('无 alt 的图占位为 [图]；src 属性值做 HTML 实体解码（&amp; 等）', () => {
+      const blocks = normalizeHtmlSections([
+        { html: '<figure><img src="https://x.org/a.png?w=1&amp;h=2&quot;"></figure>' },
+      ])
+      expect(blocks).toHaveLength(1)
+      expect(blocks[0]).toMatchObject({ kind: 'image', text: '[图]', src: 'https://x.org/a.png?w=1&h=2"' })
+    })
+
+    it('一个 figure 多张图逐图成块，figcaption 归并为殿后的一个 caption 块', () => {
+      const blocks = normalizeHtmlSections([
+        {
+          html:
+            '<figure><img src="https://x.org/a.png" alt="A"><img src="https://x.org/b.png" alt="B">' +
+            '<figcaption>双图并排</figcaption></figure>',
+        },
+      ])
+      expect(blocks.map((b) => [b.kind, b.text, b.src])).toEqual([
+        ['image', '[图: A]', 'https://x.org/a.png'],
+        ['image', '[图: B]', 'https://x.org/b.png'],
+        ['caption', '双图并排', undefined],
+      ])
+    })
+
+    it('无 src 的图仍成 image 块（占位文本、无 src 字段，渲染层降级为纯占位）', () => {
+      const blocks = normalizeHtmlSections([{ html: '<figure><img alt="lost"></figure>' }])
+      expect(blocks).toHaveLength(1)
+      expect(blocks[0].kind).toBe('image')
+      expect(blocks[0].text).toBe('[图: lost]')
+      expect(blocks[0].src).toBeUndefined()
+    })
+
+    it('figure 内 img/figcaption 之外的内容忽略', () => {
+      const blocks = normalizeHtmlSections([
+        { html: '<figure><p>杂项说明</p><img src="https://x.org/a.png"></figure>' },
+      ])
+      expect(blocks.map((b) => [b.kind, b.text])).toEqual([['image', '[图]']])
+    })
+
+    it('image / caption 块的 blockIndex 全局连续，anchor.section 沿用最近标题', () => {
+      const blocks = normalizeHtmlSections([
+        { html: '<h2>方法</h2><figure><img src="https://x.org/a.png" alt="架构"><figcaption>图 2</figcaption></figure><p>正文</p>' },
+      ])
+      blocks.forEach((b, i) => {
+        expect(b.index).toBe(i)
+        expect(b.anchor.blockIndex).toBe(i)
+      })
+      expect(blocks.map((b) => b.anchor.section)).toEqual(['方法', '方法', '方法', '方法'])
+    })
+  })
+
+  it('纯图表格不再被整块丢弃：text 为空但保留结构 html，blockIndex 连续', () => {
+    const html = '<p>A</p><table><tr><td><img src="https://x.org/a.png"></td></tr></table><p>B</p>'
+    const blocks = normalizeHtmlSections([{ html }])
+    expect(blocks.map((b) => [b.kind, b.text])).toEqual([
+      ['paragraph', 'A'],
+      ['table', ''],
+      ['paragraph', 'B'],
+    ])
+    expect(blocks[1].html).toContain('<img')
+    blocks.forEach((b, i) => {
+      expect(b.index).toBe(i)
+      expect(b.anchor.blockIndex).toBe(i)
+    })
+  })
+
   it('列表 / 表格 / pre 与 normalizeDocxHtml 行为一致（单节透传）', () => {
     const html = '<ul><li>项一</li><li>项二</li></ul><table><tr><th>A</th></tr><tr><td>1</td></tr></table><pre>code()</pre>'
     const blocks = normalizeHtmlSections([{ html }])

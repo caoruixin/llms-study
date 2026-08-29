@@ -1,7 +1,9 @@
-import { useEffect, type RefObject } from 'react'
+import { useEffect, useState, type RefObject } from 'react'
+import { Link } from 'react-router-dom'
+import type { LlmAuthCode } from '../../lib/llmClient'
 import { CURRENT_PAGE_EPSILON, blockDomId } from '../../lib/paper/anchors'
 import { splitByRanges, validRanges } from '../../lib/paper/highlight/highlightModel'
-import { sanitizeDocxHtml } from '../../lib/paper/sanitize'
+import { sanitizeArticleHtml } from '../../lib/paper/sanitize'
 import { isTranslatableBlock } from '../../lib/paper/translate/translateBatch'
 import type { LangMode, PaperBlock, PaperHighlight } from '../../lib/paper/types'
 
@@ -36,6 +38,8 @@ interface Props {
   translations?: ReadonlyMap<number, string>
   /** 修复/对分后仍失败的块：显示原文 + 重试 chip */
   failedTranslations?: ReadonlySet<number>
+  /** auth 失败细分（未登录/未配 key）：失败 chip 换成对应引导而非笼统「翻译失败」 */
+  translationAuthIssue?: LlmAuthCode | null
   onRetryTranslation?: (blockIndex: number) => void
   /** blockIndex → 该块全部高亮行（含两种 lang，渲染端按宿主语言过滤） */
   highlights?: ReadonlyMap<number, readonly PaperHighlight[]>
@@ -74,6 +78,82 @@ function HlText({ text, rows, host }: { text: string; rows: readonly PaperHighli
   )
 }
 
+/**
+ * image 块：远程引用优先（loading=lazy + no-referrer 绕常见防盗链），onError 降级为
+ * 占位文本 + 「通过代理加载」按钮（fetchUrl 代理取字节 → blob URL 重试，即时不落库）。
+ * 不带 data-hl-host：image 块不参与划词高亮（占位 span 的 textContent 不是高亮源字符串口径）。
+ */
+function ImageBlock({ block }: { block: PaperBlock }) {
+  const [failed, setFailed] = useState(false)
+  const [proxySrc, setProxySrc] = useState<string | null>(null)
+  const [proxyStatus, setProxyStatus] = useState<'idle' | 'loading' | 'error'>('idle')
+  const [proxyMessage, setProxyMessage] = useState('')
+
+  // blob URL 生命周期：换源或卸载时 revoke（代理兜底是即时 blob，不缓存不落库）
+  useEffect(() => {
+    if (!proxySrc) return
+    return () => URL.revokeObjectURL(proxySrc)
+  }, [proxySrc])
+
+  const loadViaProxy = async () => {
+    if (!block.src || proxyStatus === 'loading') return
+    setProxyStatus('loading')
+    try {
+      // 动态 import：代理兜底是低频路径，fetchUrlApi 不进阅读视图主 chunk
+      const { fetchUrl } = await import('../../lib/paper/url/fetchUrlApi')
+      const { bytes } = await fetchUrl(block.src)
+      setProxySrc(URL.createObjectURL(new Blob([bytes])))
+      setProxyStatus('idle')
+    } catch (e) {
+      setProxyMessage((e as Error).message || '代理加载失败')
+      setProxyStatus('error')
+    }
+  }
+
+  const src = proxySrc ?? block.src
+  if (src !== undefined && (!failed || proxySrc !== null)) {
+    return (
+      <figure>
+        <img
+          src={src}
+          alt={block.text}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => {
+            if (proxySrc !== null) {
+              // 代理拿回的字节也解不出图：撤 blob 回占位态并给出错误文案
+              setProxySrc(null)
+              setProxyStatus('error')
+              setProxyMessage('代理返回的图片数据无法显示')
+            }
+            setFailed(true)
+          }}
+          className="max-w-full rounded border border-line"
+        />
+      </figure>
+    )
+  }
+  // 失败态 / 无 src：渲染 [图: alt] 占位；有 src 时提供代理兜底按钮
+  return (
+    <div className="rounded-lg border border-dashed border-line bg-panel-2 p-3 text-sm text-dim">
+      <span>{block.text}</span>
+      {block.src && (
+        <span className="ml-2 inline-flex items-center gap-2 align-middle">
+          <button
+            type="button"
+            onClick={loadViaProxy}
+            disabled={proxyStatus === 'loading'}
+            className="rounded border border-line px-1.5 py-0.5 text-xs text-accent transition-colors hover:bg-accent/10 disabled:opacity-60"
+          >
+            {proxyStatus === 'loading' ? '正在通过代理加载…' : '通过代理加载'}
+          </button>
+          {proxyStatus === 'error' && <span className="text-xs text-bad">{proxyMessage}</span>}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function BlockBody({ block, rows }: { block: PaperBlock; rows?: readonly PaperHighlight[] | undefined }) {
   switch (block.kind) {
     case 'heading':
@@ -92,13 +172,16 @@ function BlockBody({ block, rows }: { block: PaperBlock; rows?: readonly PaperHi
           </span>
         </p>
       )
+    case 'image':
+      return <ImageBlock block={block} />
     case 'table':
-      // DOCX 表格保留了结构化 HTML：渲染前**再清洗一次**（纵深防御，正文永远是不可信输入）；
-      // 不带 data-hl-host——高亮偏移相对源字符串的约定在富结构 HTML 上不成立
+      // 表格保留了结构化 HTML：渲染前**再清洗一次**（纵深防御，正文永远是不可信输入）；
+      // 用文章白名单：URL 导入的表格单元格里可能有 img，用 DOCX 白名单会在渲染时被二次剥掉
+      // （DOCX 表格本就无 img，无副作用）。不带 data-hl-host——高亮偏移约定在富结构 HTML 上不成立
       return block.html ? (
         <div
           className="paper-table overflow-x-auto text-sm"
-          dangerouslySetInnerHTML={{ __html: sanitizeDocxHtml(block.html) }}
+          dangerouslySetInnerHTML={{ __html: sanitizeArticleHtml(block.html) }}
         />
       ) : (
         <pre className="overflow-x-auto rounded-lg border border-line bg-panel-2 p-3 text-xs leading-relaxed text-fg">
@@ -163,10 +246,22 @@ function TranslationSkeleton() {
   )
 }
 
-function TranslationError({ onRetry }: { onRetry?: (() => void) | undefined }) {
+function TranslationError({ onRetry, authIssue }: { onRetry?: (() => void) | undefined; authIssue?: LlmAuthCode | null }) {
   return (
     <p className="mt-1 flex items-center gap-2 text-[0.7rem]">
-      <span className="text-bad">这一段翻译失败</span>
+      <span className="text-bad">
+        {authIssue === 'unauthenticated'
+          ? '登录已过期，请重新登录后重试翻译'
+          : authIssue
+            ? '该账号尚未配置 DeepSeek Key，无法翻译'
+            : '这一段翻译失败'}
+      </span>
+      {authIssue && authIssue !== 'unauthenticated' && (
+        // 与 AskDialog 的 no-user-key 分支同一引导：账号侧配置问题 → 设置页
+        <Link to="/settings" className="text-accent underline underline-offset-2 hover:text-accent">
+          去设置页配置
+        </Link>
+      )}
       {onRetry && (
         <button
           type="button"
@@ -187,6 +282,7 @@ export default function BlockReader({
   langMode = 'orig',
   translations,
   failedTranslations,
+  translationAuthIssue,
   onRetryTranslation,
   highlights,
 }: Props) {
@@ -230,7 +326,7 @@ export default function BlockReader({
         return (
           <>
             <BlockBody block={b} rows={rows} />
-            <TranslationError onRetry={retry} />
+            <TranslationError onRetry={retry} authIssue={translationAuthIssue} />
           </>
         )
       return <TranslationSkeleton />
@@ -248,7 +344,7 @@ export default function BlockReader({
             <HlText text={zh} rows={rows} host="zh" />
           </div>
         ) : failed ? (
-          <TranslationError onRetry={retry} />
+          <TranslationError onRetry={retry} authIssue={translationAuthIssue} />
         ) : (
           <TranslationSkeleton />
         )}

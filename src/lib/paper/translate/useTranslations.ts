@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { PAPER_TASKS, buildStructuredFallbackSpec } from '../../../data/paperPolicy'
+import { LlmError, type LlmAuthCode } from '../../llmClient'
 import { GatewayError, type ModelGateway } from '../modelGateway'
 import { getPaperGateway } from '../gatewaySingleton'
 import { getRepos } from '../repo/repos'
@@ -29,6 +30,8 @@ export interface TranslationSnapshot {
   texts: ReadonlyMap<number, string>
   /** 修复/对分后仍失败的块：显示原文 + 重试 chip，不再自动重试（防失败风暴） */
   failed: ReadonlySet<number>
+  /** 账号侧 auth 失败（未登录/未配 key）：重试无意义，UI 据此把失败 chip 换成配置引导 */
+  authIssue: LlmAuthCode | null
 }
 
 export interface TranslationSchedulerDeps {
@@ -74,11 +77,13 @@ export function createTranslationScheduler(opts: {
   let disposed = false
   /** 授权被拒 / 网关级失败（熔断等）后停机：骨架保留，重试或再激活恢复 */
   let halted = false
+  /** auth 失败细分码（未登录/未配 key）：随停机记录，重试/再激活清除 */
+  let authIssue: LlmAuthCode | null = null
   let consentOk = false
   let loadPromise: Promise<void> | null = null
 
   const emit = () => {
-    if (!disposed) opts.onChange({ texts: new Map(texts), failed: new Set(failed) })
+    if (!disposed) opts.onChange({ texts: new Map(texts), failed: new Set(failed), authIssue })
   }
 
   const load = async () => {
@@ -189,6 +194,14 @@ export function createTranslationScheduler(opts: {
         halted = true
         return
       }
+      if (e instanceof LlmError && e.kind === 'auth') {
+        // 账号侧配置问题（未登录/未配 key）：继续出包只会刷一屏 403，停机；
+        // 已入队的块标失败，失败 chip 按 authIssue 换成「去设置页配置」引导
+        authIssue = e.code ?? 'forbidden'
+        halted = true
+        markFailed(batch)
+        return
+      }
       markFailed(batch)
       return
     }
@@ -246,6 +259,7 @@ export function createTranslationScheduler(opts: {
     async activate() {
       if (disposed) return
       halted = false // 再激活给拒绝授权/熔断后的用户一次重来机会
+      authIssue = null
       loadPromise ??= load()
       await loadPromise
       if (paper.sensitive) return // 敏感论文：只读缓存，绝不出包
@@ -262,6 +276,7 @@ export function createTranslationScheduler(opts: {
       if (disposed) return
       failed.delete(blockIndex)
       halted = false
+      authIssue = null // 用户可能已去设置页配好 key，给一次干净重试
       emit()
       if (paper.sensitive || !loadPromise) return
       recompute()
@@ -284,7 +299,7 @@ export interface UseTranslationsResult extends TranslationSnapshot {
   consentAsk: ((granted: boolean) => void) | null
 }
 
-const EMPTY_SNAPSHOT: TranslationSnapshot = { texts: new Map(), failed: new Set() }
+const EMPTY_SNAPSHOT: TranslationSnapshot = { texts: new Map(), failed: new Set(), authIssue: null }
 
 export function useTranslations(opts: {
   paper: PaperRecord | null
@@ -353,5 +368,5 @@ export function useTranslations(opts: {
     schedulerRef.current?.retryBlock(blockIndex)
   }, [])
 
-  return { texts: snapshot.texts, failed: snapshot.failed, retryBlock, consentAsk }
+  return { texts: snapshot.texts, failed: snapshot.failed, authIssue: snapshot.authIssue, retryBlock, consentAsk }
 }
