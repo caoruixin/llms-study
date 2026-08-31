@@ -225,7 +225,10 @@ describe('正常抓取', () => {
     // 出站头最小化:固定 UA、identity 编码、不带任何凭据
     const sent = f.origin.requests[0]
     expect(sent.url).toBe('/paper?a=1')
-    expect(sent.headers['user-agent']).toBe('llm-pro.cn paper-copilot/1.0 (+https://llm-pro.cn)')
+    expect(sent.headers['user-agent']).toBe(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    )
+    expect(sent.headers['accept-language']).toBe('zh-CN,zh;q=0.9,en;q=0.8')
     expect(sent.headers['accept-encoding']).toBe('identity')
     expect(sent.headers.cookie).toBeUndefined()
     expect(sent.headers.authorization).toBeUndefined()

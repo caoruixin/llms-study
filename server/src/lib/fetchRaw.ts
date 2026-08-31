@@ -103,12 +103,16 @@ export interface SafeFetchResult {
 /**
  * 出站头:最小集。不带任何 cookie/authorization/referer——
  * 这条通道是"代用户读公开网页",绝不能替用户出示任何身份。
+ * UA 采用通用浏览器形态:诚实自报的 bot UA 会被反爬墙(如微信公众号 mp.weixin.qq.com)
+ * 直接 302 到验证页,而通用 UA 不携带任何用户身份信息,与"绝不替用户出示身份"的原则不冲突。
  * Accept-Encoding 显式 identity:压缩流会让"实读字节"与"解压后字节"脱钩,
  * 能不压就不压(仍压缩的上游由 zlib 兜底,解压后同受上限约束)。
  */
 const OUTBOUND_HEADERS: Record<string, string> = {
-  'user-agent': 'llm-pro.cn paper-copilot/1.0 (+https://llm-pro.cn)',
+  'user-agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   accept: 'text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.1',
+  'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
   'accept-encoding': 'identity',
 }
 

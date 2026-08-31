@@ -1,18 +1,24 @@
 import { sanitizeArticleHtml } from '../sanitize'
+import { paragraphizeHtml } from './paragraphize'
+import { WEIXIN_BLOCKED_MESSAGE, isWeixinArticleUrl, isWeixinCaptchaUrl } from './weixin'
 
 /**
- * URL 导入的正文抽取：运行时层，浏览器 only（依赖 DOMParser + @mozilla/readability），
- * 本文件不进 vitest——与 parsePdf.ts 同待遇（真实解析靠 codex E2E 环覆盖）。
- * 只有 `decodeHtmlBytes` 是纯函数（不碰 DOM），单独导出给 decodeHtmlBytes.test.ts 覆盖；
- * readability 用**动态 import**，只有真正调用 extractArticle() 时才会被拉取，
+ * URL 导入的正文抽取：运行时层，浏览器 only（依赖 DOMParser + @mozilla/readability）。
+ * Readability 主路径不进 vitest——与 parsePdf.ts 同待遇（真实解析靠 codex E2E 环覆盖）；
+ * 微信直取路径不经 Readability，由 extractArticle.weixin.test.ts 在 happy-dom 下覆盖。
+ * `decodeHtmlBytes` 是纯函数（不碰 DOM），单独导出给 decodeHtmlBytes.test.ts 覆盖；
+ * readability 用**动态 import**，只有真正走 Readability 分支时才会被拉取，
  * 因此单测只 import { decodeHtmlBytes } 不会连带把 readability/DOM 依赖拖进 node 环境。
  *
  * 抽取阶梯（§Track 1）：
- *   预处理（删脚本类标签、链接/图片绝对化、图片包 figure 规整；保不住的图降级为文本占位）
- *   → isProbablyReaderable + Readability
+ *   finalUrl 是微信验证页（wappoc_appmsgcaptcha）→ 直接抛风控提示
+ *   → 预处理（删脚本类标签、链接/图片绝对化、图片包 figure 规整；保不住的图降级为文本占位）
+ *   → 微信文章页直取 #js_content（其 visibility:hidden 会被 Readability 整体丢弃，必须绕过）
+ *   → 否则 isProbablyReaderable + Readability
  *   → 都不行时启发式后备（main/article/[role=main] 里取文本最长的一个，先删导航类噪声）
- *   → 正文过短（<200 字符）判定为「依赖脚本渲染，抓不到正文」
+ *   → paragraphizeHtml 把容器内散落文本包进 <p>（必须在 sanitize 前固化段落边界）
  *   → sanitizeArticleHtml 做最终白名单清洗（DOCX 白名单 + img/figure/figcaption，见 sanitize.ts）
+ *   → 正文过短（<200 字符）判定为「依赖脚本渲染，抓不到正文」（微信改抛风控提示）
  */
 
 export interface ExtractedArticle {
@@ -177,30 +183,51 @@ function hostnameAndPath(url: string): string {
 // ---------------------------------------------------------------------------
 
 export async function extractArticle(input: { html: string; finalUrl: string }): Promise<ExtractedArticle> {
+  // 服务端代理会跟随微信风控的 302 → 人机验证页，x-fetch-final-url 带回的 finalUrl 会暴露它
+  if (isWeixinCaptchaUrl(input.finalUrl)) throw new Error(WEIXIN_BLOCKED_MESSAGE)
+
   const doc = new DOMParser().parseFromString(input.html, 'text/html')
   preprocess(doc, input.finalUrl)
 
   let contentHtml = ''
   let title = ''
 
-  // 动态 import：只有真正抽取网页时才拉取 readability，不进主 chunk
-  const { Readability, isProbablyReaderable } = await import('@mozilla/readability')
-  if (isProbablyReaderable(doc)) {
-    // Readability.parse() 会破坏性地改写传入的 document，克隆一份避免影响后续的启发式后备
-    const clone = doc.cloneNode(true) as Document
-    const article = new Readability(clone, { keepClasses: false }).parse()
-    if (article?.content) {
-      contentHtml = article.content
-      title = article.title ?? ''
+  // 微信正文 #js_content 自带 style="visibility:hidden"（靠 JS 显示），Readability 的
+  // _isProbablyVisible 会把它整体丢弃 → 直取绕过。必须在 preprocess 之后：
+  // data-src 懒加载图此时已提升为 src 并包好 figure。style 属性不在文章白名单，sanitize 兜底剥除。
+  if (isWeixinArticleUrl(input.finalUrl)) {
+    const root = doc.querySelector('#js_content')
+    // 200 状态但没有正文容器：被微信降级成 stub/验证壳页
+    if (!root) throw new Error(WEIXIN_BLOCKED_MESSAGE)
+    contentHtml = root.innerHTML
+    title = doc.querySelector('#activity-name')?.textContent?.trim() ?? ''
+  }
+
+  if (!contentHtml) {
+    // 动态 import：只有真正走 Readability 分支才拉取，不进主 chunk（微信直取路径完全跳过）
+    const { Readability, isProbablyReaderable } = await import('@mozilla/readability')
+    if (isProbablyReaderable(doc)) {
+      // Readability.parse() 会破坏性地改写传入的 document，克隆一份避免影响后续的启发式后备
+      const clone = doc.cloneNode(true) as Document
+      const article = new Readability(clone, { keepClasses: false }).parse()
+      if (article?.content) {
+        contentHtml = article.content
+        title = article.title ?? ''
+      }
     }
   }
 
   if (!contentHtml) contentHtml = fallbackExtract(doc)
   if (!title) title = doc.title || doc.querySelector('h1')?.textContent?.trim() || hostnameAndPath(input.finalUrl)
 
-  const cleaned = sanitizeArticleHtml(contentHtml)
+  // paragraphize 必须在 sanitize 之前：DOMPurify unwrap <section> 时文本无分隔符直接拼接，
+  // 段落边界一旦丢失不可恢复（中文尤甚）。Readability 输出本就是 <p> 结构 → 近似 no-op。
+  const cleaned = sanitizeArticleHtml(paragraphizeHtml(contentHtml))
   const plainLength = cleaned.replace(/<[^>]+>/g, '').trim().length
   if (plainLength < MIN_ARTICLE_CHARS) {
+    // 微信被限流后可能返回 200 + 残缺 stub（空/近空的 #js_content）：给可行动的风控提示，
+    // 而不是误导性的「依赖脚本渲染」
+    if (isWeixinArticleUrl(input.finalUrl)) throw new Error(WEIXIN_BLOCKED_MESSAGE)
     throw new Error('页面依赖脚本渲染，无法抓取正文')
   }
 
