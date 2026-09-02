@@ -195,6 +195,10 @@ export default function InterviewPage() {
         model: settings.model,
         messages,
         wantJson: true,
+        // 评分不需要思考：输出是固定形状的 JSON，开思考只会把预算吃在 reasoning 上（严重时正文空流），
+        // 1500 token 对评分 JSON 绰绰有余
+        thinking: 'off',
+        maxOutputTokens: 1500,
       })
     const first = await call()
     try {
@@ -210,6 +214,8 @@ export default function InterviewPage() {
           { role: 'user', content: '你的输出不是合法 JSON。请只输出一个合法 JSON 对象，字段与格式要求同前，不要任何其他文字。' },
         ],
         wantJson: true,
+        thinking: 'off', // 与首轮同口径：重试只是纠正格式，更不该花在思考上
+        maxOutputTokens: 1500,
       })
       return parseScoreJson(retry)
     }

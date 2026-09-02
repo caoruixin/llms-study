@@ -35,7 +35,9 @@ export const PROVIDERS: ProviderPreset[] = [
     label: 'DeepSeek',
     proxyPrefix: '/api/deepseek',
     chatPath: '/chat/completions',
-    defaultModel: 'deepseek-v4-flash',
+    // v4-pro：与论文陪读（src/data/paperPolicy.ts）拉齐的质量档（1.6T/49B 激活 vs Flash 284B/13B）。
+    // 换档不牺牲延迟——通用链路已在 llmClient 里显式关思考，端到端反而比「flash + 默认思考」快一个量级。
+    defaultModel: 'deepseek-v4-pro',
     supportsJsonMode: true,
   },
   {
@@ -63,7 +65,7 @@ export const useSettings = create<SettingsState>()(
   persist(
     (set) => ({
       provider: 'deepseek',
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4-pro',
       setProvider: (provider) =>
         set({ provider, model: PROVIDERS.find((p) => p.id === provider)?.defaultModel ?? '' }),
       setModel: (model) => set({ model }),
@@ -71,6 +73,16 @@ export const useSettings = create<SettingsState>()(
     {
       name: 'llm-infra-settings',
       partialize: (s) => ({ provider: s.provider, model: s.model }),
+      version: 1, // v1：默认档 deepseek-v4-flash → v4-pro，老会话的 localStorage 不迁移就永远停在 flash
+      migrate: (persisted: unknown) => {
+        const s = persisted as Partial<SettingsState> | undefined
+        // 只改写「还停在旧默认值」的这一种情况：用户手填过别的 model id（含刻意选回 flash 之外的档）
+        // 属于显式选择，迁移无权覆盖
+        if (s?.provider === 'deepseek' && s.model === 'deepseek-v4-flash') {
+          return { ...s, model: 'deepseek-v4-pro' } as SettingsState
+        }
+        return s as SettingsState
+      },
     },
   ),
 )

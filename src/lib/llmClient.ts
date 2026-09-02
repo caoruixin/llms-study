@@ -1,6 +1,6 @@
 import { PROVIDERS } from '../store'
 import type { ProviderId } from '../store'
-import { createSseParser, extractStreamDelta, extractStreamError } from './sse'
+import { createSseParser, extractFinishReason, extractStreamDelta, extractStreamError } from './sse'
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
@@ -26,12 +26,52 @@ export class LlmError extends Error {
   }
 }
 
+/** 思考档：'off' 显式关闭（默认），'low' / 'high' 开启并指定 reasoning_effort */
+export type ThinkingLevel = 'off' | 'low' | 'high'
+
 export interface ChatOptions {
   provider: ProviderId
   model: string
   messages: ChatMessage[]
   wantJson?: boolean
   timeoutMs?: number
+  /** 思考档，默认 'off'（不依赖上游默认值，详见 applyThinkingAndLimit） */
+  thinking?: ThinkingLevel
+  /** 输出上限；不传则不发送该参数，由上游默认值决定 */
+  maxOutputTokens?: number
+}
+
+/**
+ * 按 provider 写入思考档与输出上限。参数语义照抄 src/lib/paper/providerAdapters.ts 的 buildChatBody
+ * （论文陪读链路已实弹验证），但**刻意复制而非 import**：src/lib/paper/** 在 flag-off 构建里被
+ * vite 插件解析成空模块（见 vite.config.ts 的 paperCopilotOffPlugin 与 src/data/paperPolicy.ts 文件头），
+ * 主入口静态图一旦引用它，flag-off 产物就会拿到空模块而爆掉。
+ *
+ * - deepseek：思考可关。'off' → thinking:{type:'disabled'}；'low'/'high' → thinking:{type:'enabled'} + reasoning_effort。
+ *   必须显式关——DeepSeek V4 两档默认思考都是开的，不发这个字段实测出现过 24.8K reasoning token /
+ *   195s 才回包（直接撞穿超时）；思考长度还极不稳定，简单题百来个 token、中等题就上万。
+ * - moonshot（Kimi）：思考不可关，只发 reasoning_effort，'off' 降级为 'low'；输出上限参数名是 max_completion_tokens。
+ * - zhipu / openai-compat：无实测依据，一律不发思考字段（猜错参数名上游直接 400），只发 max_tokens。
+ */
+function applyThinkingAndLimit(
+  body: Record<string, unknown>,
+  provider: ProviderId,
+  thinking: ThinkingLevel,
+  maxOutputTokens: number | undefined,
+): void {
+  if (provider === 'deepseek') {
+    if (thinking === 'off') {
+      body.thinking = { type: 'disabled' }
+    } else {
+      body.thinking = { type: 'enabled' }
+      body.reasoning_effort = thinking
+    }
+  } else if (provider === 'moonshot') {
+    body.reasoning_effort = thinking === 'high' ? 'high' : 'low'
+  }
+  if (maxOutputTokens !== undefined) {
+    body[provider === 'moonshot' ? 'max_completion_tokens' : 'max_tokens'] = maxOutputTokens
+  }
 }
 
 /** Retry-After 支持秒数与 HTTP-date 两种形态；解析失败返回 undefined */
@@ -85,8 +125,10 @@ export async function chatComplete(opts: ChatOptions): Promise<string> {
   if (!preset) throw new LlmError('bad-response', `未知 provider: ${opts.provider}`)
 
   const controller = new AbortController()
-  // 120s：兼容 v4-pro / K3 等思考模式常开的模型（评分可能带较长 reasoning）
-  const timeoutMs = opts.timeoutMs ?? 120_000
+  // 60s：思考档现在由 applyThinkingAndLimit 显式下发（默认 off），实测 P99 在 20s 内。
+  // 旧的 120s 是给「思考常开、reasoning 长度不可控」留的余量，那条路已经堵死——
+  // 再留 120s 只会让真正失败的请求多干等一分钟。
+  const timeoutMs = opts.timeoutMs ?? 60_000
   const timer = setTimeout(() => controller.abort(), timeoutMs)
 
   const body: Record<string, unknown> = {
@@ -94,6 +136,7 @@ export async function chatComplete(opts: ChatOptions): Promise<string> {
     messages: opts.messages,
     temperature: 0.2,
   }
+  applyThinkingAndLimit(body, opts.provider, opts.thinking ?? 'off', opts.maxOutputTokens)
   if (opts.wantJson && preset.supportsJsonMode) {
     body.response_format = { type: 'json_object' }
   }
@@ -265,7 +308,17 @@ export interface ChatStreamOptions {
   signal?: AbortSignal // 外部中止（Stop / 关闭对话框都走此，语义区分在调用方）
   firstByteTimeoutMs?: number // 默认 120_000，fetch 前启动
   idleTimeoutMs?: number // 默认 30_000，首字节后帧间空闲超时，每次 read 后重置
+  /** 思考档，默认 'off'（详见 applyThinkingAndLimit；思考期间 delta.content 为空，面板会一直空白） */
+  thinking?: ThinkingLevel
+  /** 输出上限；不传则不发送该参数，由上游默认值决定 */
+  maxOutputTokens?: number
   onDelta: (delta: string) => void
+  /**
+   * 上游 finish_reason === 'length'（撞 maxOutputTokens 被截断）时回调一次。
+   * 截断在协议层是「正常收尾」：HTTP 200、无 error 帧、内容也不带任何标记，
+   * 不显式接住这个信号，用户看到的就是一段句子中间断掉却毫无提示的回答。
+   */
+  onTruncated?: () => void
 }
 
 // 流式（SSE）调用，返回累计全文。签名与行为不变：传输层已抽取为 runSseChat，
@@ -274,15 +327,18 @@ export async function chatStream(opts: ChatStreamOptions): Promise<string> {
   const preset = PROVIDERS.find((p) => p.id === opts.provider)
   if (!preset) throw new LlmError('bad-response', `未知 provider: ${opts.provider}`)
 
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    messages: opts.messages,
+    temperature: 0.7,
+    stream: true,
+  }
+  applyThinkingAndLimit(body, opts.provider, opts.thinking ?? 'off', opts.maxOutputTokens)
+
   let acc = ''
   const result = await runSseChat({
     url: preset.proxyPrefix + preset.chatPath,
-    body: {
-      model: opts.model,
-      messages: opts.messages,
-      temperature: 0.7,
-      stream: true,
-    },
+    body,
     signal: opts.signal,
     firstByteTimeoutMs: opts.firstByteTimeoutMs,
     idleTimeoutMs: opts.idleTimeoutMs,
@@ -294,6 +350,7 @@ export async function chatStream(opts: ChatStreamOptions): Promise<string> {
         acc += delta
         opts.onDelta(delta)
       }
+      if (extractFinishReason(data) === 'length') opts.onTruncated?.()
     },
     onJson: (data) => {
       const content = extractContent(data)

@@ -11,6 +11,7 @@ export interface AskMsg {
   content: string
   quoted?: boolean // 引用卡
   pending?: boolean // 流式中的助手占位消息
+  truncated?: boolean // 撞 max_tokens 被截断（finish_reason='length'），尾部加提示
 }
 
 interface Props {
@@ -198,6 +199,9 @@ export default function AskDialog({ messages, busy, error, errorKind, errorCode,
             ) : (
               <div key={m.id} className="space-y-2">
                 {renderAssistant(m.content)}
+                {m.truncated && (
+                  <p className="text-xs text-dim">回答已达长度上限，内容可能不完整——可追问「继续」。</p>
+                )}
               </div>
             ),
           )}

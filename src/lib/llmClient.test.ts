@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { chatStream, LlmError } from './llmClient'
+import { chatComplete, chatStream, LlmError, type ChatStreamOptions } from './llmClient'
 
 const realFetch = globalThis.fetch
 const encoder = new TextEncoder()
@@ -11,7 +11,7 @@ afterEach(() => {
 
 const base = {
   provider: 'deepseek' as const,
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4-pro',
   messages: [{ role: 'user' as const, content: '你好' }],
 }
 
@@ -145,7 +145,7 @@ describe('chatStream（流式）', () => {
     }
     expect(sent.stream).toBe(true)
     expect(sent.temperature).toBe(0.7)
-    expect(sent.model).toBe('deepseek-v4-flash')
+    expect(sent.model).toBe('deepseek-v4-pro')
     expect(sent.messages).toHaveLength(1)
     // key 一律由后端网关按登录账号注入：浏览器请求头不允许出现 X-User-Key
     expect((lastInit?.headers as Record<string, string>)['X-User-Key']).toBeUndefined()
@@ -256,6 +256,140 @@ describe('chatStream（流式）', () => {
     s.close()
     const r = await p
     expect(expectKind(r.err, 'bad-response').message).toContain('流式返回为空')
+  })
+})
+
+/** 跑一次一帧就收尾的流式调用，返回实际发出的请求体——思考档/输出上限的契约断言都走这里 */
+async function streamBody(over: Partial<ChatStreamOptions>): Promise<Record<string, unknown>> {
+  const s = makeStream()
+  s.send(frame('hi'))
+  s.close()
+  stubFetch({ contentType: 'text/event-stream', stream: s })
+  await chatStream({ ...base, ...over, onDelta: () => {} })
+  return JSON.parse(String(lastInit?.body)) as Record<string, unknown>
+}
+
+// 思考档必须显式下发：DeepSeek V4 默认思考是开的，不发字段实测出现过 24.8K reasoning token / 195s 才回包。
+// 各 provider 的参数名与可选值差异是硬契约，猜错上游直接 400，因此逐家钉死。
+describe('思考档与输出上限（按 provider 分支）', () => {
+  it('deepseek：默认 off → thinking:{type:disabled} + max_tokens，不发 reasoning_effort', async () => {
+    const sent = await streamBody({ maxOutputTokens: 2000 })
+    expect(sent.thinking).toEqual({ type: 'disabled' })
+    expect(sent.max_tokens).toBe(2000)
+    expect(sent).not.toHaveProperty('reasoning_effort')
+    expect(sent).not.toHaveProperty('max_completion_tokens')
+  })
+
+  it('deepseek：low/high → thinking:{type:enabled} + 同名 reasoning_effort', async () => {
+    const low = await streamBody({ thinking: 'low' })
+    expect(low.thinking).toEqual({ type: 'enabled' })
+    expect(low.reasoning_effort).toBe('low')
+    const high = await streamBody({ thinking: 'high' })
+    expect(high.thinking).toEqual({ type: 'enabled' })
+    expect(high.reasoning_effort).toBe('high')
+  })
+
+  it('moonshot：思考不可关 → 只发 reasoning_effort（off 降级 low）+ max_completion_tokens', async () => {
+    const sent = await streamBody({ provider: 'moonshot', model: 'kimi-k3', maxOutputTokens: 1500 })
+    expect(sent).not.toHaveProperty('thinking') // 发了会 400
+    expect(sent.reasoning_effort).toBe('low')
+    expect(sent.max_completion_tokens).toBe(1500)
+    expect(sent).not.toHaveProperty('max_tokens')
+    const high = await streamBody({ provider: 'moonshot', model: 'kimi-k3', thinking: 'high' })
+    expect(high.reasoning_effort).toBe('high')
+  })
+
+  it('zhipu / openai-compat：无实测依据，一律不发思考字段，输出上限走 max_tokens', async () => {
+    for (const [provider, model] of [
+      ['zhipu', 'glm-5.3'],
+      ['openai-compat', 'gpt-5.6-terra'],
+    ] as const) {
+      const sent = await streamBody({ provider, model, thinking: 'high', maxOutputTokens: 800 })
+      expect(sent).not.toHaveProperty('thinking')
+      expect(sent).not.toHaveProperty('reasoning_effort')
+      expect(sent.max_tokens).toBe(800)
+    }
+  })
+
+  it('maxOutputTokens 不传 → 不发送上限字段，交给上游默认值', async () => {
+    const sent = await streamBody({})
+    expect(sent).not.toHaveProperty('max_tokens')
+    expect(sent).not.toHaveProperty('max_completion_tokens')
+  })
+
+  it('chatComplete（非流式）走同一套分支，且不影响 temperature / response_format', async () => {
+    stubFetch({
+      contentType: 'application/json',
+      body: null,
+      json: { choices: [{ message: { content: 'ok' } }] },
+    })
+    await expect(chatComplete({ ...base, wantJson: true, maxOutputTokens: 1500 })).resolves.toBe('ok')
+    const sent = JSON.parse(String(lastInit?.body)) as Record<string, unknown>
+    expect(sent.thinking).toEqual({ type: 'disabled' })
+    expect(sent.max_tokens).toBe(1500)
+    expect(sent.temperature).toBe(0.2)
+    expect(sent.response_format).toEqual({ type: 'json_object' })
+  })
+})
+
+describe('截断信号（finish_reason=length）', () => {
+  const finish = (reason: string) => `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: reason }] })}\n\n`
+
+  it('撞 max_tokens：onTruncated 回调一次，内容照常返回', async () => {
+    const s = makeStream()
+    stubFetch({ contentType: 'text/event-stream', stream: s })
+    let truncated = 0
+    const p = chatStream({ ...base, onDelta: () => {}, onTruncated: () => truncated++ })
+    s.send(frame('半截答案') + finish('length'))
+    s.close()
+    await expect(p).resolves.toBe('半截答案') // 截断不丢内容，只加标记
+    expect(truncated).toBe(1)
+  })
+
+  it('正常收尾 finish_reason=stop 不误报截断', async () => {
+    const s = makeStream()
+    stubFetch({ contentType: 'text/event-stream', stream: s })
+    let truncated = 0
+    const p = chatStream({ ...base, onDelta: () => {}, onTruncated: () => truncated++ })
+    s.send(frame('完整答案') + finish('stop'))
+    s.close()
+    await expect(p).resolves.toBe('完整答案')
+    expect(truncated).toBe(0)
+  })
+})
+
+describe('chatComplete 超时（fake timers）', () => {
+  // 建连成功但上游一直不回包：真实 fetch 在 abort 时以 AbortError 拒绝，这里照做
+  function stubHangingFetch() {
+    globalThis.fetch = (_input: RequestInfo | URL, ri?: RequestInit): Promise<Response> =>
+      new Promise((_resolve, reject) => {
+        ri?.signal?.addEventListener('abort', () =>
+          reject(new DOMException('The operation was aborted.', 'AbortError')),
+        )
+      })
+  }
+
+  it('默认 60s：59s 时仍在等，越过 60s → timeout 且提示写明 60s', async () => {
+    vi.useFakeTimers()
+    stubHangingFetch()
+    let done = false
+    const p = settled(chatComplete({ ...base })).then((r) => {
+      done = true
+      return r
+    })
+    await vi.advanceTimersByTimeAsync(59_000)
+    expect(done).toBe(false) // 早于上限不得误杀——把 60_000 改小会在这里红
+    await vi.advanceTimersByTimeAsync(1_100)
+    // 改回 120_000 则此处仍在 pending，settled 拿不到 err → 红
+    expect(expectKind((await p).err, 'timeout').message).toContain('60s')
+  })
+
+  it('timeoutMs 显式传入时优先于默认值', async () => {
+    vi.useFakeTimers()
+    stubHangingFetch()
+    const p = settled(chatComplete({ ...base, timeoutMs: 5_000 }))
+    await vi.advanceTimersByTimeAsync(5_100)
+    expect(expectKind((await p).err, 'timeout').message).toContain('5s')
   })
 })
 

@@ -224,6 +224,7 @@ export default function SelectionAsk() {
     const ctrl = new AbortController()
     abortRef.current = ctrl
     let partial = '' // 供 catch 判断是否保留了半截内容
+    let truncated = false // finish_reason='length'：成功路径重建消息时要把标记带回去
     try {
       const full = await chatStream({
         provider: settings.provider,
@@ -232,17 +233,29 @@ export default function SelectionAsk() {
           { role: 'system', content: SYSTEM_PROMPT },
           ...history.map(({ role, content }) => ({ role, content })),
         ],
+        // 划词提问关思考：思考期间上游只发 reasoning、delta.content 为空（sse.ts 的 extractStreamDelta
+        // 只取 content），面板会长时间空白；关掉后首字 ~1s 出现。
+        // 3000 而非 2000：实测「推导 + 算例对比表」这类硬题单轮就要 1779 token（3582 字），
+        // 2000 只剩 11% 余量，再啰嗦一点就撞 finish_reason='length'。
+        thinking: 'off',
+        maxOutputTokens: 3000,
         signal: ctrl.signal,
         onDelta: (d) => {
           partial += d
           if (gen !== sessionRef.current) return
           setMessages((m) => m.map((x) => (x.id === holderId ? { ...x, content: x.content + d } : x)))
         },
+        // 仍撞上限时给出明示：截断在协议层与正常收尾无法区分，不标注用户会当成完整回答
+        onTruncated: () => {
+          truncated = true
+          if (gen !== sessionRef.current) return
+          setMessages((m) => m.map((x) => (x.id === holderId ? { ...x, truncated: true } : x)))
+        },
       })
       if (gen !== sessionRef.current) return
       setMessages((m) =>
         full
-          ? m.map((x) => (x.id === holderId ? { ...x, content: full, pending: false } : x))
+          ? m.map((x) => (x.id === holderId ? { ...x, content: full, pending: false, truncated } : x))
           : m.filter((x) => x.id !== holderId), // 空回答移除占位
       )
     } catch (e) {

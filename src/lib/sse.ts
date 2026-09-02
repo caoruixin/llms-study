@@ -63,6 +63,21 @@ export function extractStreamDelta(data: unknown): string | null {
   return typeof content === 'string' && content.length > 0 ? content : null
 }
 
+/**
+ * 逐层守卫读 choices[0].finish_reason。'length' = 被 max_tokens 截断——上游照样 200 收尾、
+ * delta.content 也正常，不看这个字段就只能得到一段句子中间断掉的「完整」回答。
+ * 首帧/中间帧该字段为 null，只有终帧带值；usage 帧 choices 为空数组。
+ */
+export function extractFinishReason(data: unknown): string | null {
+  if (typeof data !== 'object' || data === null) return null
+  const choices = (data as { choices?: unknown }).choices
+  if (!Array.isArray(choices) || choices.length === 0) return null
+  const first = choices[0]
+  if (typeof first !== 'object' || first === null) return null
+  const reason = (first as { finish_reason?: unknown }).finish_reason
+  return typeof reason === 'string' && reason.length > 0 ? reason : null
+}
+
 export interface StreamUsage {
   inputTokens: number
   outputTokens: number
