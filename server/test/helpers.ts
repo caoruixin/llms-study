@@ -33,6 +33,16 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     },
     adminDailyCallLimit: 0,
     fetchUrlAllowForbiddenDev: false,
+    // 默认关语音:除 voice.test.ts 外的用例不该因为新增功能而改变行为
+    voice: {
+      provider: 'none',
+      keys: [],
+      baseUrl: 'http://127.0.0.1:9',
+      asrModel: 'test-asr',
+      ttsModel: 'test-tts',
+      defaultVoice: 'anna',
+      dailyCharLimit: 0,
+    },
     ...overrides,
   }
 }

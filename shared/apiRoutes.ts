@@ -94,3 +94,63 @@ export const MAX_URLS_PER_IMPORT = 20
  * 否则跳转过域名的站点会把相对路径拼到原始域上。
  */
 export const FETCH_URL_HEADER_FINAL_URL = 'x-fetch-final-url'
+
+// ---- 语音助手(Voice Copilot)----
+
+/**
+ * 单次上传音频字节上限 2MiB:一句提问按 60s 封顶,webm/opus 24kbps 约 180KiB,
+ * 最坏情况(浏览器不支持 opus 而退到 16k 单声道 WAV)60s ≈ 1.87MiB,仍在帽内。
+ * 比 FETCH_URL_MAX_BYTES 小一个量级——音频要整块进内存再转发,必须更保守。
+ */
+export const VOICE_ASR_MAX_BYTES = 2 * 1024 * 1024
+/** 单次转写总超时:ASR 是"说完才发",上游按音频时长算,20s 覆盖 60s 音频的常见处理耗时 */
+export const VOICE_ASR_TIMEOUT_MS = 20_000
+/**
+ * 每用户转写令牌桶:6 容量、每 10s 回一枚。
+ * 连续对话模式一轮一次转写,6 枚够连问 6 句再进入 10s/句的稳态,
+ * 而人正常说一句 + 听完回答远超 10s,所以正常使用永远碰不到桶。
+ */
+export const VOICE_ASR_RATE_CAPACITY = 6
+export const VOICE_ASR_RATE_REFILL_MS = 10_000
+/** 每用户并发转写 1:半双工语音交互天然串行,多余并发只会放大内存峰值 */
+export const VOICE_ASR_MAX_CONCURRENT = 1
+
+/** 单次合成文本上限 400 字:一句成句的播报远低于此,超长多半是整段回答误发 */
+export const VOICE_TTS_MAX_CHARS = 400
+/** 合成请求体上限 8KiB:400 字 UTF-8 最多 1.2KiB,余量给 voice/format/speed 与 JSON 结构 */
+export const VOICE_TTS_BODY_MAX_BYTES = 8 * 1024
+/** 单次合成总超时 15s:比 ASR 短——首音延迟直接决定体感,宁可快失败转浏览器朗读 */
+export const VOICE_TTS_TIMEOUT_MS = 15_000
+/**
+ * 每用户合成令牌桶:20 容量、每 1s 回一枚。
+ * **刻意不复用 LLM 的 3/10s**:一条回答会被成句切成 4~8 段,每段一次合成,
+ * 用 LLM 桶会在第一条回答播到一半时就把用户自己限死。
+ */
+export const VOICE_TTS_RATE_CAPACITY = 20
+export const VOICE_TTS_RATE_REFILL_MS = 1_000
+/** 每用户并发合成 2:正好是"播当前句 + 预取下一句"的稳态,再多也没人听 */
+export const VOICE_TTS_MAX_CONCURRENT = 2
+/**
+ * 合成音频字节上限 4MiB:400 字 mp3 约 300KiB、wav 约 2.5MiB,4MiB 留足余量;
+ * 上限存在的意义是防上游异常时把无界字节读进单进程内存。
+ */
+export const VOICE_TTS_MAX_AUDIO_BYTES = 4 * 1024 * 1024
+
+/** 单次录音时长上限:超过 30s 的"一句提问"基本是忘了松手,前端据此自动断句 */
+export const VOICE_MAX_UTTERANCE_MS = 30_000
+
+/**
+ * 上传音频容器白名单:MediaRecorder 在各浏览器的实际产物(webm/opus、Safari 的 mp4)
+ * 加上转码兜底的 wav,以及少数场景的 ogg/mpeg。服务端按此派生 multipart 文件扩展名——
+ * 部分 ASR 上游按扩展名分发解码器,扩展名错了会直接 400。
+ */
+export const VOICE_AUDIO_MIME_ALLOWLIST = [
+  'audio/webm',
+  'audio/mp4',
+  'audio/ogg',
+  'audio/wav',
+  'audio/mpeg',
+] as const
+
+/** 转写语种提示头:zh|en|auto,非法值一律按 auto 处理(提示而非契约) */
+export const VOICE_HEADER_LANG = 'x-voice-lang'

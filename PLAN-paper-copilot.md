@@ -585,11 +585,14 @@ splitCopilotStream(src): CopilotSeg[]
 
 ## 9. 语音设计
 
-- 复用现有 `src/lib/speech.ts`（Web Speech API）支持中文和英文语音提问。
-- 新增浏览器 `speechSynthesis` 封装，支持朗读、暂停、继续和停止。
+> 2026-09 修订（见 PLAN-voice-copilot.md）：语音口径由「纯浏览器本地」升级为「云端 ASR/TTS + 浏览器兜底」。
+> 原因：原方案的 Web Speech 识别依赖 Google 服务，大陆环境不可用；本条目原「不上传音频」承诺随之显式反转。
+
+- 语音输入：录音上传到服务端 `/api/app/voice/transcribe`，由已配置的语音服务商（SiliconFlow SenseVoice）转写；`src/lib/speech.ts`（Web Speech API）仅保留给 InterviewPage。
+- 朗读：云端 TTS（CosyVoice2，`/api/app/voice/tts`）为主、浏览器 `speechSynthesis` 兜底；支持朗读、暂停、继续和停止。
 - 流式回答按完整句子排队朗读，停止生成时同时停止未朗读内容；朗读跳过代码块与结构岛，只读 prose 与讲解文本。
-- 不生成、不上传、不保存音频文件。
-- 浏览器不支持语音能力时，自动降级为文本输入和屏幕阅读器可读文本。
+- 隐私口径：录音仅用于本次转写、待朗读文本仅用于本次合成——服务端不存储、不记录内容（审计表只有字节数/字符数/延迟），合成音频 `no-store`、播毕即弃；语音功能首次使用前独立授权，敏感论文全程禁用。
+- 浏览器不支持录音/朗读能力、或服务端未配置语音服务商时，自动降级为文本输入和屏幕阅读器可读文本。
 
 ## 10. 实施顺序
 
@@ -740,7 +743,7 @@ Jina 启用门槛（缩留）：20 条固定检索查询集（带 gold chunk 标
 - 配置：模型策略为 `src/data/paperPolicy.ts` 客户端常量；`.env.local` 只供代理注 key（`DEEPSEEK_*`、`KIMI_*`、`JINA_*`）；v1 Paper 请求不发送 X-User-Key。
 - 渲染：Copilot prose 用 react-markdown + remark-gfm + remark-math + rehype-katex + KaTeX（仅 paper chunk）；站内其他页面继续用 liteMd。
 - 文档支持：只支持可抽取文字的 PDF 和 DOCX；不做 OCR。
-- 语音：支持浏览器语音输入和本地朗读；不生成音频文件。
+- 语音：云端 ASR/TTS + 浏览器朗读兜底（2026-09 修订，见 §9 与 PLAN-voice-copilot.md）；服务端不存储任何音频与文本内容。
 - 媒体：不生成图片或视频；所有交互图形使用 DOM/SVG。
 - 评测：右尺寸化方案（§11.3）；κ/双人复核/双模型盲评不执行。
 - 发布：先 flag 内部试用（本地），质量达标后按附录 A 二阶段上生产。

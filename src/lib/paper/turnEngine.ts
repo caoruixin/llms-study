@@ -186,6 +186,8 @@ export interface TurnRequest {
   /** 检索查询（默认 = question；速览等入口可自定义） */
   retrievalQuery?: string
   selection?: string | null
+  /** 语音提问附带的「当前屏幕可见正文」：进 assembleContext 指代层 + 无选区时喂查询扩展 */
+  viewportContext?: string | null
   spec: PaperTaskSpec
   /** (b) 选段快捷：无 plan 岛指令；自由问答带 plan 岛指令 */
   planIsland: boolean
@@ -216,7 +218,13 @@ export interface TurnOutcome {
 export interface TurnRunnerDeps {
   retrieve(
     query: string,
-    opts: { topK: number; selection?: string; currentSection?: string; sectionTitles?: readonly string[] },
+    opts: {
+      topK: number
+      selection?: string
+      viewport?: string
+      currentSection?: string
+      sectionTitles?: readonly string[]
+    },
   ): Promise<RetrieveResult>
   stream(req: {
     spec: PaperTaskSpec
@@ -294,6 +302,7 @@ export function createTurnRunner(deps: TurnRunnerDeps): TurnRunner {
         rollingSummary: req.context.rollingSummary,
         history: req.context.history,
         selection: req.selection,
+        viewportContext: req.viewportContext,
         chunks,
         question: req.question,
         directives,
@@ -339,6 +348,7 @@ export function createTurnRunner(deps: TurnRunnerDeps): TurnRunner {
       const retrieval = await deps.retrieve(req.retrievalQuery ?? req.question, {
         topK,
         selection: req.selection ?? undefined,
+        viewport: req.viewportContext ?? undefined,
         currentSection: req.context.currentSection,
         sectionTitles: req.context.sectionTitles,
       })
@@ -359,6 +369,7 @@ export function createTurnRunner(deps: TurnRunnerDeps): TurnRunner {
         const wider = await deps.retrieve(req.retrievalQuery ?? req.question, {
           topK: RETRIEVE_TOP_K.deep,
           selection: req.selection ?? undefined,
+          viewport: req.viewportContext ?? undefined,
           currentSection: req.context.currentSection,
           sectionTitles: req.context.sectionTitles,
         })

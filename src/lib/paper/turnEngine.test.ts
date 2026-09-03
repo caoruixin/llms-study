@@ -133,12 +133,12 @@ interface ScriptedStream {
 }
 
 function makeDeps(replies: ScriptedStream[], over: Partial<TurnRunnerDeps> = {}) {
-  const retrieveCalls: { query: string; topK: number }[] = []
+  const retrieveCalls: { query: string; topK: number; viewport?: string }[] = []
   const streamCalls: { directives: string; signal: AbortSignal }[] = []
   let call = 0
   const deps: TurnRunnerDeps = {
     retrieve: async (query, opts) => {
-      retrieveCalls.push({ query, topK: opts.topK })
+      retrieveCalls.push({ query, topK: opts.topK, viewport: opts.viewport })
       return mkRetrieval(opts.topK >= 12 ? ['c1', 'c2', 'c3'] : ['c1'])
     },
     stream: async (req) => {
@@ -195,6 +195,23 @@ describe('createTurnRunner · 编排', () => {
     expect(streamCalls[1].directives).toContain('扩大检索')
     expect(outcome!.state.insufficient).toBe(true)
     expect(outcome!.state.phase).toBe('done')
+  })
+
+  it('viewportContext 贯穿：首查与 evidence 扩检索都带 viewport，最终 user 消息含指代段', async () => {
+    const insufficientReply = '```copilot:evidence\n{"status":"insufficient","note":"缺"}\n```'
+    const { deps, retrieveCalls, streamCalls } = makeDeps([{ reply: insufficientReply }, { reply: 'ok' }])
+    await createTurnRunner(deps).run({ ...baseReq, viewportContext: '屏幕上正在讲注意力分数的计算' }, () => {})
+    expect(retrieveCalls).toHaveLength(2)
+    expect(retrieveCalls[0].viewport).toBe('屏幕上正在讲注意力分数的计算')
+    expect(retrieveCalls[1].viewport).toBe('屏幕上正在讲注意力分数的计算')
+    expect(streamCalls[0].directives).toContain('【当前屏幕上的正文】')
+    expect(streamCalls[0].directives).toContain('屏幕上正在讲注意力分数的计算')
+  })
+
+  it('无 viewportContext 时最终 user 消息不含指代段（字节与旧行为一致）', async () => {
+    const { deps, streamCalls } = makeDeps([{ reply: 'ok' }])
+    await createTurnRunner(deps).run(baseReq, () => {})
+    expect(streamCalls[0].directives).not.toContain('【当前屏幕上的正文】')
   })
 
   it('evidence 重试后成功 → insufficient=false', async () => {

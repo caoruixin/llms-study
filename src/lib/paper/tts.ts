@@ -7,7 +7,9 @@ import type { CopilotSeg } from './streamParser'
  * - 行内/独立公式替换为「公式」占位，不朗读 LaTeX 原文。
  * - 流式期间句子就绪即入队（takeCompleteSentences 只交出已终结的句子）；
  *   Stop 生成时 stop() 同时清空未读队列。
- * - 不生成、不上传、不保存音频；不支持时 isTtsSupported() 返回 false，UI 隐藏按钮。
+ * - 本模块（浏览器朗读）不生成、不上传、不保存音频；云端 TTS 见 voice/cloudTtsPlayer
+ *   （向服务端发送待朗读文本、取回音频，隐私口径见 PLAN-paper-copilot.md §9 修订）。
+ *   不支持时 isTtsSupported() 返回 false，UI 隐藏按钮。
  *
  * 句切与队列都是纯函数（reducer），node 环境直测；只有 player 触碰浏览器 API。
  */

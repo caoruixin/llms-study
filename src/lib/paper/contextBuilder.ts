@@ -8,7 +8,8 @@ import { estimateTokens } from './usage'
  * 2. system#2 PaperBrief 摘要 + 粗粒度画像 + 读者视角（persona，Track 3）
  * 3. system#3 rolling summary
  * 4. 最近 ≤6 轮真实 user/assistant 消息
- * 5. 本轮 user = 选区 + 白名单 chunk 段 + 问题 + 逐轮指令（一切逐轮变化集中于此）
+ * 5. 本轮 user = 选区 + 屏幕可见正文（语音提问的指代上下文）+ 白名单 chunk 段 + 问题 + 逐轮指令
+ *    （一切逐轮变化集中于此）
  */
 
 export const PAPER_TUTOR_PROMPT_VERSION = 'pcp4-2'
@@ -55,6 +56,11 @@ export interface AssembleInput {
   history: readonly ChatMessage[]
   /** 本轮选区（上限 4000 沿 SelectionAsk 先例） */
   selection?: string | null
+  /**
+   * 语音提问附带的「当前屏幕可见正文」（voice/viewportContext.buildViewportContext 已封顶 2000 字）。
+   * 只用于指代消解（"这里/这一段"），不是引用来源；null/空整层省略。
+   */
+  viewportContext?: string | null
   chunks: readonly RetrievedChunk[]
   question: string
   /** 逐轮指令行（plan/memo 岛开关等），由调用方组装 */
@@ -71,6 +77,10 @@ export interface BudgetReport {
   chunksTruncated: boolean
   turnsDropped: number
   selectionTruncated: boolean
+  /** 阶梯 0：屏幕可见正文被收缩到 VIEWPORT_HARD_CHARS */
+  viewportTruncated: boolean
+  /** 阶梯 5：屏幕可见正文被整段丢弃 */
+  viewportDropped: boolean
   /** 阶梯裁到底仍超预算：调用方应报错而不是硬发 */
   overBudget: boolean
 }
@@ -89,6 +99,11 @@ const CHUNK_HEAD_CHARS = 900
 const CHUNK_TAIL_CHARS = 300
 /** 阶梯第 4 档的选区强截断 */
 const SELECTION_HARD_CHARS = 1200
+/**
+ * 阶梯第 0 档：屏幕可见正文先收缩到此长度——它的内容已被检索（查询扩展 + 当前章节
+ * 加权）部分覆盖，收缩的信息损失最小，所以最先动它；白名单 chunk 带引用别名，最后动。
+ */
+const VIEWPORT_HARD_CHARS = 600
 
 /** 白名单片段的呈现格式（§8.1 Prompt 契约）：[c3] §4.2 Method · p.7 + 块文本 */
 export function renderChunkHeader(c: RetrievedChunk): string {
@@ -121,12 +136,18 @@ export const PERSONA_NO_HIT_DIRECTIVE =
 function buildFinalUser(
   input: AssembleInput,
   chunks: readonly RetrievedChunk[],
-  opts: { chunksTruncated: boolean; selectionChars: number },
+  opts: { chunksTruncated: boolean; selectionChars: number; viewportChars: number; dropViewport: boolean },
 ): string {
   const parts: string[] = []
   const selection = (input.selection ?? '').slice(0, opts.selectionChars)
   if (selection.trim()) {
     parts.push(`我选中了论文中的这段内容：\n"""\n${selection}\n"""`)
+  }
+  const viewport = opts.dropViewport ? '' : (input.viewportContext ?? '').slice(0, opts.viewportChars)
+  if (viewport.trim()) {
+    parts.push(
+      `【当前屏幕上的正文】仅用于理解「这里 / 这一段 / 它」等指代，不是引用来源；不得为其编造引用别名，引用仍只能使用下方白名单中的 cX：\n"""\n${viewport}\n"""`,
+    )
   }
   parts.push(`【本轮白名单片段】只准引用以下别名：\n${renderChunks(chunks, opts.chunksTruncated)}`)
   parts.push(`【问题】${input.question}`)
@@ -144,8 +165,8 @@ const estimateMessages = (messages: readonly ChatMessage[]): number =>
   messages.reduce((sum, m) => sum + estimateTokens(m.content) + 4, 0)
 
 /**
- * 组装 + 预算裁剪阶梯（§5.4）：减 chunk 数 → chunk 首尾截断 → 丢最老轮 → 截选区 → 报错。
- * 纯函数：每档在快照上重算估算值，报告完整落在 BudgetReport（UI 显示预估用）。
+ * 组装 + 预算裁剪阶梯（§5.4）：缩可见正文 → 减 chunk 数 → chunk 首尾截断 → 丢最老轮 →
+ * 截选区 → 丢可见正文 → 报错。纯函数：每档在快照上重算估算值，报告完整落在 BudgetReport。
  */
 export function assembleContext(input: AssembleInput): BuiltContext {
   const budget = input.inputBudgetTokens
@@ -154,6 +175,8 @@ export function assembleContext(input: AssembleInput): BuiltContext {
   let history = [...input.history]
   let chunksTruncated = false
   let selectionChars = SELECTION_MAX_CHARS
+  let viewportChars = Number.POSITIVE_INFINITY
+  let dropViewport = false
   const originalChunks = chunks.length
   const originalHistory = history.length
 
@@ -165,13 +188,22 @@ export function assembleContext(input: AssembleInput): BuiltContext {
       messages.push({ role: 'system', content: `【此前对话摘要】\n${input.rollingSummary.trim()}` })
     }
     messages.push(...history.map(({ role, content }) => ({ role, content })))
-    messages.push({ role: 'user', content: buildFinalUser(input, chunks, { chunksTruncated, selectionChars }) })
+    messages.push({
+      role: 'user',
+      content: buildFinalUser(input, chunks, { chunksTruncated, selectionChars, viewportChars, dropViewport }),
+    })
     return messages
   }
 
   let messages = build()
   let estimated = estimateMessages(messages)
 
+  // 阶梯 0：先收缩屏幕可见正文（理由见 VIEWPORT_HARD_CHARS）
+  if (estimated > budget && (input.viewportContext ?? '').length > VIEWPORT_HARD_CHARS) {
+    viewportChars = VIEWPORT_HARD_CHARS
+    messages = build()
+    estimated = estimateMessages(messages)
+  }
   // 阶梯 1：减 chunk 数（从排名尾部丢，最少保 2 条）
   while (estimated > budget && chunks.length > 2) {
     chunks.pop()
@@ -196,6 +228,12 @@ export function assembleContext(input: AssembleInput): BuiltContext {
     messages = build()
     estimated = estimateMessages(messages)
   }
+  // 阶梯 5：整段丢弃屏幕可见正文（其区域仍有检索兜底；白名单 chunk 带引用别名，比它金贵）
+  if (estimated > budget && (input.viewportContext ?? '').trim()) {
+    dropViewport = true
+    messages = build()
+    estimated = estimateMessages(messages)
+  }
 
   return {
     messages,
@@ -207,7 +245,9 @@ export function assembleContext(input: AssembleInput): BuiltContext {
       chunksTruncated,
       turnsDropped: (originalHistory - history.length) / 2,
       selectionTruncated: selectionChars < SELECTION_MAX_CHARS,
-      overBudget: estimated > budget, // 阶梯 5：报错档，调用方处理
+      viewportTruncated: Number.isFinite(viewportChars),
+      viewportDropped: dropViewport,
+      overBudget: estimated > budget, // 阶梯 6：报错档，调用方处理
     },
   }
 }

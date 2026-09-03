@@ -57,7 +57,12 @@ import {
   ttsReducer,
   type TtsPlayer,
 } from '../../lib/paper/tts'
-import { isSpeechSupported, startDictation, type DictationSession } from '../../lib/speech'
+import { createCloudTtsPlayer } from '../../lib/paper/voice/cloudTtsPlayer'
+import { VOICE_ANSWER_DIRECTIVE } from '../../lib/paper/voice/prompts'
+import { createRecorder, type Recorder } from '../../lib/paper/voice/recorder'
+import { micErrorMessage } from '../../lib/paper/voice/recorderMime'
+import { TTS_MIN_GROUP_CHARS, groupSentencesForTts } from '../../lib/paper/voice/ttsChunking'
+import { transcribeAudio } from '../../lib/paper/voice/voiceApi'
 import { personaHintText, type PersonaId } from '../../lib/paper/personas'
 import type { RetrievalService } from '../../lib/paper/retrieval'
 import type { ScrollTarget } from '../../lib/paper/anchors'
@@ -73,6 +78,7 @@ import { usePaperUi, type PaperAskAction, type PendingAsk } from '../../pages/pa
 import type { ChatMessage } from '../../lib/llmClient'
 import CopilotMessageView from './CopilotMessage'
 import ConsentDialog from './ConsentDialog'
+import VoiceConsentDialog from './VoiceConsentDialog'
 import CostConfirm, { type CostConfirmInfo } from './CostConfirm'
 import PersonaChip from './PersonaChip'
 import ProfileChip from './ProfileChip'
@@ -105,6 +111,8 @@ interface SendParams {
   question: string
   retrievalQuery?: string
   selection?: string | null
+  /** 语音提问附带的屏幕可见正文：进指代层 + 无选区时喂检索扩展（contextBuilder/turnEngine） */
+  viewportContext?: string | null
   task: TurnTask
   planIsland: boolean
   label?: string
@@ -122,6 +130,7 @@ interface SendParams {
 
 type GateRequest =
   | { kind: 'consent'; provider: PaperProviderId; resolve: (ok: boolean) => void }
+  | { kind: 'voice-consent'; resolve: (ok: boolean) => void }
   | { kind: 'cost'; info: CostConfirmInfo; resolve: (ok: boolean) => void }
 
 const ASK_TEMPLATES: Record<Exclude<PaperAskAction, 'queue'>, { question: string; task: TurnTask }> = {
@@ -198,7 +207,21 @@ export default function CopilotPanel({
   const [profiles, setProfiles] = useState<ConceptProfile[]>([])
   const [guided, setGuided] = useState<GuidedRun | null>(null)
 
-  const { briefUi, briefData, briefRequestTick, setBriefUi, setBriefData } = usePaperUi()
+  const {
+    briefUi,
+    briefData,
+    briefRequestTick,
+    setBriefUi,
+    setBriefData,
+    voiceAsk,
+    consumeVoiceAsk,
+    setVoiceTurnPhase,
+    setVoicePanelBusy,
+    voiceStopSpeakTick,
+    voiceSpeakTypedTurns,
+    voiceTtsEngine,
+    voiceTtsVoice,
+  } = usePaperUi()
 
   // 渲染期同步 ref（事件回调不重挂）
   const paperRef = useRef(paper)
@@ -290,10 +313,18 @@ export default function CopilotPanel({
     [],
   )
 
+  /** 语音独立授权（consents 表 key 'voice'）：面板内 🎙 听写首次使用前弹出 */
+  const ensureVoiceConsent = useCallback(async (): Promise<boolean> => {
+    const existing = await repo.getConsent('voice')
+    if (existing?.granted) return true
+    return new Promise<boolean>((resolve) => setGate({ kind: 'voice-consent', resolve }))
+  }, [repo])
+
   const decideGate = useCallback(
     async (ok: boolean) => {
       if (!gate) return
       if (gate.kind === 'consent' && ok) await repo.setConsent(gate.provider, true)
+      if (gate.kind === 'voice-consent' && ok) await repo.setConsent('voice', true)
       setGate(null)
       gate.resolve(ok)
     },
@@ -313,6 +344,7 @@ export default function CopilotPanel({
         retrieval.retrieve(paperRef.current.id, query, {
           topK: opts.topK,
           selection: opts.selection,
+          viewport: opts.viewport,
           currentSection: opts.currentSection,
           sectionTitles: opts.sectionTitles ? [...opts.sectionTitles] : undefined,
         }),
@@ -457,6 +489,7 @@ export default function CopilotPanel({
           question: params.question,
           retrievalQuery: params.retrievalQuery,
           selection: params.selection ?? null,
+          viewportContext: params.viewportContext ?? null,
           spec,
           planIsland: params.planIsland,
           memoIsland,
@@ -748,17 +781,60 @@ export default function CopilotPanel({
   // -----------------------------------------------------------------------
   const [tts, dispatchTts] = useReducer(ttsReducer, initialTtsState)
   const ttsSupported = useMemo(() => isTtsSupported(), [])
-  const playerRef = useRef<TtsPlayer | null>(null)
+  /** 云端朗读降级等一次性提示（aria-live 行展示，下一轮语音提问时清空） */
+  const [voiceNotice, setVoiceNotice] = useState('')
+  const playerRef = useRef<(TtsPlayer & { dispose?: () => void }) | null>(null)
+  /** 当前播放器按哪组偏好构建：引擎/音色变更即重建，否则设置不生效（缓存陈旧实现） */
+  const playerKeyRef = useRef('')
   const getPlayer = useCallback(() => {
-    playerRef.current ??= createTtsPlayer()
+    const key = `${voiceTtsEngine}:${voiceTtsVoice}`
+    if (playerRef.current !== null && playerKeyRef.current === key) return playerRef.current
+    playerRef.current?.cancel()
+    playerRef.current?.dispose?.()
+    playerKeyRef.current = key
+    playerRef.current =
+      voiceTtsEngine === 'cloud'
+        ? createCloudTtsPlayer({
+            fallback: createTtsPlayer(),
+            ...(voiceTtsVoice ? { voice: voiceTtsVoice } : {}),
+            onDegrade: setVoiceNotice,
+          })
+        : createTtsPlayer()
     return playerRef.current
-  }, [])
+  }, [voiceTtsEngine, voiceTtsVoice])
   /** 正在朗读的对象：消息 id 或 'live'（流式跟读） */
   const [speakingId, setSpeakingId] = useState<string | null>(null)
   /** 已入队到的字符位置（跟读续接点） */
   const consumedRef = useRef(0)
   const liveSpeechRef = useRef('')
   const liveFlushedRef = useRef(false)
+  /** 云端 TTS 成组缓冲：句子攒到 TTS_MIN_GROUP_CHARS 再合成（省调用）；首句立即放行（压首音延迟） */
+  const pendingTtsRef = useRef<string[]>([])
+  const spokeFirstRef = useRef(false)
+
+  const flushTtsGroups = useCallback(
+    (flush: boolean) => {
+      const pending = pendingTtsRef.current
+      if (pending.length === 0) return
+      // 浏览器朗读维持逐句入队的旧行为：成组只有云端有动机（按次计费 + 每次合成的固定延迟）
+      if (voiceTtsEngine !== 'cloud') {
+        dispatchTts({ type: 'enqueue', sentences: pending.splice(0) })
+        return
+      }
+      if (!spokeFirstRef.current) {
+        const first = pending.shift()
+        if (first !== undefined) {
+          spokeFirstRef.current = true
+          dispatchTts({ type: 'enqueue', sentences: [first] })
+        }
+      }
+      if (pending.length === 0) return
+      const joined = pending.reduce((n, s) => n + s.length, 0)
+      if (!flush && joined < TTS_MIN_GROUP_CHARS) return
+      dispatchTts({ type: 'enqueue', sentences: groupSentencesForTts(pending.splice(0), { isFirst: false }) })
+    },
+    [voiceTtsEngine],
+  )
 
   // 播放驱动：current 变化即朗读一句，结束回 'ended' 取下一句
   useEffect(() => {
@@ -771,6 +847,8 @@ export default function CopilotPanel({
     dispatchTts({ type: 'stop' })
     setSpeakingId(null)
     consumedRef.current = 0
+    pendingTtsRef.current = []
+    spokeFirstRef.current = false
   }, [getPlayer])
 
   const speakText = useCallback(
@@ -784,11 +862,14 @@ export default function CopilotPanel({
       const { sentences } = takeCompleteSentences(text, 0, true)
       consumedRef.current = text.length
       setSpeakingId(id)
-      dispatchTts({ type: 'enqueue', sentences })
+      dispatchTts({
+        type: 'enqueue',
+        sentences: voiceTtsEngine === 'cloud' ? groupSentencesForTts(sentences, { isFirst: true }) : sentences,
+      })
       dispatchTts({ type: 'start' })
       dispatchTts({ type: 'source-end' })
     },
-    [getPlayer, speakingId, stopSpeaking],
+    [getPlayer, speakingId, stopSpeaking, voiceTtsEngine],
   )
 
   const speakMessage = useCallback(
@@ -806,11 +887,13 @@ export default function CopilotPanel({
     consumedRef.current = 0
     liveSpeechRef.current = ''
     liveFlushedRef.current = false
+    pendingTtsRef.current = []
+    spokeFirstRef.current = false
     setSpeakingId('live')
     dispatchTts({ type: 'start' })
   }, [getPlayer])
 
-  /** 流式跟读：完整句子就绪即入队；轮次结束时补尾句并标记源结束（§9） */
+  /** 流式跟读：完整句子就绪即进成组缓冲；轮次结束时补尾句、清空缓冲并标记源结束（§9） */
   useEffect(() => {
     if (speakingId !== 'live') return
     const streaming = live !== null && live.phase !== 'done' && live.phase !== 'error'
@@ -820,61 +903,99 @@ export default function CopilotPanel({
       const { sentences, consumed } = takeCompleteSentences(text, consumedRef.current)
       if (sentences.length === 0) return
       consumedRef.current = consumed
-      dispatchTts({ type: 'enqueue', sentences })
+      pendingTtsRef.current.push(...sentences)
+      flushTtsGroups(false)
       return
     }
     if (liveFlushedRef.current) return
     liveFlushedRef.current = true
     const { sentences } = takeCompleteSentences(liveSpeechRef.current, consumedRef.current, true)
     consumedRef.current = liveSpeechRef.current.length
-    if (sentences.length > 0) dispatchTts({ type: 'enqueue', sentences })
+    pendingTtsRef.current.push(...sentences)
+    flushTtsGroups(true)
     dispatchTts({ type: 'source-end' })
-  }, [live, speakingId])
+  }, [live, speakingId, flushTtsGroups])
 
   const stopTurn = useCallback(() => {
     runnerRef.current?.stop()
     if (speakingId === 'live') stopSpeaking() // Stop 生成时同时清空未读队列
   }, [speakingId, stopSpeaking])
 
-  // 听写输入（复用 src/lib/speech.ts）
-  const speechSupported = useMemo(() => isSpeechSupported(), [])
-  const [listening, setListening] = useState(false)
-  const [interim, setInterim] = useState('')
-  const dictationRef = useRef<DictationSession | null>(null)
+  // 听写输入：云端 ASR（原 webkitSpeechRecognition 依赖 Google 服务，大陆环境实际不可用，
+  // 见 PLAN-voice-copilot.md）。转写结果仍只追加进输入框、由用户确认后发送——自动发送
+  // 是悬浮球的语义，面板内保持打字流的手动确认心智。录音流走 recorderSingleton，与
+  // 悬浮球共享同一条 MediaStream 引用计数。
+  const dictationSupported = useMemo(
+    () =>
+      typeof MediaRecorder !== 'undefined' &&
+      typeof navigator !== 'undefined' &&
+      typeof navigator.mediaDevices?.getUserMedia === 'function',
+    [],
+  )
+  const [dictation, setDictation] = useState<'idle' | 'recording' | 'transcribing'>('idle')
+  const dictationRecRef = useRef<Recorder | null>(null)
+  /** 代数守卫（SelectionAsk 竞态模式）：取消/卸载后迟到的 stop()/fetch 结果一律作废 */
+  const dictationGenRef = useRef(0)
 
   const stopDictation = useCallback(() => {
-    dictationRef.current?.stop()
-    dictationRef.current = null
-    setListening(false)
-    setInterim('')
+    dictationGenRef.current += 1
+    dictationRecRef.current?.cancel()
+    setDictation('idle')
   }, [])
 
-  const toggleDictation = useCallback(() => {
-    if (listening) {
-      stopDictation()
+  const toggleDictation = useCallback(async () => {
+    if (dictation === 'transcribing') return
+    if (dictation === 'recording') {
+      const rec = dictationRecRef.current
+      if (rec === null) {
+        setDictation('idle')
+        return
+      }
+      const gen = ++dictationGenRef.current
+      setDictation('transcribing')
+      const audio = await rec.stop()
+      if (gen !== dictationGenRef.current) return
+      if (audio === null || audio.blob.size < 2048 || audio.durationMs < 300) {
+        setDictation('idle')
+        setError({ message: '没有录到声音，请点击麦克风后多说一会儿', kind: 'speech' })
+        return
+      }
+      try {
+        const { text } = await transcribeAudio(audio.blob, { lang: 'auto' })
+        if (gen !== dictationGenRef.current) return
+        const trimmed = text.trim()
+        if (trimmed) setInput((v) => (v ? `${v}${trimmed}` : trimmed))
+        else setError({ message: '没听清，请再试一次', kind: 'speech' })
+      } catch (e) {
+        if (gen !== dictationGenRef.current) return
+        setError({ message: e instanceof Error ? e.message : '语音识别失败，请重试', kind: 'speech' })
+      } finally {
+        if (gen === dictationGenRef.current) setDictation('idle')
+      }
       return
     }
-    setListening(true)
-    dictationRef.current = startDictation(
-      'zh',
-      (finalText, interimText) => {
-        if (finalText) setInput((v) => v + finalText)
-        setInterim(interimText)
-      },
-      (err) => {
-        dictationRef.current = null
-        setListening(false)
-        setInterim('')
-        if (err) setError({ message: err, kind: 'speech' })
-      },
-    )
-  }, [listening, stopDictation])
+    // 起录：敏感论文不采音；首次使用先过语音独立授权
+    if (paperRef.current.sensitive) {
+      setError({ message: '这篇论文已标记为敏感：语音功能已禁用', kind: 'speech' })
+      return
+    }
+    if (!(await ensureVoiceConsent())) return
+    try {
+      dictationRecRef.current ??= createRecorder()
+      await dictationRecRef.current.start()
+      setDictation('recording')
+    } catch (e) {
+      setError({ message: micErrorMessage(e), kind: 'speech' })
+    }
+  }, [dictation, ensureVoiceConsent])
 
   useEffect(
     () => () => {
-      dictationRef.current?.stop()
-      dictationRef.current = null
+      dictationGenRef.current += 1
+      dictationRecRef.current?.dispose()
+      dictationRecRef.current = null
       playerRef.current?.cancel()
+      playerRef.current?.dispose?.() // 云端播放器：释放共享 <audio> 的回调与在途请求
     },
     [],
   )
@@ -994,6 +1115,104 @@ export default function CopilotPanel({
   )
 
   // -----------------------------------------------------------------------
+  // 语音陪读（悬浮球 → store → 面板）：消费提问 / 自动跟读 / 阶段回写 / 打断
+  // -----------------------------------------------------------------------
+
+  /** 等 live 就绪再 startLiveSpeak 的挂起标记：与 sendTurn 同步调用会在 live===null 时
+   *  走 flush 分支立即 source-end 关死队列（PLAN「设计代理抓出的坑」#2） */
+  const pendingLiveSpeakRef = useRef(false)
+  /** 当前轮次是否语音发起：只有语音轮回写 voiceTurnPhase，打字轮不动它 */
+  const voiceTurnRef = useRef(false)
+  const voiceTurnDoneRef = useRef(false)
+  const voiceTurnSpeakRef = useRef(false)
+  const errorRef = useRef(error)
+  errorRef.current = error
+  const ttsStatusRef = useRef(tts.status)
+  ttsStatusRef.current = tts.status
+  const speakingIdRef = useRef(speakingId)
+  speakingIdRef.current = speakingId
+
+  const maybeFinishVoiceTurn = useCallback(() => {
+    if (!voiceTurnRef.current || !voiceTurnDoneRef.current) return
+    // 要求朗读的轮次等 TTS 队列排空（仍在 live 跟读且状态未回 idle = 还在读）
+    if (voiceTurnSpeakRef.current && speakingIdRef.current === 'live' && ttsStatusRef.current !== 'idle') return
+    voiceTurnRef.current = false
+    voiceTurnDoneRef.current = false
+    voiceTurnSpeakRef.current = false
+    pendingLiveSpeakRef.current = false // 流未起就失败的轮次：别把标记漏给下一轮
+    const err = errorRef.current
+    if (err) setVoiceTurnPhase('error', err.message)
+    else setVoiceTurnPhase('done')
+  }, [setVoiceTurnPhase])
+
+  // 排空检测：tts 状态回 idle 的那一刻补一次收尾判定
+  useEffect(() => {
+    maybeFinishVoiceTurn()
+  }, [tts.status, maybeFinishVoiceTurn])
+
+  // 面板忙闲回写：悬浮球据此拒绝新提问 / 暂停连续对话重臂
+  useEffect(() => {
+    setVoicePanelBusy(busy)
+  }, [busy, setVoicePanelBusy])
+
+  // 「开口」时刻回写：live 跟读真正读出第一句
+  useEffect(() => {
+    if (!voiceTurnRef.current) return
+    if (speakingId === 'live' && tts.status === 'speaking' && tts.current !== null) setVoiceTurnPhase('speaking')
+  }, [speakingId, tts.status, tts.current, setVoiceTurnPhase])
+
+  // 挂起的自动跟读：等第一帧 live 状态落地再启动
+  useEffect(() => {
+    if (!pendingLiveSpeakRef.current || live === null) return
+    pendingLiveSpeakRef.current = false
+    startLiveSpeak()
+  }, [live, startLiveSpeak])
+
+  // 语音提问消费（consume-and-clear：新挂载的面板也能拿到载荷，见 paperUiStore.VoiceAsk 注释）
+  useEffect(() => {
+    if (voiceAsk === null) return
+    if (voiceAsk.paperId !== paper.id) {
+      consumeVoiceAsk() // 陈旧载荷（切论文竞态）：弃掉，不能留给未来的错误论文
+      return
+    }
+    if (session === null) return // 会话装载后本 effect 因 session 变化自动重跑
+    consumeVoiceAsk()
+    if (getRunner().busy()) {
+      setVoiceTurnPhase('error', '回答进行中，说完这轮再问')
+      return
+    }
+    setVoiceNotice('')
+    voiceTurnRef.current = true
+    voiceTurnDoneRef.current = false
+    voiceTurnSpeakRef.current = voiceAsk.speak
+    pendingLiveSpeakRef.current = voiceAsk.speak
+    setVoiceTurnPhase('thinking')
+    stickRef.current = true
+    void sendTurn({
+      question: voiceAsk.text,
+      selection: voiceAsk.selection,
+      viewportContext: voiceAsk.viewportContext,
+      task: 'chat',
+      planIsland: true,
+      label: '语音提问',
+      extraDirectives: [LEARNER_DIRECTIVE, VOICE_ANSWER_DIRECTIVE],
+      userAuthored: true,
+      displayText: voiceAsk.text,
+    }).then(() => {
+      voiceTurnDoneRef.current = true
+      maybeFinishVoiceTurn()
+    })
+  }, [voiceAsk, paper.id, session, consumeVoiceAsk, getRunner, sendTurn, setVoiceTurnPhase, maybeFinishVoiceTurn])
+
+  // 打断信号（ball → panel）：停播清未读队列，但不打断生成（文字继续流入对话）
+  const seenStopSpeakRef = useRef(voiceStopSpeakTick)
+  useEffect(() => {
+    if (voiceStopSpeakTick === seenStopSpeakRef.current) return
+    seenStopSpeakRef.current = voiceStopSpeakTick
+    stopSpeaking()
+  }, [voiceStopSpeakTick, stopSpeaking])
+
+  // -----------------------------------------------------------------------
   // 滚动粘底（AskDialog 48px 阈值先例）
   // -----------------------------------------------------------------------
   const listRef = useRef<HTMLDivElement | null>(null)
@@ -1021,12 +1240,14 @@ export default function CopilotPanel({
       setSendBlocked(true)
       return
     }
-    if (listening) stopDictation()
+    if (dictation !== 'idle') stopDictation()
     setInput('')
     setSendBlocked(false)
     stickRef.current = true
+    // 「打字提问也朗读」偏好：同一条挂起标记，live 就绪后自动开跟读（不回写语音阶段）
+    if (voiceSpeakTypedTurns && ttsSupported) pendingLiveSpeakRef.current = true
     sendFree(value)
-  }, [busy, input, listening, sendFree, stopDictation])
+  }, [busy, input, dictation, sendFree, stopDictation, voiceSpeakTypedTurns, ttsSupported])
 
   const sessionCost = session?.costTotal ?? 0
   const lastUsage = live?.usage ?? null
@@ -1178,6 +1399,12 @@ export default function CopilotPanel({
         {messages.map((m) =>
           m.role === 'user' ? (
             <div key={m.id} className="flex flex-col items-end">
+              {/* 提问来源标签（语音提问 / 选段快捷键等）：与 assistant 侧 sourceLabel 徽章同族 */}
+              {m.actionLabel && (
+                <p className="mb-0.5 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[0.65rem] text-accent">
+                  {m.actionLabel}
+                </p>
+              )}
               {/* 超宽档下 92% 会拉出一条极长的单行气泡，再加 36rem 绝对上限保住可读行长 */}
               <div className="max-w-[min(92%,36rem)] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
                 {m.content}
@@ -1370,7 +1597,7 @@ export default function CopilotPanel({
           </div>
         )}
         <textarea
-          value={listening && interim ? `${input}${interim}` : input}
+          value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             // IME-safe：中文输入法回车不误发；流式中 submit 只提示不发送、也不清空输入
@@ -1385,26 +1612,29 @@ export default function CopilotPanel({
         />
         {/* 常驻于 DOM（aria-live 区域先存在才会播报），空时不占高度 */}
         <p aria-live="polite" className="mt-0.5 text-[0.65rem] text-warn">
-          {sendBlocked && busy ? '回答进行中，完成后可发送（问题已保留在输入框）' : null}
+          {sendBlocked && busy ? '回答进行中，完成后可发送（问题已保留在输入框）' : voiceNotice || null}
         </p>
         <div className="mt-1.5 flex items-center justify-between gap-2">
           <span className="min-w-0 flex-1 truncate text-[0.65rem] text-dim">
-            {listening
-              ? '正在听写…（再次点击麦克风结束）'
-              : busy
-                ? live?.reasoning
-                  ? '深度思考中…'
-                  : '回答中…'
-                : '回答基于本地检索片段，均带可回跳引用'}
+            {dictation === 'recording'
+              ? '正在录音…（再次点击麦克风结束）'
+              : dictation === 'transcribing'
+                ? '识别中…'
+                : busy
+                  ? live?.reasoning
+                    ? '深度思考中…'
+                    : '回答中…'
+                  : '回答基于本地检索片段，均带可回跳引用'}
           </span>
-          {speechSupported && (
+          {dictationSupported && (
             <button
               type="button"
-              onClick={toggleDictation}
-              aria-pressed={listening}
-              title={listening ? '结束语音输入' : '语音提问'}
-              className={`shrink-0 rounded-lg border px-2 py-1 text-sm transition-colors ${
-                listening ? 'border-accent bg-accent/10 text-accent' : 'border-line text-dim hover:text-fg'
+              onClick={() => void toggleDictation()}
+              disabled={dictation === 'transcribing'}
+              aria-pressed={dictation === 'recording'}
+              title={dictation === 'recording' ? '结束录音并识别' : '语音输入（识别结果进输入框）'}
+              className={`shrink-0 rounded-lg border px-2 py-1 text-sm transition-colors disabled:opacity-40 ${
+                dictation === 'recording' ? 'border-accent bg-accent/10 text-accent' : 'border-line text-dim hover:text-fg'
               }`}
             >
               🎙
@@ -1441,6 +1671,7 @@ export default function CopilotPanel({
       </div>
 
       {gate?.kind === 'consent' && <ConsentDialog provider={gate.provider} onDecide={(ok) => void decideGate(ok)} />}
+      {gate?.kind === 'voice-consent' && <VoiceConsentDialog onDecide={(ok) => void decideGate(ok)} />}
       {gate?.kind === 'cost' && <CostConfirm info={gate.info} onDecide={(ok) => void decideGate(ok)} />}
     </div>
   )

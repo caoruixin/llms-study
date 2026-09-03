@@ -6,6 +6,7 @@ import HighlightActions from '../../components/papers/HighlightActions'
 import OutlinePane, { buildOutline, type HighlightListItem, type OutlineTab } from '../../components/papers/OutlinePane'
 import PdfViewer from '../../components/papers/PdfViewer'
 import SelectionActions from '../../components/papers/SelectionActions'
+import VoiceMicBall from '../../components/papers/VoiceMicBall'
 import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
 import Drawer from '../../components/ui/Drawer'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
@@ -24,6 +25,13 @@ import { captureHighlightRanges } from '../../lib/paper/highlight/selectionOffse
 import { useHighlights } from '../../lib/paper/highlight/useHighlights'
 import { estimateTranslationCost } from '../../lib/paper/translate/translateBatch'
 import { useTranslations } from '../../lib/paper/translate/useTranslations'
+import { getVoiceConfig, type VoiceConfigResp } from '../../lib/paper/voice/voiceApi'
+import {
+  buildViewportContext,
+  pageBlockRange,
+  windowAroundBlock,
+  type BlockRange,
+} from '../../lib/paper/voice/viewportContext'
 import { formatUsd } from '../../lib/paper/usage'
 import type { LangMode, PaperBlock, PaperFormat, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
@@ -147,6 +155,13 @@ export default function PaperWorkbenchPage() {
   const readerRef = useRef<HTMLElement | null>(null)
   const restoredFor = useRef<string | null>(null)
   const alignedKey = useRef('')
+  /** 全视口可见块区间（BlockReader 第二观察器上报）：只被语音提问的快照读取，不驱动渲染 */
+  const visibleRangeRef = useRef<BlockRange | null>(null)
+  /** 服务端语音配置：null = 尚未取到（球不渲染），{enabled:false} = 未开启 */
+  const [voiceConfig, setVoiceConfig] = useState<VoiceConfigResp | null>(null)
+  /** Copilot 列实测宽度：悬浮球桌面锚位要让出整列（QA R1 V13），宽度档/钳位太多，测比算稳 */
+  const copilotAsideRef = useRef<HTMLElement | null>(null)
+  const [copilotColWidth, setCopilotColWidth] = useState(0)
   // 抽屉与桌面左栏是两件事：桌面左栏默认展开，小屏抽屉默认收起（否则一进页面就被目录盖住）
   const [drawerOpen, setDrawerOpen] = useState(false)
   // 手机：Copilot 底部面板可切全屏（长回答 + 交互块在 390px 下需要整屏）
@@ -163,6 +178,8 @@ export default function PaperWorkbenchPage() {
     pendingAsks,
     briefUi,
     briefData,
+    voiceBallHidden,
+    requestVoiceAsk,
     setCopilotOpen,
     setOutlineOpen,
     setCopilotWidth,
@@ -541,6 +558,11 @@ export default function PaperWorkbenchPage() {
     setMaxBlockIndex((m) => (blockIndex > m ? blockIndex : m))
   }, [])
 
+  /** 第二观察器的可见区间只进 ref：语音发送瞬间才读，滚动不触发任何重渲染 */
+  const handleVisibleRange = useCallback((range: { min: number; max: number }) => {
+    visibleRangeRef.current = range
+  }, [])
+
   const handleVisiblePage = useCallback((page: number) => {
     const blockIndex = anchorCtxRef.current.firstBlockOfPage[page]
     setPosition((prev) => {
@@ -652,6 +674,84 @@ export default function PaperWorkbenchPage() {
     const timer = setTimeout(() => setToast(''), TOAST_MS)
     return () => clearTimeout(timer)
   }, [toast])
+
+  // ---------------------------------------------------------------------
+  // 语音陪读：服务端配置 + 提问快照
+  // ---------------------------------------------------------------------
+
+  // /voice/config 需要登录态；未登录/未开启一律安静落到 enabled:false（球不渲染）
+  useEffect(() => {
+    if (authStatus !== 'authed') {
+      setVoiceConfig(null)
+      return
+    }
+    let alive = true
+    void getVoiceConfig()
+      .then((c) => {
+        if (alive) setVoiceConfig(c)
+      })
+      .catch(() => {
+        if (alive) setVoiceConfig({ enabled: false })
+      })
+    return () => {
+      alive = false
+    }
+  }, [authStatus])
+
+  // Copilot 列宽跟踪：档位切换/专注陪读/收起都会改宽度，ResizeObserver 一网打尽；
+  // 列收起时带 hidden 类 → offsetWidth 0 → 球回到默认右下角
+  useEffect(() => {
+    const el = copilotAsideRef.current
+    if (!el) {
+      setCopilotColWidth(0)
+      return
+    }
+    const ro = new ResizeObserver(() => setCopilotColWidth(el.offsetWidth))
+    ro.observe(el)
+    setCopilotColWidth(el.offsetWidth)
+    return () => ro.disconnect()
+  }, [copilotEverOpened, isTablet])
+
+  /**
+   * 语音转写完成 → 发送瞬间快照上下文（不是录音瞬间：说话期间用户可能还在滚动）：
+   * 划词选区（若有）+ 屏幕可见正文区间 → requestVoiceAsk 交给 CopilotPanel 消费。
+   * PDF 原版视图没有块级观察器，用当前页反查块区间；再兜底为阅读位置附近的窗口。
+   */
+  const handleVoiceTranscript = useCallback(
+    (text: string) => {
+      if (!paperId) return
+      const pos = positionRef.current
+      const blockList = blockByIndexRef.current
+      let range: BlockRange | null =
+        modeRef.current === 'original' && formatRef.current === 'pdf'
+          ? pos.page !== undefined
+            ? pageBlockRange(anchorCtxRef.current.firstBlockOfPage, pos.page, blockList.length)
+            : null
+          : visibleRangeRef.current
+      if (!range || range.max < range.min) range = windowAroundBlock(pos.blockIndex, blockList.length)
+
+      const sel = window.getSelection()
+      const container = readerRef.current
+      const anchorNode = sel?.anchorNode ?? null
+      const selection =
+        sel && !sel.isCollapsed && container && anchorNode && container.contains(anchorNode)
+          ? sel.toString().trim().slice(0, MAX_ASK_TEXT)
+          : ''
+
+      const viewport = buildViewportContext(blockList, range, {
+        selection: selection || null,
+        centerIndex: pos.blockIndex,
+      })
+      requestVoiceAsk({
+        paperId,
+        text,
+        selection: selection || null,
+        viewportContext: viewport.text || null,
+        speak: usePaperUi.getState().voiceSpeakAloud,
+      })
+    },
+    [paperId, requestVoiceAsk],
+  )
 
   const runSearch = useCallback(() => {
     if (!paperId || !searchQuery.trim()) return
@@ -888,6 +988,17 @@ export default function PaperWorkbenchPage() {
                 <span className="hidden md:inline">展开 Copilot</span>
               </button>
             )}
+            {/* 麦克风球被隐藏后的恢复入口（设置浮层里的「隐藏」提示指向这里） */}
+            {!paper.sensitive && voiceConfig?.enabled === true && voiceBallHidden && (
+              <button
+                type="button"
+                onClick={() => usePaperUi.getState().setVoicePrefs({ voiceBallHidden: false })}
+                title="恢复语音麦克风球"
+                className="min-h-11 rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 hover:text-fg md:min-h-0"
+              >
+                🎙
+              </button>
+            )}
             {/* 手机 meta 精简版：完整 meta 段在 md- 隐藏，这里在工具行行尾补上最关键的两个数 */}
             <span className="ml-auto min-w-0 truncate text-xs text-dim md:hidden">
               {position.page !== undefined && paper.pageCount
@@ -985,6 +1096,7 @@ export default function PaperWorkbenchPage() {
                   blocks={blocks}
                   containerRef={readerRef}
                   onVisibleBlock={handleVisibleBlock}
+                  onVisibleRange={handleVisibleRange}
                   langMode={langMode}
                   translations={translations}
                   failedTranslations={failedTranslations}
@@ -997,7 +1109,10 @@ export default function PaperWorkbenchPage() {
           </main>
 
           {showCopilotColumn && (
-            <aside className={`${copilotColumnClass} overflow-hidden rounded-xl border border-line bg-panel p-4 shadow-sm`}>
+            <aside
+              ref={copilotAsideRef}
+              className={`${copilotColumnClass} overflow-hidden rounded-xl border border-line bg-panel p-4 shadow-sm`}
+            >
               {copilotPane}
             </aside>
           )}
@@ -1053,6 +1168,28 @@ export default function PaperWorkbenchPage() {
           onHighlight={mode === 'text' ? handleHighlight : undefined}
         />
         <HighlightActions onRemove={removeHighlight} />
+
+        {/* 语音陪读悬浮球：敏感论文一票否决（不采音），服务端未开启/未登录不渲染 */}
+        {!paper.sensitive && voiceConfig?.enabled === true && !voiceBallHidden && (
+          <VoiceMicBall
+            paperId={paper.id}
+            enabled
+            onTranscript={handleVoiceTranscript}
+            {...(voiceConfig.maxUtteranceMs !== undefined ? { maxUtteranceMs: voiceConfig.maxUtteranceMs } : {})}
+            {...(voiceConfig.providerLabel ? { providerLabel: voiceConfig.providerLabel } : {})}
+            voices={voiceConfig.voices ?? []}
+            {...(voiceConfig.defaultVoice ? { defaultVoiceId: voiceConfig.defaultVoice } : {})}
+            mobileLayout={!isTablet && copilotOpen ? (sheetFull ? 'sheetFull' : 'sheet') : 'free'}
+            desktopPos={
+              // 让出 Copilot 列（列宽 + gap-3 + 右缘距）；专注陪读整行都是面板，改为抬到输入行上方
+              readerHidden
+                ? { right: 24, bottom: 112 }
+                : copilotOpen && copilotColWidth > 0
+                  ? { right: copilotColWidth + 12 + 24, bottom: 32 }
+                  : { right: 24, bottom: 32 }
+            }
+          />
+        )}
       </div>
     </ReaderProvider>
   )

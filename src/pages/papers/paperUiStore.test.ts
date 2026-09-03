@@ -4,6 +4,7 @@ import {
   effectiveCopilotWidth,
   nextCopilotWidth,
   sanitizeLayoutPrefs,
+  sanitizeVoicePrefs,
   type CopilotWidth,
 } from './paperUiStore'
 
@@ -112,6 +113,43 @@ describe('sanitizeLayoutPrefs（localStorage 视为不可信输入）', () => {
   })
 })
 
+describe('sanitizeVoicePrefs（语音偏好，localStorage 同样不可信）', () => {
+  const DEFAULTS = {
+    voiceSpeakAloud: true,
+    voiceSpeakTypedTurns: false,
+    voiceContinuous: false,
+    voiceHotkey: true,
+    voiceTtsVoice: '',
+    voiceTtsEngine: 'cloud',
+    voiceBallHidden: false,
+  }
+
+  it('非对象一律回默认值', () => {
+    for (const bad of [null, undefined, 42, 'x', [], true]) expect(sanitizeVoicePrefs(bad)).toEqual(DEFAULTS)
+  })
+
+  it('逐字段白名单：坏值只污染自己那一格', () => {
+    expect(sanitizeVoicePrefs({ voiceSpeakAloud: 'yes', voiceContinuous: true, voiceTtsEngine: 'chip' })).toEqual({
+      ...DEFAULTS,
+      voiceContinuous: true,
+    })
+  })
+
+  it('音色 id：超长字符串退回默认，合法枚举引擎保留', () => {
+    expect(sanitizeVoicePrefs({ voiceTtsVoice: 'x'.repeat(200) }).voiceTtsVoice).toBe('')
+    expect(sanitizeVoicePrefs({ voiceTtsVoice: 'anna', voiceTtsEngine: 'browser' })).toMatchObject({
+      voiceTtsVoice: 'anna',
+      voiceTtsEngine: 'browser',
+    })
+  })
+
+  it('运行时状态字段不会被带出来', () => {
+    const out = sanitizeVoicePrefs({ voiceAsk: { id: 'x' }, voiceTurnPhase: 'speaking', voiceSpeakAloud: false })
+    expect(Object.keys(out).sort()).toEqual(Object.keys(DEFAULTS).sort())
+    expect(out.voiceSpeakAloud).toBe(false)
+  })
+})
+
 describe('store 不变量联动', () => {
   it('收起 Copilot 会顺带退出专注陪读', async () => {
     const { store } = await loadStore()
@@ -136,7 +174,7 @@ describe('store 不变量联动', () => {
 })
 
 describe('persist：白名单落盘与恢复', () => {
-  it('只有四个布局键落盘，运行时状态一个不进', async () => {
+  it('只有布局与语音偏好键落盘，运行时状态一个不进', async () => {
     const { store, storage } = await loadStore()
     store.getState().setCopilotWidth('max')
     store.getState().addPendingAsk({
@@ -147,6 +185,13 @@ describe('persist：白名单落盘与恢复', () => {
       anchor: { kind: 'pdf', blockIndex: 3 },
     })
     store.getState().setBriefUi({ paperId: 'p1', status: 'running', done: 1, total: 4 })
+    store.getState().requestVoiceAsk({
+      paperId: 'p1',
+      text: '这段怎么理解',
+      selection: null,
+      viewportContext: '可见正文',
+      speak: true,
+    })
 
     const raw = persisted(storage)
     expect(raw.version).toBe(1)
@@ -155,10 +200,71 @@ describe('persist：白名单落盘与恢复', () => {
       'copilotWidth',
       'outlineOpen',
       'readerCollapsed',
+      'voiceBallHidden',
+      'voiceContinuous',
+      'voiceHotkey',
+      'voiceSpeakAloud',
+      'voiceSpeakTypedTurns',
+      'voiceTtsEngine',
+      'voiceTtsVoice',
     ])
     expect(raw.state?.copilotWidth).toBe('max')
     // 运行时状态仍在内存里，只是不落盘
     expect(store.getState().pendingAsks).toHaveLength(1)
+    expect(store.getState().voiceAsk?.text).toBe('这段怎么理解')
+  })
+
+  it('语音提问载荷：requestVoiceAsk 展开面板并复位阶段，consume 后清空', async () => {
+    const { store } = await loadStore()
+    store.getState().setVoiceTurnPhase('error', '上一轮的错')
+    store.getState().requestVoiceAsk({
+      paperId: 'p1',
+      text: '注意力分数怎么算',
+      selection: '选区',
+      viewportContext: null,
+      speak: false,
+    })
+    const s = store.getState()
+    expect(s.copilotOpen).toBe(true)
+    expect(s.voiceTurnPhase).toBe('idle')
+    expect(s.voiceTurnError).toBeNull()
+    expect(s.voiceAsk).toMatchObject({ paperId: 'p1', text: '注意力分数怎么算', speak: false })
+    expect(typeof s.voiceAsk?.id).toBe('string')
+    store.getState().consumeVoiceAsk()
+    expect(store.getState().voiceAsk).toBeNull()
+  })
+
+  it('阶段回写与打断信号：setVoiceTurnPhase 带错误文案，requestStopSpeak 单调递增', async () => {
+    const { store } = await loadStore()
+    store.getState().setVoiceTurnPhase('speaking')
+    expect(store.getState()).toMatchObject({ voiceTurnPhase: 'speaking', voiceTurnError: null })
+    store.getState().setVoiceTurnPhase('error', '云端朗读不可用')
+    expect(store.getState().voiceTurnError).toBe('云端朗读不可用')
+    const before = store.getState().voiceStopSpeakTick
+    store.getState().requestStopSpeak()
+    store.getState().requestStopSpeak()
+    expect(store.getState().voiceStopSpeakTick).toBe(before + 2)
+  })
+
+  it('setVoicePrefs 局部更新并落盘', async () => {
+    const { store, storage } = await loadStore()
+    store.getState().setVoicePrefs({ voiceContinuous: true, voiceTtsVoice: 'anna' })
+    expect(store.getState()).toMatchObject({ voiceContinuous: true, voiceTtsVoice: 'anna', voiceSpeakAloud: true })
+    const raw = persisted(storage)
+    expect(raw.state?.voiceContinuous).toBe(true)
+    expect(raw.state?.voiceTtsVoice).toBe('anna')
+  })
+
+  it('坏语音偏好从 localStorage 恢复时被净化', async () => {
+    const { store } = await loadStore(
+      seedOf({ copilotOpen: true, voiceTtsEngine: 'chip', voiceContinuous: 'yes', voiceHotkey: false }),
+    )
+    expect(store.getState()).toMatchObject({
+      copilotOpen: true,
+      voiceTtsEngine: 'cloud',
+      voiceContinuous: false,
+      voiceHotkey: false,
+    })
   })
 
   it('三项偏好都能从 localStorage 恢复', async () => {

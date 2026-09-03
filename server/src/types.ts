@@ -5,6 +5,7 @@
 import type { Config } from './config.js'
 import type { Db, UserRow } from './db/db.js'
 import type { FetchLookup, FetchTransport } from './lib/fetchRaw.js'
+import type { VoiceAdapter } from './voice/adapter.js'
 
 export interface AppDeps {
   db: Db
@@ -28,6 +29,20 @@ export interface AppDeps {
     timeoutMs?: number
     transport?: FetchTransport
     lookup?: FetchLookup
+  }
+  /**
+   * 语音路由参数覆盖(测试专用),同 llmTuning 的理由不进 config。
+   * adapter 是注入口:测试用纯内存适配器把转写/合成的全部分支(轮换/超时/上游 4xx)
+   * 跑成零网络——语音上游没有可本地复现的 stub 协议,起 http stub 只会测到 multipart 拼装。
+   */
+  voiceTuning?: {
+    adapter?: VoiceAdapter
+    rateCapacity?: number
+    rateRefillMs?: number
+    ttsRateCapacity?: number
+    ttsRateRefillMs?: number
+    maxBytes?: number
+    timeoutMs?: number
   }
 }
 

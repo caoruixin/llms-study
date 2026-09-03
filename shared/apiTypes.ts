@@ -25,7 +25,9 @@ export type ApiErrorCode =
   | 'fetch-denied' // 403:URL 抓取被安全策略拒绝(内网/保留地址、userinfo、非常规端口)
   | 'fetch-failed' // 502:URL 抓取失败(连接/超时/上游 4xx-5xx/重定向过多)
   | 'fetch-too-large' // 413:抓取内容超过 FETCH_URL_MAX_BYTES
-  | 'unsupported-content' // 415:抓到的内容类型不在 html/xhtml/plain/pdf 白名单内
+  | 'unsupported-content' // 415:抓到的内容类型不在 html/xhtml/plain/pdf 白名单内(语音上传容器不在白名单亦用此码)
+  | 'voice-upstream-failed' // 502:语音上游转写/合成失败(含超时与全部 key 用尽)
+  | 'voice-unavailable' // 503:本部署未配置语音 provider 或 key,功能整体不可用
   | 'internal' // 500
 
 export interface ApiError {
@@ -216,6 +218,51 @@ export interface FilePutResponse {
  */
 export interface FetchUrlBody {
   url: string
+}
+
+// ---- 语音助手(Voice Copilot)----
+
+/** 可选音色:id 是厂商短标识(拼进上游 voice 参数),label 是中文试听标签 */
+export interface VoiceVoiceOption {
+  id: string
+  label: string
+}
+
+/**
+ * GET /api/app/voice/config:前端据此决定是否渲染麦克风球。
+ * 未配置 provider/key 的部署只回 `{enabled:false}`——不泄露"配了哪家但没 key"。
+ */
+export type VoiceConfigResponse =
+  | { enabled: false }
+  | {
+      enabled: true
+      provider: string
+      providerLabel: string
+      asrModel: string
+      voices: VoiceVoiceOption[]
+      /** 用户未选音色时服务端使用的默认音色 id */
+      defaultVoice: string
+      maxUtteranceMs: number
+      maxAudioBytes: number
+    }
+
+/**
+ * POST /api/app/voice/transcribe 的成功响应。
+ * text 为空字符串是**正常结果**(没说话/全是噪声),不是错误——前端据此提示"没听清"。
+ */
+export interface VoiceTranscribeResponse {
+  text: string
+  model: string
+  latencyMs: number
+}
+
+/** POST /api/app/voice/tts 请求体;成功响应不是 JSON 而是音频字节(Cache-Control: no-store) */
+export interface VoiceTtsBody {
+  text: string
+  /** 缺省 = 服务端默认音色 */
+  voice?: string
+  format?: 'mp3' | 'wav'
+  speed?: number
 }
 
 // ---- misc ----

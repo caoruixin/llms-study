@@ -192,9 +192,60 @@ describe('assembleContext · 裁剪阶梯', () => {
       chunksTruncated: false,
       turnsDropped: 0,
       selectionTruncated: false,
+      viewportTruncated: false,
+      viewportDropped: false,
       overBudget: false,
     })
     expect(report.estimatedInputTokens).toBeGreaterThan(0)
     expect(report.budgetTokens).toBe(12_000)
+  })
+})
+
+describe('assembleContext · 屏幕可见正文（语音陪读）', () => {
+  it('插在选区之后、白名单之前，带「不是引用来源」守卫', () => {
+    const { messages, report } = assembleContext(baseInput({ viewportContext: '屏幕可见段落甲' }))
+    const last = messages[messages.length - 1].content
+    expect(last).toContain('【当前屏幕上的正文】')
+    expect(last).toContain('屏幕可见段落甲')
+    expect(last).toContain('不是引用来源')
+    expect(last.indexOf('选中的原文')).toBeLessThan(last.indexOf('【当前屏幕上的正文】'))
+    expect(last.indexOf('【当前屏幕上的正文】')).toBeLessThan(last.indexOf('【本轮白名单片段】'))
+    expect(report.viewportTruncated).toBe(false)
+    expect(report.viewportDropped).toBe(false)
+  })
+
+  it('null / 空白 viewport 整段省略，字节与不带该字段完全一致', () => {
+    const without = assembleContext(baseInput()).messages.at(-1)!.content
+    expect(assembleContext(baseInput({ viewportContext: null })).messages.at(-1)!.content).toBe(without)
+    expect(assembleContext(baseInput({ viewportContext: '   ' })).messages.at(-1)!.content).toBe(without)
+  })
+
+  it('阶梯 0：超预算先收缩 viewport 到 600 字，chunk 一条不丢', () => {
+    // 预算按「无 viewport 的基线 + 300 token」动态设定，不依赖系统提示词的具体长度：
+    // 6000 字 viewport（≈2000 tok）必然超预算；收缩到 600 字（≈200 tok + 包装段）后回到预算内
+    const baseline = assembleContext(baseInput()).report.estimatedInputTokens
+    const { report, messages } = assembleContext(
+      baseInput({ viewportContext: 'v'.repeat(6000), inputBudgetTokens: baseline + 300 }),
+    )
+    expect(report.viewportTruncated).toBe(true)
+    expect(report.viewportDropped).toBe(false)
+    expect(report.chunksDropped).toBe(0)
+    expect(report.overBudget).toBe(false)
+    const last = messages[messages.length - 1].content
+    expect(last).toContain('v'.repeat(600))
+    expect(last).not.toContain('v'.repeat(601))
+  })
+
+  it('阶梯 5：收缩仍不够时整段丢弃 viewport 而不是报 overBudget', () => {
+    // 预算 = 基线 + 100：连收缩后的 600 字（≈200 tok）也装不下 → 走到整段丢弃档
+    const lean = { chunks: [mkChunk('c1', '小')], history: [], selection: null } as const
+    const baseline = assembleContext(baseInput(lean)).report.estimatedInputTokens
+    const { report, messages } = assembleContext(
+      baseInput({ ...lean, viewportContext: 'v'.repeat(2000), inputBudgetTokens: baseline + 100 }),
+    )
+    expect(report.viewportTruncated).toBe(true)
+    expect(report.viewportDropped).toBe(true)
+    expect(report.overBudget).toBe(false)
+    expect(messages[messages.length - 1].content).not.toContain('【当前屏幕上的正文】')
   })
 })

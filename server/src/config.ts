@@ -33,7 +33,34 @@ export interface Config {
    * 不开这个开关本机什么都抓不到。生产严禁配置——等于拆掉 SSRF 防线。
    */
   fetchUrlAllowForbiddenDev: boolean
+  /** 语音助手(转写/合成);provider='none' = 整体关闭,前端不渲染麦克风球 */
+  voice: VoiceConfig
 }
+
+/** 语音 provider allowlist;刻意不并进 LLM_PROVIDERS——语音不走 /api/{provider} 网关那套 */
+export const VOICE_PROVIDERS = ['none', 'siliconflow'] as const
+export type VoiceProvider = (typeof VOICE_PROVIDERS)[number]
+
+export interface VoiceConfig {
+  provider: VoiceProvider
+  /** 逗号列表,依序故障转移(与 SERVER_*_KEYS 同语义) */
+  keys: string[]
+  baseUrl: string
+  asrModel: string
+  ttsModel: string
+  /** 用户未选音色时用的音色短 id */
+  defaultVoice: string
+  /** 每用户每日 TTS 字符上限(账单兜底,按 voice_call_log 当日 SUM 统计);0 = 不限 */
+  dailyCharLimit: number
+}
+
+/** SiliconFlow 默认模型/音色/上游;env 可逐项覆盖(换模型不必改代码) */
+const VOICE_DEFAULTS = {
+  baseUrl: 'https://api.siliconflow.cn',
+  asrModel: 'FunAudioLLM/SenseVoiceSmall',
+  ttsModel: 'FunAudioLLM/CosyVoice2-0.5B',
+  voice: 'anna',
+} as const
 
 /** 逗号分隔列表解析:空段剔除,顺序即优先级(与 src/lib/keyRotation.ts 的 parseKeyList 同语义) */
 function parseList(raw: string | undefined): string[] {
@@ -117,5 +144,43 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     llmUpstreams,
     adminDailyCallLimit,
     fetchUrlAllowForbiddenDev: parseBool(env.FETCH_URL_ALLOW_FORBIDDEN_DEV, false),
+    voice: loadVoiceConfig(env),
+  }
+}
+
+/**
+ * 语音配置解析,同样 fail-fast:配了未知 provider 或配了 provider 却没 key,
+ * 都是"以为开了其实没开"的静默失败,宁可起不来。
+ */
+function loadVoiceConfig(env: Record<string, string | undefined>): VoiceConfig {
+  const raw = env.VOICE_PROVIDER || 'none'
+  if (!(VOICE_PROVIDERS as readonly string[]).includes(raw)) {
+    throw new Error(`VOICE_PROVIDER 只接受 ${VOICE_PROVIDERS.join('/')},得到:${raw}`)
+  }
+  const provider = raw as VoiceProvider
+  const keys = parseList(env.SERVER_SILICONFLOW_KEYS)
+  if (provider !== 'none' && keys.length === 0) {
+    throw new Error(`VOICE_PROVIDER=${provider} 但 SERVER_SILICONFLOW_KEYS 为空`)
+  }
+
+  const dailyCharLimit = env.VOICE_DAILY_CHAR_LIMIT ? Number(env.VOICE_DAILY_CHAR_LIMIT) : 0
+  if (!Number.isInteger(dailyCharLimit) || dailyCharLimit < 0) {
+    throw new Error(`VOICE_DAILY_CHAR_LIMIT 必须是非负整数:${env.VOICE_DAILY_CHAR_LIMIT}`)
+  }
+
+  // 末尾 /v1 一并剥掉:适配器里的路径常量自带 /v1(OpenAI 兼容形状),
+  // 而人手写 base URL 时习惯带上,不剥就会拼成 /v1/v1/audio/... 直接 404
+  const baseUrl = (env.SILICONFLOW_BASE_URL || VOICE_DEFAULTS.baseUrl)
+    .replace(/\/+$/, '')
+    .replace(/\/v1$/, '')
+
+  return {
+    provider,
+    keys,
+    baseUrl,
+    asrModel: env.VOICE_ASR_MODEL || VOICE_DEFAULTS.asrModel,
+    ttsModel: env.VOICE_TTS_MODEL || VOICE_DEFAULTS.ttsModel,
+    defaultVoice: env.VOICE_TTS_VOICE || VOICE_DEFAULTS.voice,
+    dailyCharLimit,
   }
 }

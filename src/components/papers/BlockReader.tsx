@@ -32,6 +32,8 @@ interface Props {
   containerRef: RefObject<HTMLElement | null>
   /** 视口内最靠上的块序号，用于阅读进度与目录高亮 */
   onVisibleBlock: (blockIndex: number) => void
+  /** 全视口可见块区间（语音陪读的「屏幕可见正文」来源）；不传则不建第二观察器 */
+  onVisibleRange?: (range: { min: number; max: number }) => void
   /** 正文语言三态；缺省 'orig' = 与翻译功能完全无关的旧行为 */
   langMode?: LangMode
   /** blockIndex → 译文（缺席且可译 = 骨架态） */
@@ -279,6 +281,7 @@ export default function BlockReader({
   blocks,
   containerRef,
   onVisibleBlock,
+  onVisibleRange,
   langMode = 'orig',
   translations,
   failedTranslations,
@@ -309,6 +312,35 @@ export default function BlockReader({
     for (const el of root.querySelectorAll('[data-block-index]')) io.observe(el)
     return () => io.disconnect()
   }, [blocks, containerRef, onVisibleBlock])
+
+  // 第二观察器：全视口可见块区间（语音陪读用）。上面的观察器 rootMargin 收缩到视口上
+  // 1/4，回答的是「当前读到哪」；这里 rootMargin 0 回答「屏幕上有什么」——两个问题两套
+  // 机制（PdfViewer 的渲染窗口 vs 当前页判定同一先例），互不干扰。onVisibleRange 缺省时
+  // 完全不建，旧调用方零开销。
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root || !blocks.length || !onVisibleRange) return
+    const visible = new Set<number>()
+    let last: { min: number; max: number } | null = null
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const i = Number((e.target as HTMLElement).dataset.blockIndex)
+          if (Number.isNaN(i)) continue
+          if (e.isIntersecting) visible.add(i)
+          else visible.delete(i)
+        }
+        if (!visible.size) return
+        const next = { min: Math.min(...visible), max: Math.max(...visible) }
+        if (last && last.min === next.min && last.max === next.max) return
+        last = next
+        onVisibleRange(next)
+      },
+      { root, threshold: 0 },
+    )
+    for (const el of root.querySelectorAll('[data-block-index]')) io.observe(el)
+    return () => io.disconnect()
+  }, [blocks, containerRef, onVisibleRange])
 
   if (!blocks.length) return <p className="text-sm text-dim">这篇论文没有可显示的正文块。</p>
 

@@ -47,6 +47,82 @@ export interface PendingAsk {
   translated?: boolean
 }
 
+// ---------------------------------------------------------------------------
+// 语音陪读（voice copilot）
+// ---------------------------------------------------------------------------
+
+/**
+ * 语音提问载荷：悬浮球（PaperWorkbenchPage）写入、CopilotPanel 消费后立即清空。
+ * 有意用 consume-and-clear 而不是 briefRequestTick 的 tick+seenTick——面板未挂载时
+ * tick 先加、面板后挂，useRef(tick) 初始化即等于新值，effect 永不触发（手机 sheet 必踩）。
+ */
+export interface VoiceAsk {
+  id: string
+  paperId: string
+  /** 语音转写文本（displayText 与 question 的共同来源） */
+  text: string
+  /** 发送瞬间快照的划词选区 */
+  selection: string | null
+  /** 发送瞬间快照的屏幕可见正文（voice/viewportContext 产物） */
+  viewportContext: string | null
+  /** 本轮回答是否自动朗读 */
+  speak: boolean
+  at: number
+}
+
+/** 面板回写给悬浮球的轮次阶段（粗粒度：一轮只有个位数次写入，不放高频数据） */
+export type VoiceTurnPhase = 'idle' | 'thinking' | 'speaking' | 'done' | 'error'
+
+/** 进 localStorage 的语音偏好白名单——与 sanitizeVoicePrefs 共用一份，防两处漂移 */
+export interface VoicePrefs {
+  /** 语音提问的回答自动朗读 */
+  voiceSpeakAloud: boolean
+  /** 打字提问也自动朗读（默认关；手动「边生成边朗读」按钮不受影响） */
+  voiceSpeakTypedTurns: boolean
+  /** 连续对话：回答读完自动重新收音 */
+  voiceContinuous: boolean
+  /** 桌面端「按住 V 说话」热键 */
+  voiceHotkey: boolean
+  /** 云端 TTS 音色 id（'' = 服务端默认） */
+  voiceTtsVoice: string
+  /** 朗读引擎：云端更自然 / 浏览器免费离线 */
+  voiceTtsEngine: 'cloud' | 'browser'
+  /** 隐藏悬浮麦克风球 */
+  voiceBallHidden: boolean
+}
+
+const DEFAULT_VOICE_PREFS: VoicePrefs = {
+  voiceSpeakAloud: true,
+  voiceSpeakTypedTurns: false,
+  voiceContinuous: false,
+  voiceHotkey: true,
+  voiceTtsVoice: '',
+  voiceTtsEngine: 'cloud',
+  voiceBallHidden: false,
+}
+
+/** localStorage 视为不可信输入（同 sanitizeLayoutPrefs）：坏值只污染自己那一格 */
+export function sanitizeVoicePrefs(raw: unknown): VoicePrefs {
+  if (typeof raw !== 'object' || raw === null) return { ...DEFAULT_VOICE_PREFS }
+  const o = raw as Record<string, unknown>
+  const bool = (v: unknown, fallback: boolean) => (typeof v === 'boolean' ? v : fallback)
+  return {
+    voiceSpeakAloud: bool(o.voiceSpeakAloud, DEFAULT_VOICE_PREFS.voiceSpeakAloud),
+    voiceSpeakTypedTurns: bool(o.voiceSpeakTypedTurns, DEFAULT_VOICE_PREFS.voiceSpeakTypedTurns),
+    voiceContinuous: bool(o.voiceContinuous, DEFAULT_VOICE_PREFS.voiceContinuous),
+    voiceHotkey: bool(o.voiceHotkey, DEFAULT_VOICE_PREFS.voiceHotkey),
+    voiceTtsVoice:
+      typeof o.voiceTtsVoice === 'string' && o.voiceTtsVoice.length <= 120
+        ? o.voiceTtsVoice
+        : DEFAULT_VOICE_PREFS.voiceTtsVoice,
+    voiceTtsEngine:
+      o.voiceTtsEngine === 'cloud' || o.voiceTtsEngine === 'browser'
+        ? o.voiceTtsEngine
+        : DEFAULT_VOICE_PREFS.voiceTtsEngine,
+    voiceBallHidden: bool(o.voiceBallHidden, DEFAULT_VOICE_PREFS.voiceBallHidden),
+  }
+}
+
 /** 论文地图生成进度（CopilotPanel 写入，OutlinePane 展示；跨栏共享走 store） */
 export interface BriefUiState {
   paperId: string
@@ -120,7 +196,7 @@ export function sanitizeLayoutPrefs(raw: unknown): LayoutPrefs {
   }
 }
 
-interface PaperUiState extends LayoutPrefs {
+interface PaperUiState extends LayoutPrefs, VoicePrefs {
   sortBy: PaperSortBy
   filter: PaperFilter
   pendingDuplicate: PendingDuplicate | null
@@ -131,6 +207,14 @@ interface PaperUiState extends LayoutPrefs {
   briefData: BriefDataState | null
   /** OutlinePane 的「生成论文地图」入口 → CopilotPanel 监听 tick 发起管线（面板收起时先展开） */
   briefRequestTick: number
+  /** 语音提问载荷（consume-and-clear，见 VoiceAsk 注释）；以下语音运行时状态一律不落盘 */
+  voiceAsk: VoiceAsk | null
+  voiceTurnPhase: VoiceTurnPhase
+  voiceTurnError: string | null
+  /** CopilotPanel 是否有轮次在飞（悬浮球据此拒绝新提问 / 暂停连续模式重臂） */
+  voicePanelBusy: boolean
+  /** 悬浮球打断朗读的信号（ball → panel；面板 stopSpeaking，不停止生成） */
+  voiceStopSpeakTick: number
   setSortBy: (sortBy: PaperSortBy) => void
   setFilter: (filter: PaperFilter) => void
   setCopilotOpen: (copilotOpen: boolean) => void
@@ -145,6 +229,13 @@ interface PaperUiState extends LayoutPrefs {
   setBriefUi: (briefUi: BriefUiState | null) => void
   setBriefData: (briefData: BriefDataState | null) => void
   requestBrief: () => void
+  setVoicePrefs: (patch: Partial<VoicePrefs>) => void
+  /** 悬浮球提交语音提问：面板收起时顺带展开（requestBrief 先例），并复位上一轮的阶段/错误 */
+  requestVoiceAsk: (ask: Omit<VoiceAsk, 'id' | 'at'>) => void
+  consumeVoiceAsk: () => void
+  setVoiceTurnPhase: (voiceTurnPhase: VoiceTurnPhase, voiceTurnError?: string | null) => void
+  setVoicePanelBusy: (voicePanelBusy: boolean) => void
+  requestStopSpeak: () => void
 }
 
 const askId = (): string =>
@@ -158,12 +249,18 @@ export const usePaperUi = create<PaperUiState>()(
       sortBy: 'lastRead',
       filter: 'all',
       ...DEFAULT_LAYOUT,
+      ...DEFAULT_VOICE_PREFS,
       pendingDuplicate: null,
       confirmDeleteId: null,
       pendingAsks: [],
       briefUi: null,
       briefData: null,
       briefRequestTick: 0,
+      voiceAsk: null,
+      voiceTurnPhase: 'idle',
+      voiceTurnError: null,
+      voicePanelBusy: false,
+      voiceStopSpeakTick: 0,
       setSortBy: (sortBy) => set({ sortBy }),
       setFilter: (filter) => set({ filter }),
       // 不变量：收起 Copilot 必须同时退出专注陪读，否则正文与 Copilot 会一起消失
@@ -182,18 +279,41 @@ export const usePaperUi = create<PaperUiState>()(
       setBriefUi: (briefUi) => set({ briefUi }),
       setBriefData: (briefData) => set({ briefData }),
       requestBrief: () => set((s) => ({ briefRequestTick: s.briefRequestTick + 1, copilotOpen: true })),
+      setVoicePrefs: (patch) => set(patch),
+      requestVoiceAsk: (ask) =>
+        set({
+          voiceAsk: { ...ask, id: askId(), at: Date.now() },
+          copilotOpen: true,
+          voiceTurnPhase: 'idle',
+          voiceTurnError: null,
+        }),
+      consumeVoiceAsk: () => set({ voiceAsk: null }),
+      setVoiceTurnPhase: (voiceTurnPhase, voiceTurnError = null) => set({ voiceTurnPhase, voiceTurnError }),
+      setVoicePanelBusy: (voicePanelBusy) => set({ voicePanelBusy }),
+      requestStopSpeak: () => set((s) => ({ voiceStopSpeakTick: s.voiceStopSpeakTick + 1 })),
     }),
     {
       name: 'paper-ui-layout',
       version: 1,
-      // 仿 src/store.ts 先例：白名单式 partialize，运行时状态（pendingAsks/briefData/…）绝不落盘
-      partialize: (s): LayoutPrefs => ({
+      // 仿 src/store.ts 先例：白名单式 partialize，运行时状态（pendingAsks/briefData/voiceAsk/…）绝不落盘
+      partialize: (s): LayoutPrefs & VoicePrefs => ({
         copilotOpen: s.copilotOpen,
         outlineOpen: s.outlineOpen,
         copilotWidth: s.copilotWidth,
         readerCollapsed: s.readerCollapsed,
+        voiceSpeakAloud: s.voiceSpeakAloud,
+        voiceSpeakTypedTurns: s.voiceSpeakTypedTurns,
+        voiceContinuous: s.voiceContinuous,
+        voiceHotkey: s.voiceHotkey,
+        voiceTtsVoice: s.voiceTtsVoice,
+        voiceTtsEngine: s.voiceTtsEngine,
+        voiceBallHidden: s.voiceBallHidden,
       }),
-      merge: (persisted, current) => ({ ...current, ...sanitizeLayoutPrefs(persisted) }),
+      merge: (persisted, current) => ({
+        ...current,
+        ...sanitizeLayoutPrefs(persisted),
+        ...sanitizeVoicePrefs(persisted),
+      }),
     },
   ),
 )

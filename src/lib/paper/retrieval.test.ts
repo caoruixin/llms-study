@@ -54,6 +54,28 @@ describe('expandQuery', () => {
   it('没有上下文时就是原查询', () => {
     expect(expandQuery('  hello  ')).toBe('hello')
   })
+
+  it('可见正文 auto 模式：无选区时并入（截 300），有选区时抑制', () => {
+    const viewport = `paged KV cache ${'v'.repeat(1000)}`
+    const withNoSelection = expandQuery('这里说的显存增长是指什么', { viewport })
+    expect(withNoSelection).toContain('paged KV cache')
+    expect(withNoSelection.length).toBeLessThan(400)
+
+    const withSelection = expandQuery('这里说的显存增长是指什么', {
+      viewport,
+      selection: 'memory grows linearly',
+    })
+    expect(withSelection).toContain('memory grows linearly')
+    expect(withSelection).not.toContain('paged KV cache')
+  })
+
+  it("可见正文显式开关：'always' 与选区共存，'never' 一律不并入", () => {
+    const ctx = { viewport: 'attention scores', selection: 'eight GPUs' }
+    expect(expandQuery('q', { ...ctx, viewportQuery: 'always' })).toContain('attention scores')
+    expect(expandQuery('q', { viewport: 'attention scores', viewportQuery: 'never' })).not.toContain(
+      'attention scores',
+    )
+  })
 })
 
 describe('retrieveFromChunks', () => {

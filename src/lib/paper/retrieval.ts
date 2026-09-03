@@ -33,8 +33,17 @@ export interface RetrieveContext {
   currentSection?: string
   /** 用户选区文本（上限截断后参与查询扩展） */
   selection?: string
+  /** 语音提问附带的屏幕可见正文（截断后可参与查询扩展，见 viewportQuery） */
+  viewport?: string
   /** 全文章节标题表：与问题有词面交集的标题会被并入查询 */
   sectionTitles?: readonly string[]
+  /**
+   * 可见正文是否参与查询扩展：
+   * - 'auto'（默认）：仅在无选区时并入——选区是更强的意图信号，BM25 对噪声敏感；
+   *   且 currentSection 加权已偏向视口所在章节，叠加可见正文常属重复。
+   * - 'always' / 'never'：评估调参用的显式开关。
+   */
+  viewportQuery?: 'auto' | 'always' | 'never'
 }
 
 export interface RetrieveOptions extends RetrieveContext {
@@ -55,6 +64,8 @@ export interface RetrieveResult {
 
 /** 选区参与查询扩展时的截断长度：整段选区会稀释问题本身的关键词 */
 const SELECTION_QUERY_CHARS = 300
+/** 可见正文参与查询扩展的截断长度（与选区同理，只取头部） */
+const VIEWPORT_QUERY_CHARS = 300
 /** 当前阅读章节的乘性加权：轻微倾斜，不足以压过词面强相关的其他章节 */
 const CURRENT_SECTION_BOOST = 1.12
 
@@ -65,6 +76,9 @@ const CURRENT_SECTION_BOOST = 1.12
 export function expandQuery(query: string, ctx: RetrieveContext = {}): string {
   const parts: string[] = [query.trim()]
   if (ctx.selection?.trim()) parts.push(ctx.selection.trim().slice(0, SELECTION_QUERY_CHARS))
+  const viewportMode = ctx.viewportQuery ?? 'auto'
+  const viewportEligible = viewportMode === 'always' || (viewportMode === 'auto' && !ctx.selection?.trim())
+  if (viewportEligible && ctx.viewport?.trim()) parts.push(ctx.viewport.trim().slice(0, VIEWPORT_QUERY_CHARS))
   if (ctx.currentSection?.trim()) parts.push(ctx.currentSection.trim())
 
   if (ctx.sectionTitles?.length) {

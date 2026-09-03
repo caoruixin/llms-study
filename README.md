@@ -60,6 +60,20 @@ cp .env.example .env   # fill provider keys
 npm run dev            # gateway on http://localhost:8787 (vite proxies /api/* to it)
 ```
 
+### Voice copilot (语音陪读)
+
+The paper workbench ships a ChatGPT-Voice-style assistant (floating mic ball, hold-to-talk / hold `V`, continuous mode, barge-in). Speech runs through the backend — cloud ASR/TTS via SiliconFlow (SenseVoice + CosyVoice2) with browser `speechSynthesis` as the fallback voice. Disabled unless the server is configured:
+
+```bash
+# server/.env
+VOICE_PROVIDER=siliconflow             # none (default) hides the feature entirely
+SERVER_SILICONFLOW_KEYS=sk-...         # comma list, ordered failover (keyRotation semantics)
+#SILICONFLOW_BASE_URL=https://api.siliconflow.cn
+#VOICE_DAILY_CHAR_LIMIT=0              # per-user daily TTS chars; 0 = unlimited
+```
+
+Privacy posture (see `PLAN-paper-copilot.md` §9, revised): audio is used only for the one transcription, synthesized audio is `no-store`, and the server logs byte/char counts + latency only — never content. Voice requires its own one-time consent, and sensitive papers disable the feature at every layer.
+
 ### Quality gates
 
 ```bash

@@ -57,6 +57,11 @@ export function ReaderStyles() {
 .paper-flash { animation: paper-flash-kf ${FLASH_MS}ms ease-out; border-radius: 6px; }
 @media (prefers-reduced-motion: reduce) { .paper-flash { animation-duration: 1ms; } }
 
+/* 语音悬浮球：收音时呼吸脉冲；实际音量电平走 --voice-level 缩放内环（不进 React 状态） */
+@keyframes voice-listen-kf { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+.voice-listening { animation: voice-listen-kf 1.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .voice-listening { animation: none; } }
+
 /* 文本视图的原生虚拟化：视口外的块跳过渲染，DOM 节点仍在（跳转/选区/浏览器查找照常） */
 .paper-block { content-visibility: auto; contain-intrinsic-size: auto 3.5rem; }
 .paper-table table { width: 100%; border-collapse: collapse; }
