@@ -13,6 +13,8 @@ import {
   buildReaderSrcdoc,
   hostRectInParent,
   pickLinkAction,
+  stampScrollers,
+  wheelScrollTarget,
 } from './snapshotDom'
 
 /**
@@ -78,6 +80,8 @@ interface Bound {
 const MAX_HEIGHT_PX = 400_000
 /** 等文档解析就绪的轮询间隔：只在绑定前跑，绑上即停 */
 const BIND_POLL_MS = 50
+/** deltaMode=DOM_DELTA_LINE 时一行按多少 px 折算（Chrome/Firefox 的常规行高档位） */
+const WHEEL_LINE_PX = 16
 const EMPTY_HIGHLIGHTS: ReadonlyMap<number, readonly PaperHighlight[]> = new Map()
 
 const cssEscape = (s: string): string =>
@@ -260,6 +264,30 @@ export default function WebSnapshotView({
     }
     doc.addEventListener('click', onClick, true)
 
+    // 站点自带的内部纵向滚动容器：整篇平铺的快照里它们只会吃掉滚轮，渲染期统一解除（存量快照免重导）
+    stampScrollers(doc)
+
+    /**
+     * 滚轮转发桥：iframe 自己不滚（`scrolling="no"` + 注入的 `html{overflow:hidden}`），滚轮落在
+     * iframe 上时必须**链式传递**出去才能滚到外层 main。而快照里保留着站点自己的 CSS——
+     * 例如 `html{overscroll-behavior-y:none}`，它本就是「别把滚动传给宿主页」的专用开关——
+     * 链路一断，触摸板/滚轮就整页滚不动，只剩拖 main 的滚动条能用（拖滚动条不经过 iframe 命中测试）。
+     *
+     * 这里不赌引擎的链式行为，直接把滚轮转发给外层容器；iframe 内还有能滚的祖先则让位给它。
+     */
+    const onWheel = (e: WheelEvent) => {
+      // ctrl+滚轮是捏合缩放，别抢；拦不住原生行为（passive）就别插手，否则会叠成双倍滚动
+      if (e.defaultPrevented || e.ctrlKey || !e.cancelable) return
+      const container = containerRef.current
+      const dy = e.deltaY
+      if (!container || !dy) return
+      if (wheelScrollTarget(e.target as Node | null, dy, doc.documentElement)) return
+      const unit = e.deltaMode === 1 ? WHEEL_LINE_PX : e.deltaMode === 2 ? container.clientHeight : 1
+      container.scrollTop += dy * unit
+      e.preventDefault()
+    }
+    doc.addEventListener('wheel', onWheel, { capture: true, passive: false })
+
     const source: SelectionSource = {
       doc,
       container: doc.body,
@@ -274,13 +302,14 @@ export default function WebSnapshotView({
       cleanup: () => {
         ro.disconnect()
         doc.removeEventListener('click', onClick, true)
+        doc.removeEventListener('wheel', onWheel, true)
         callbacks.current.onSelectionSource?.(null)
       },
     }
     setDocTick((t) => t + 1)
     callbacks.current.onSelectionSource?.(source)
     callbacks.current.onReady?.(api)
-  }, [decoded, api, scrollMainTo])
+  }, [decoded, api, scrollMainTo, containerRef])
 
   /**
    * 绑定时机：文档**解析完毕**即可，不等 `load`。

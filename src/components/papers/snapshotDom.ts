@@ -38,6 +38,19 @@ export const READER_CSP =
 
 export const READER_STYLE_ID = 'pc-reader'
 
+/**
+ * 站点自带的内部纵向滚动容器（渲染期由 `stampScrollers()` 统一打标）。
+ *
+ * 快照是一份**整篇平铺**的静态文档，内部本就不该有滚动口：留着它们只会把滚轮吃掉——指针停在
+ * 站点侧栏上滚不动正文，滚到底还会被站点的 `overscroll-behavior` 掐断链式传递。
+ *
+ * 两轴一起解除，而不是只解纵向：CSS overflow 规范规定 `overflow-x` 非 visible 时，`overflow-y`
+ * 的 visible 会被**计算成 auto**——站点的 Radix ScrollArea 带内联 `overflow:scroll`，只写
+ * `overflow-y:visible` 会被这条规则原样打回去（llm-pro.cn 上实测如此）。打标只认**真有纵向溢出**的
+ * 元素，横向单轴滚动的长代码块压根不会被标上，所以两轴一起解不会伤到它们。
+ */
+export const SCROLLER_ATTR = 'data-pc-scroller'
+
 /** 常见 cookie / consent 横幅：固化时它们往往还在 DOM 里，阅读时只会盖住正文 */
 const CONSENT_SELECTORS = [
   '#onetrust-consent-sdk',
@@ -57,7 +70,9 @@ const CONSENT_SELECTORS = [
 export const READER_CSS = `
 html { overflow: hidden !important; height: auto !important; min-height: 0 !important; }
 body { height: auto !important; min-height: 0 !important; }
+html, body { overscroll-behavior: auto !important; touch-action: auto !important; }
 [data-pc-fixed] { position: static !important; }
+[${SCROLLER_ATTR}] { overflow: visible !important; max-height: none !important; height: auto !important; }
 [${HIDDEN_ATTR}] { display: none !important; }
 ${CONSENT_SELECTORS} { display: none !important; }
 .pc-placeholder { display: inline-block; padding: .5em .8em; border: 1px dashed #9a9a9a; border-radius: 6px; color: #666; font-size: .85em; }
@@ -86,6 +101,69 @@ const SHOW_TEXT = 4
 const FILTER_ACCEPT = 1
 const FILTER_REJECT = 2
 const FILTER_SKIP = 3
+
+
+// ---------------------------------------------------------------------------
+// 滚动：内部滚动容器与滚轮归属
+// ---------------------------------------------------------------------------
+
+/** 会响应滚轮的 overflow 取值（`hidden` 不响应用户滚动，不算陷阱） */
+const SCROLLABLE_OVERFLOW = /^(auto|scroll|overlay)$/
+
+/** 元素当前的纵向 overflow；跨 realm 取样式要用它自己那个 window */
+const overflowYOf = (el: Element): string => {
+  const view = el.ownerDocument?.defaultView
+  if (!view) return ''
+  try {
+    return String(view.getComputedStyle(el).overflowY || '')
+  } catch {
+    return ''
+  }
+}
+
+/** 元素在 `dy` 方向上还能不能滚：得是真滚动容器、有溢出、且没到那一端 */
+const canScrollBy = (el: Element, dy: number): boolean => {
+  if (!SCROLLABLE_OVERFLOW.test(overflowYOf(el))) return false
+  const max = el.scrollHeight - el.clientHeight
+  if (max <= 1) return false
+  return dy > 0 ? el.scrollTop < max - 1 : el.scrollTop > 1
+}
+
+/**
+ * 这一下滚轮该由 iframe 内部谁吃：从 `target` 往上找**当前方向上还能滚**的祖先（找到 `root` 为止，不含 root）。
+ *
+ * 返回元素 → 让浏览器自己滚它，转发桥不插手；返回 `null` → iframe 内没人能消费，
+ * 该由 WebSnapshotView 把这一下转发给外层滚动容器。
+ */
+export const wheelScrollTarget = (target: Node | null, deltaY: number, root: Element | null): Element | null => {
+  let node: Node | null = target
+  while (node && node !== root) {
+    if (isElement(node) && canScrollBy(node, deltaY)) return node
+    node = node.parentNode
+  }
+  return null
+}
+
+/**
+ * 给站点自带的纵向滚动容器补打 `data-pc-scroller`，返回打标个数。
+ *
+ * 只在渲染期做，不在抓取期做：捕获 iframe 的时间预算很紧（硬超时内还要做整篇序列化），
+ * 而这里不限时；顺带也让存量快照不必重新导入就能修好。只认**真的有纵向溢出**的元素：
+ * `overflow-x:auto` 的长代码块其 `overflow-y` 计算值也会变成 `auto`（CSS overflow 规范），
+ * 但它纵向没有溢出，不该被当成滚动容器。
+ */
+export const stampScrollers = (doc: Document): number => {
+  let n = 0
+  for (const el of Array.from(doc.querySelectorAll('*'))) {
+    if (el === doc.documentElement || el === doc.body) continue
+    if (el.hasAttribute(SCROLLER_ATTR)) continue
+    if (!SCROLLABLE_OVERFLOW.test(overflowYOf(el))) continue
+    if (el.scrollHeight - el.clientHeight <= 1) continue
+    el.setAttribute(SCROLLER_ATTR, '1')
+    n++
+  }
+  return n
+}
 
 
 // ---------------------------------------------------------------------------

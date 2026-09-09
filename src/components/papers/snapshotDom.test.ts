@@ -418,3 +418,154 @@ describe('hostRectInParent', () => {
     iframe.remove()
   })
 })
+
+// ---------------------------------------------------------------------------
+// 滚动：内部滚动容器与滚轮归属
+// ---------------------------------------------------------------------------
+
+/** 造一个带滚动度量的元素（happy-dom 没有布局，scrollHeight/clientHeight 得手动钉） */
+function scrollBox(opts: { overflowY?: string; overflowX?: string; scrollHeight: number; clientHeight: number; scrollTop?: number }): HTMLElement {
+  const el = document.createElement('div')
+  if (opts.overflowY) el.style.overflowY = opts.overflowY
+  if (opts.overflowX) el.style.overflowX = opts.overflowX
+  Object.defineProperty(el, 'scrollHeight', { value: opts.scrollHeight, configurable: true })
+  Object.defineProperty(el, 'clientHeight', { value: opts.clientHeight, configurable: true })
+  el.scrollTop = opts.scrollTop ?? 0
+  return el
+}
+
+describe('READER_CSS 滚动复位', () => {
+  it('解除站点的 overscroll-behavior / touch-action，并解除内部纵向滚动口', () => {
+    // 站点的 `html{overscroll-behavior-y:none}` 会掐断滚动链式传递，触摸板整页滚不动
+    expect(mod.READER_CSS).toMatch(/html, body \{[^}]*overscroll-behavior: auto !important/)
+    expect(mod.READER_CSS).toMatch(/html, body \{[^}]*touch-action: auto !important/)
+    // 两轴一起解：overflow-x 非 visible 时规范会把 overflow-y:visible 计算成 auto，只解纵向会被打回
+    expect(mod.READER_CSS).toContain(
+      '[data-pc-scroller] { overflow: visible !important; max-height: none !important; height: auto !important; }',
+    )
+  })
+})
+
+describe('wheelScrollTarget', () => {
+  const root = () => document.documentElement
+
+  it('没有可滚祖先：返回 null（该转发给外层容器）', () => {
+    const p = document.createElement('p')
+    document.body.appendChild(p)
+    expect(mod.wheelScrollTarget(p, 120, root())).toBeNull()
+    p.remove()
+  })
+
+  it('祖先还能往下滚：让位给它', () => {
+    const box = scrollBox({ overflowY: 'auto', scrollHeight: 2940, clientHeight: 611, scrollTop: 0 })
+    const inner = document.createElement('span')
+    box.appendChild(inner)
+    document.body.appendChild(box)
+    expect(mod.wheelScrollTarget(inner, 120, root())).toBe(box)
+    box.remove()
+  })
+
+  it('祖先已滚到底：向下返回 null（转发），向上仍让位', () => {
+    const box = scrollBox({ overflowY: 'scroll', scrollHeight: 2940, clientHeight: 611, scrollTop: 2329 })
+    const inner = document.createElement('span')
+    box.appendChild(inner)
+    document.body.appendChild(box)
+    expect(mod.wheelScrollTarget(inner, 120, root())).toBeNull()
+    expect(mod.wheelScrollTarget(inner, -120, root())).toBe(box)
+    box.remove()
+  })
+
+  it('overflow:hidden 不响应用户滚动，不算陷阱', () => {
+    const box = scrollBox({ overflowY: 'hidden', scrollHeight: 2940, clientHeight: 611, scrollTop: 0 })
+    const inner = document.createElement('span')
+    box.appendChild(inner)
+    document.body.appendChild(box)
+    expect(mod.wheelScrollTarget(inner, 120, root())).toBeNull()
+    box.remove()
+  })
+
+  it('走到 root 就停：root 自己不作为让位目标', () => {
+    const box = scrollBox({ overflowY: 'auto', scrollHeight: 2940, clientHeight: 611, scrollTop: 0 })
+    const inner = document.createElement('span')
+    box.appendChild(inner)
+    document.body.appendChild(box)
+    // 以 box 自己为 root：向上找不到别人
+    expect(mod.wheelScrollTarget(inner, 120, box)).toBeNull()
+    box.remove()
+  })
+
+  it('文本节点作为 target 也能向上找（滚轮 target 未必是元素）', () => {
+    const box = scrollBox({ overflowY: 'auto', scrollHeight: 2940, clientHeight: 611, scrollTop: 0 })
+    const text = document.createTextNode('hi')
+    box.appendChild(text)
+    document.body.appendChild(box)
+    expect(mod.wheelScrollTarget(text, 120, root())).toBe(box)
+    box.remove()
+  })
+})
+
+/** 生产里 stampScrollers 拿到的是 iframe 的 contentDocument；createHTMLDocument 没有 defaultView，取不到计算样式 */
+function iframeDoc(): { doc: Document; done: () => void } {
+  const f = document.createElement('iframe')
+  document.body.appendChild(f)
+  const doc = f.contentDocument as Document
+  return { doc, done: () => f.remove() }
+}
+
+describe('stampScrollers', () => {
+  it('给真有纵向溢出的滚动容器打标，返回个数', () => {
+    const { doc, done } = iframeDoc()
+    const box = doc.createElement('div')
+    box.style.overflowY = 'auto'
+    Object.defineProperty(box, 'scrollHeight', { value: 2940, configurable: true })
+    Object.defineProperty(box, 'clientHeight', { value: 611, configurable: true })
+    doc.body.appendChild(box)
+    expect(mod.stampScrollers(doc)).toBe(1)
+    expect(box.getAttribute('data-pc-scroller')).toBe('1')
+    // 幂等：已打标的不重复计数
+    expect(mod.stampScrollers(doc)).toBe(0)
+    done()
+  })
+
+  it('overflow-x:auto 的长代码块纵向没溢出，不打标', () => {
+    const { doc, done } = iframeDoc()
+    const pre = doc.createElement('pre')
+    // CSS overflow 规范：overflow-x 非 visible 时 overflow-y 的 visible 计算成 auto
+    pre.style.overflowX = 'auto'
+    pre.style.overflowY = 'auto'
+    Object.defineProperty(pre, 'scrollHeight', { value: 40, configurable: true })
+    Object.defineProperty(pre, 'clientHeight', { value: 40, configurable: true })
+    doc.body.appendChild(pre)
+    expect(mod.stampScrollers(doc)).toBe(0)
+    expect(pre.hasAttribute('data-pc-scroller')).toBe(false)
+    done()
+  })
+
+  it('两轴都 scroll 且真有纵向溢出：照样打标（站点 Radix ScrollArea 的形状）', () => {
+    const { doc, done } = iframeDoc()
+    const area = doc.createElement('div')
+    // 站点写的是内联 `overflow:scroll` 简写；happy-dom 不把简写展开到 overflowY，这里写成等价的长写法
+    // （真实 Chrome 会展开——llm-pro.cn 上这个元素确实被打上了 data-pc-scroller）
+    area.style.overflowX = 'scroll'
+    area.style.overflowY = 'scroll'
+    Object.defineProperty(area, 'scrollHeight', { value: 2941, configurable: true })
+    Object.defineProperty(area, 'clientHeight', { value: 480, configurable: true })
+    doc.body.appendChild(area)
+    expect(mod.stampScrollers(doc)).toBe(1)
+    expect(area.getAttribute('data-pc-scroller')).toBe('1')
+    done()
+  })
+
+  it('不碰 html / body（整页的滚动口由 READER_CSS 统一管）', () => {
+    const { doc, done } = iframeDoc()
+    for (const el of [doc.documentElement, doc.body]) {
+      ;(el as HTMLElement).style.overflowY = 'auto'
+      Object.defineProperty(el, 'scrollHeight', { value: 9999, configurable: true })
+      Object.defineProperty(el, 'clientHeight', { value: 600, configurable: true })
+    }
+    expect(mod.stampScrollers(doc)).toBe(0)
+    expect(doc.documentElement.hasAttribute('data-pc-scroller')).toBe(false)
+    expect(doc.body.hasAttribute('data-pc-scroller')).toBe(false)
+    done()
+  })
+})
