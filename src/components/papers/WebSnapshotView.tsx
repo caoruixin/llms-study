@@ -76,6 +76,8 @@ interface Bound {
 
 /** iframe 高度上限：防御未知的高度回环（vh 已在水合时钉死，正常文档远达不到） */
 const MAX_HEIGHT_PX = 400_000
+/** 等文档解析就绪的轮询间隔：只在绑定前跑，绑上即停 */
+const BIND_POLL_MS = 50
 const EMPTY_HIGHLIGHTS: ReadonlyMap<number, readonly PaperHighlight[]> = new Map()
 
 const cssEscape = (s: string): string =>
@@ -195,6 +197,8 @@ export default function WebSnapshotView({
     const doc = iframe?.contentDocument
     const win = iframe?.contentWindow
     if (!iframe || !doc || !win) return
+    // 同一份文档只绑一次：解析就绪的轮询与 load 事件都会走到这里
+    if (boundRef.current?.doc === doc) return
     boundRef.current?.cleanup()
     boundRef.current = null
     // srcdoc 赋值前的 about:blank 首载：没有阅读器样式就不是我们的文档
@@ -277,6 +281,30 @@ export default function WebSnapshotView({
     callbacks.current.onSelectionSource?.(source)
     callbacks.current.onReady?.(api)
   }, [decoded, api, scrollMainTo])
+
+  /**
+   * 绑定时机：文档**解析完毕**即可，不等 `load`。
+   *
+   * `load` 要等文档里所有子资源落地——快照里只要留下一个够不着的远程资源（站点自己的字体
+   * CDN 打不通就够了），readyState 会永远停在 `interactive`，load 永不触发，整个阅读器卡死在
+   * 「正在渲染网页原貌…」：高度停在占位的 60vh 把正文裁掉，译文/高亮/可见块也全都绑不上。
+   * 轮询而不用 rAF：后台标签页里 rAF 会被挂起，同一份快照在别的 tab 打开就永远不绑。
+   */
+  useEffect(() => {
+    if (srcdoc === null) return
+    let timer = 0
+    const tick = (): void => {
+      const doc = iframeRef.current?.contentDocument
+      // readyState 过了 loading 才算解析完；样式在则说明这是我们写进去的那份文档（不是首载的 about:blank）
+      if (doc && doc.readyState !== 'loading' && doc.getElementById(READER_STYLE_ID)) {
+        handleLoad()
+        if (boundRef.current?.doc === doc) return
+      }
+      timer = window.setTimeout(tick, BIND_POLL_MS)
+    }
+    tick()
+    return () => window.clearTimeout(timer)
+  }, [srcdoc, handleLoad])
 
   // 卸载：解绑文档（RO / 点击拦截 / 选区源注销）
   useEffect(

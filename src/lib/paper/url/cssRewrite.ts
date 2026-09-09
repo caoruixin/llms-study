@@ -201,6 +201,10 @@ function scanCss(css: string): ScannedToken[] {
       i = e < 0 ? css.length : e + 2
       continue
     }
+    // 转义优先于引号：选择器里的 `\'` / `\"` 是**被转义的字符**，不是字符串开头。
+    // Tailwind 的任意值工具类（`.bg-\[url\(\'…\'\)\]`）满页都是这种写法，误当字符串会
+    // 一路吞到下一个引号，把其后整段样式表（连同 @font-face 与背景图）从扫描结果里抹掉。
+    if (c === '\\') { i += 2; continue }
     if (c === '"' || c === "'") { i = skipString(css, i); continue }
     if (c === '{') { stack.push(pendingAt); pendingAt = ''; i++; continue }
     if (c === '}') { stack.pop(); pendingAt = ''; i++; continue }

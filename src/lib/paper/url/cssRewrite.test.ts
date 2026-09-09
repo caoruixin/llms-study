@@ -55,6 +55,28 @@ describe('collectCssRefs', () => {
     ])
   })
 
+  it('选择器里被转义的引号不当字符串开头（Tailwind 任意值工具类）', () => {
+    // `.bg-[url('…')]` 转义后满是 \' \" ——误判成字符串会一路吞到下一个引号，
+    // 把其后整段样式表（@font-face、背景图）从扫描结果里抹掉。
+    const css = [
+      String.raw`.bg-\[url\(\'https\:\/\/cdn.example\/a\.png\'\)\]{background-image:url(https://cdn.example/a.png)}`,
+      String.raw`.bg-\[url\(\"https\:\/\/cdn.example\/b\.png\"\)\]{background-image:url(https://cdn.example/b.png)}`,
+      '@font-face{font-family:F;src:url(https://cdn.example/f.woff2) format("woff2")}',
+      '.tail{background:url(tail.png)}',
+    ].join('')
+    expect(collectCssRefs(css, BASE).map((r) => [r.abs, r.isFont])).toEqual([
+      ['https://cdn.example/a.png', false],
+      ['https://cdn.example/b.png', false],
+      ['https://cdn.example/f.woff2', true],
+      ['https://site.example/assets/css/tail.png', false],
+    ])
+  })
+
+  it('转义引号之后的相对 url() 仍被绝对化', () => {
+    const css = String.raw`.bg-\[url\(\'x\'\)\]{color:red}.c{background:url(../img/rel.png)}`
+    expect(absolutizeCssUrls(css, BASE)).toContain('https://site.example/assets/img/rel.png')
+  })
+
   it('注释与字符串里的 url( 不算引用', () => {
     const css = [
       '/* 旧版写法：url(https://old.example/legacy.png) */',
