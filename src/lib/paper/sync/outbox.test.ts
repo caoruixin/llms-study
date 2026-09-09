@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import type { OutboxItem } from '../repo/db'
-import { SYNC_BATCH_MAX_CHANGES, chunkRows, planOutbox, recordKey } from './outbox'
+import { SYNC_CHANNEL_NAME } from './crossTab'
+import { SYNC_BATCH_MAX_CHANGES, chunkRows, outboxSignal, planOutbox, recordKey } from './outbox'
 
 let seq = 0
 const item = (overrides: Partial<OutboxItem>): OutboxItem => ({
@@ -96,5 +97,68 @@ describe('chunkRows', () => {
   it('按字节软上限切批（单行超限自成一批，不会死循环）', () => {
     const rows = [{ t: 'x'.repeat(100) }, { t: 'y'.repeat(100) }]
     expect(chunkRows(rows, 10, 150).map((c) => c.length)).toEqual([1, 1])
+  })
+})
+
+describe('outboxSignal 跨 tab（§1.1）', () => {
+  const channels: BroadcastChannel[] = []
+  const offs: (() => void)[] = []
+  afterEach(() => {
+    for (const c of channels.splice(0)) c.close()
+    for (const off of offs.splice(0)) off()
+  })
+  const otherTab = (): BroadcastChannel => {
+    const ch = new BroadcastChannel(SYNC_CHANNEL_NAME)
+    ;(ch as { unref?: () => void }).unref?.()
+    channels.push(ch)
+    return ch
+  }
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const waitFor = async (pred: () => boolean, timeoutMs = 1000): Promise<void> => {
+    const start = Date.now()
+    while (!pred()) {
+      if (Date.now() - start > timeoutMs) throw new Error('waitFor 超时')
+      await sleep(5)
+    }
+  }
+
+  it('远端 enqueued 消息 → 本地监听器收到合成项：op/paperId 照搬、createdAt 为当下、无 payload', async () => {
+    const got: { dbName: string; item: OutboxItem }[] = []
+    offs.push(outboxSignal.on((dbName, it) => got.push({ dbName, item: it })))
+    const before = Date.now()
+    otherTab().postMessage({ kind: 'enqueued', dbName: 'paper-copilot-u7', op: 'progress', paperId: 'pX' })
+    await waitFor(() => got.length >= 1)
+
+    expect(got[0].dbName).toBe('paper-copilot-u7')
+    expect(got[0].item).toMatchObject({ op: 'progress', paperId: 'pX' })
+    expect(got[0].item.payload).toBeUndefined()
+    expect(got[0].item.qid).toBeUndefined()
+    expect(got[0].item.createdAt).toBeGreaterThanOrEqual(before)
+  })
+
+  it('畸形/非 enqueued 消息不触发监听器', async () => {
+    const got: OutboxItem[] = []
+    offs.push(outboxSignal.on((_db, it) => got.push(it)))
+    const tab = otherTab()
+    tab.postMessage(null)
+    tab.postMessage({ kind: 'enqueued', dbName: 'd' }) // 缺 op/paperId
+    tab.postMessage({ kind: 'enqueued', dbName: 'd', op: 'bogus', paperId: 'p' })
+    tab.postMessage({ kind: 'flushed', dbName: 'd' })
+    tab.postMessage({ kind: 'pulled', dbName: 'd', paperIds: ['p'], tables: ['blocks'] })
+    await sleep(30)
+    expect(got).toEqual([])
+  })
+
+  it('本地 emit → 本地监听器带完整项；同时广播到其它 tab 的消息不带 payload', async () => {
+    const local: OutboxItem[] = []
+    offs.push(outboxSignal.on((_db, it) => local.push(it)))
+    const remote: unknown[] = []
+    otherTab().addEventListener('message', (ev) => remote.push((ev as MessageEvent).data))
+
+    const full = item({ op: 'progress', paperId: 'pY', payload: { secret: 1 } })
+    outboxSignal.emit('db-a', full)
+    expect(local).toEqual([full])
+    await waitFor(() => remote.length >= 1)
+    expect(remote[0]).toEqual({ kind: 'enqueued', dbName: 'db-a', op: 'progress', paperId: 'pY' })
   })
 })

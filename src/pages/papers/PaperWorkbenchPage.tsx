@@ -5,8 +5,9 @@ import ConsentDialog from '../../components/papers/ConsentDialog'
 import HighlightActions from '../../components/papers/HighlightActions'
 import OutlinePane, { buildOutline, type HighlightListItem, type OutlineTab } from '../../components/papers/OutlinePane'
 import PdfViewer from '../../components/papers/PdfViewer'
-import SelectionActions from '../../components/papers/SelectionActions'
+import SelectionActions, { type SelectionSource } from '../../components/papers/SelectionActions'
 import VoiceMicBall from '../../components/papers/VoiceMicBall'
+import WebSnapshotView, { type WebSnapshotApi } from '../../components/papers/WebSnapshotView'
 import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
 import Drawer from '../../components/ui/Drawer'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
@@ -25,6 +26,7 @@ import { captureHighlightRanges } from '../../lib/paper/highlight/selectionOffse
 import { useHighlights } from '../../lib/paper/highlight/useHighlights'
 import { estimateTranslationCost } from '../../lib/paper/translate/translateBatch'
 import { useTranslations } from '../../lib/paper/translate/useTranslations'
+import { WEB_SNAPSHOT_MIME } from '../../lib/paper/url/webSnapshotMime'
 import { getVoiceConfig, type VoiceConfigResp } from '../../lib/paper/voice/voiceApi'
 import {
   buildViewportContext,
@@ -44,6 +46,7 @@ import {
   type CopilotWidth,
   type PaperAskAction,
 } from './paperUiStore'
+import { isHollow, needsRemotePull } from './workbenchLoad'
 
 /**
  * 阅读工作台（§3.3）：左栏目录/进度/搜索 · 中栏正文阅读器 · 右栏 Copilot（Phase 3 接入）。
@@ -69,6 +72,21 @@ const MODE_TABS_SHORT = [
   { id: 'original', label: 'PDF' },
   { id: 'text', label: '文本' },
 ] as const satisfies readonly { readonly id: ReaderMode; readonly label: string }[]
+
+/** 网页原貌快照（mime = WEB_SNAPSHOT_MIME 的 html 论文）：original = 整页 iframe，text = 语义化块视图 */
+const SNAPSHOT_MODE_TABS = [
+  { id: 'original', label: '网页原貌' },
+  { id: 'text', label: '文本视图' },
+] as const satisfies readonly { readonly id: ReaderMode; readonly label: string }[]
+
+const SNAPSHOT_MODE_TABS_SHORT = [
+  { id: 'original', label: '原貌' },
+  { id: 'text', label: '文本' },
+] as const satisfies readonly { readonly id: ReaderMode; readonly label: string }[]
+
+/** 有「原版」视图的论文：PDF 或网页原貌快照 */
+const hasOriginalView = (record: PaperRecord | null | undefined): boolean =>
+  record?.format === 'pdf' || record?.mime === WEB_SNAPSHOT_MIME
 
 /** 正文语言三态（全文翻译）：与 ReaderMode 正交，只作用于语义化视图 */
 const LANG_TABS = [
@@ -135,6 +153,8 @@ export default function PaperWorkbenchPage() {
   const [loading, setLoading] = useState(true)
   /** 换设备补拉进行中（papers 行或 blocks 从服务端拉取） */
   const [pullingRemote, setPullingRemote] = useState(false)
+  /** 「重新拉取」计数：进装载 effect 依赖，递增即重跑一轮按篇补拉（空心论文可反复重试） */
+  const [pullTick, setPullTick] = useState(0)
   const [mode, setMode] = useState<ReaderMode>('text')
   const [langMode, setLangMode] = useState<LangMode>('orig')
   /** 首次在本篇切非原文时的一次性成本提示：unseen → show → dismissed（按论文重置） */
@@ -155,6 +175,10 @@ export default function PaperWorkbenchPage() {
   const readerRef = useRef<HTMLElement | null>(null)
   const restoredFor = useRef<string | null>(null)
   const alignedKey = useRef('')
+  /** 网页原貌视图的命令式 API（iframe 文档载入后回传；切走视图后调用返回 false，无副作用） */
+  const snapshotApiRef = useRef<WebSnapshotApi | null>(null)
+  /** 快照 iframe 文档作为选区源（SelectionActions / HighlightActions 逐文档挂监听） */
+  const [snapshotSource, setSnapshotSource] = useState<SelectionSource | null>(null)
   /** 全视口可见块区间（BlockReader 第二观察器上报）：只被语音提问的快照读取，不驱动渲染 */
   const visibleRangeRef = useRef<BlockRange | null>(null)
   /** 服务端语音配置：null = 尚未取到（球不渲染），{enabled:false} = 未开启 */
@@ -225,7 +249,17 @@ export default function PaperWorkbenchPage() {
 
   useEffect(() => {
     if (!paperId) return
+    // 登录态未定（冷启动深链）：getPaperDb() 此刻还指向游客库，读了只会闪一下「找不到这篇论文」。
+    // refresh() 必定收敛到 authed|anon（authStore.ts:54-68），停在加载态等它，authed 后本 effect 重跑。
+    if (authStatus === 'unknown') {
+      setLoading(true)
+      return
+    }
     let alive = true
+    // 每次重跑都从加载态起步：换论文/登录态变化/「重新拉取」都要看到「正在加载/正在同步」，
+    // 而不是把上一轮的正文与「0 段」空态挂在屏幕上
+    setLoading(true)
+    setPullingRemote(false)
     void (async () => {
       try {
         if (authStatus === 'authed') {
@@ -239,20 +273,20 @@ export default function PaperWorkbenchPage() {
           }
         }
         let [record, list] = await Promise.all([repo.getPaper(paperId), repo.getBlocks(paperId)])
-        // 换设备补拉：papers 行或 blocks 本地缺失且已登录 → 按论文从服务端拉一轮，
-        // 写回本地后既有「chunks 缺失补建」effect 会自动重建索引
-        if (authStatus === 'authed' && (!record || (record.status === 'ready' && list.length === 0))) {
-          const meta = await getPaperDb().syncMeta.get(paperId)
-          if (!record || meta?.blocksPulled !== true) {
-            if (alive) setPullingRemote(true)
-            try {
-              await getSyncEngine()?.pullPaper(paperId)
-              ;[record, list] = await Promise.all([repo.getPaper(paperId), repo.getBlocks(paperId)])
-            } catch {
-              /* 拉取失败静默：按本地现状渲染（找不到/空正文提示自然出现） */
-            } finally {
-              if (alive) setPullingRemote(false)
-            }
+        // 换设备补拉：papers 行缺失或正文块不齐且已登录 → 按论文从服务端拉一轮，
+        // 写回本地后既有「chunks 缺失补建」effect 会自动重建索引。
+        // 判定走 workbenchLoad.needsRemotePull（纯函数 + 表驱动单测），且**不再锁存**：
+        // 旧的 `meta?.blocksPulled !== true` 门槛会把「拉到 0 块」永久化（pullPaper 拉空也置 true），
+        // 原设备补推 blocks 之后接收端永远不会再试。
+        if (needsRemotePull({ authStatus, record, localBlocks: list.length })) {
+          if (alive) setPullingRemote(true)
+          try {
+            await getSyncEngine()?.pullPaper(paperId)
+            ;[record, list] = await Promise.all([repo.getPaper(paperId), repo.getBlocks(paperId)])
+          } catch {
+            /* 拉取失败静默：按本地现状渲染（找不到/空心面板自然出现） */
+          } finally {
+            if (alive) setPullingRemote(false)
           }
         }
         // blocks 经批量 pullSince 到齐的设备上,pullPaper 没跑过、blocksPulled 一直是 false
@@ -269,8 +303,8 @@ export default function PaperWorkbenchPage() {
           const p = record.progress
           setPosition({ blockIndex: p?.blockIndex ?? 0, page: p?.page })
           setMaxBlockIndex(Math.max(p?.maxBlockIndex ?? 0, p?.blockIndex ?? 0))
-          // 非 PDF（DOCX / URL 导入的 html）只有语义化视图；PDF 恢复上次用的视图，默认原版
-          setMode(record.format !== 'pdf' ? 'text' : (p?.mode ?? 'original'))
+          // DOCX / 阅读模式 html 只有语义化视图；PDF 与网页原貌快照恢复上次用的视图，默认原版
+          setMode(hasOriginalView(record) ? (p?.mode ?? 'original') : 'text')
           // 语言三态与视图正交：恢复上次的语言（只在文本视图生效）；成本提示按论文重置
           setLangMode(p?.lang ?? 'orig')
           setCostNotice(p?.lang && p.lang !== 'orig' ? 'dismissed' : 'unseen')
@@ -282,7 +316,8 @@ export default function PaperWorkbenchPage() {
     return () => {
       alive = false
     }
-  }, [paperId, repo, authStatus, userId])
+    // pullTick：空心面板的「重新拉取」递增即重跑本 effect（restoredFor 不复位，位置恢复不重复做）
+  }, [paperId, repo, authStatus, userId, pullTick])
 
   // 「启动 Copilot」入口带 ?copilot=open（HashRouter 下 query 在 hash 内，useSearchParams 正常工作）。
   // 只在首次挂载生效一次：否则用户手动收起后，任何一次 searchParams 变化都会把面板重新弹开。
@@ -397,6 +432,10 @@ export default function PaperWorkbenchPage() {
   positionRef.current = position
   const formatRef = useRef(paper?.format ?? 'pdf')
   formatRef.current = paper?.format ?? 'pdf'
+  // mime 随 papers 行同步：只拉到 blocks 的设备也能立刻判定是快照（原貌视图再懒拉文件）
+  const isSnapshot = paper?.mime === WEB_SNAPSHOT_MIME
+  const isSnapshotRef = useRef(isSnapshot)
+  isSnapshotRef.current = isSnapshot
   const readerHiddenRef = useRef(readerHidden)
   readerHiddenRef.current = readerHidden
   /** 跳转触发的展开由 scrollToAnchor 自己接管滚动，别让「手动恢复正文」的重对齐再抢一次 */
@@ -433,7 +472,11 @@ export default function PaperWorkbenchPage() {
   )
 
   const scrollToAnchor = useCallback((anchor: Partial<SourceAnchor> | null | undefined): ScrollTarget => {
-    const target = resolveAnchor(anchor, anchorCtxRef.current, modeRef.current)
+    // 网页原貌：块精度（快照的块与文本视图同一套），滚动交给 iframe 视图的 API；mode 仍报 original
+    const snapshotOriginal = modeRef.current === 'original' && isSnapshotRef.current
+    const target = snapshotOriginal
+      ? { ...resolveAnchor(anchor, anchorCtxRef.current, 'text'), mode: 'original' as const }
+      : resolveAnchor(anchor, anchorCtxRef.current, modeRef.current)
     const domId = target.domId
     // 专注陪读下正文是 display:none：目标元素没有布局，必须先展开、等两帧排版完成再滚
     const expanding = readerHiddenRef.current
@@ -441,7 +484,14 @@ export default function PaperWorkbenchPage() {
       jumpExpandRef.current = true
       setReaderCollapsed(false)
     }
-    if (domId) {
+    if (snapshotOriginal) {
+      const idx = target.blockIndex
+      if (idx !== undefined) {
+        const go = () => snapshotApiRef.current?.scrollToBlock(idx, { flash: true, behavior: 'smooth' })
+        if (expanding) requestAnimationFrame(() => requestAnimationFrame(go))
+        else go()
+      }
+    } else if (domId) {
       if (expanding) requestAnimationFrame(() => requestAnimationFrame(() => scrollAndFlash(domId)))
       else scrollAndFlash(domId)
     }
@@ -468,11 +518,21 @@ export default function PaperWorkbenchPage() {
   /** 内容就绪 / 切换视图后，把滚动位置对齐到当前阅读位置（不高亮，避免每次进页面都闪一下） */
   const alignToPosition = useCallback(() => {
     const pos = positionRef.current
+    const snapshotOriginal = modeRef.current === 'original' && isSnapshotRef.current
     const target = resolveAnchor(
       { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
       anchorCtxRef.current,
-      modeRef.current,
+      snapshotOriginal ? 'text' : modeRef.current,
     )
+    if (snapshotOriginal) {
+      const idx = target.blockIndex
+      if (idx === undefined) return
+      // 两帧后再滚：等 iframe 文档完成首次布局与高度同步
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => snapshotApiRef.current?.scrollToBlock(idx, { behavior: 'auto' }))
+      })
+      return
+    }
     if (!target.domId) return
     const domId = target.domId
     // 两帧后再滚：等占位页 / content-visibility 块完成首次布局
@@ -499,13 +559,16 @@ export default function PaperWorkbenchPage() {
     setMode(next)
   }, [])
 
-  /** 语言切换（与视图正交）：PDF 原版视图下点中文/对照自动转文本视图——译文只在语义化视图渲染 */
+  /**
+   * 语言切换（与视图正交）：PDF 原版视图下点中文/对照自动转文本视图——译文只在语义化视图渲染；
+   * 网页原貌视图能就地挂译文（WebSnapshotView 的 applyLangState），不切视图。
+   */
   const changeLang = useCallback(
     (next: LangMode) => {
       setLangMode(next)
       if (next === 'orig') return
       setCostNotice((s) => (s === 'unseen' ? 'show' : s))
-      if (modeRef.current === 'original') {
+      if (modeRef.current === 'original' && !isSnapshotRef.current) {
         changeMode('text')
         setToast('已切换到文本视图显示译文')
       }
@@ -546,6 +609,27 @@ export default function PaperWorkbenchPage() {
     if (paperId) alignOnce(`${paperId}:original`)
   }, [alignOnce, paperId])
 
+  /** 快照 iframe 文档就绪：记下 API，再把阅读位置接上（与 PDF 的 onLoaded 同一 aligned 键） */
+  const handleSnapshotReady = useCallback(
+    (api: WebSnapshotApi) => {
+      snapshotApiRef.current = api
+      if (paperId) alignOnce(`${paperId}:original`)
+    },
+    [alignOnce, paperId],
+  )
+
+  /**
+   * 选区源：父文档的阅读列永远在；快照 iframe 文档载入后追加（SelectionActions / HighlightActions
+   * 按本函数的引用变化重挂监听——只随 snapshotSource 变）。
+   */
+  const getSelectionSources = useCallback((): SelectionSource[] => {
+    const out: SelectionSource[] = []
+    const main = readerRef.current
+    if (main) out.push({ doc: document, container: main, offset: () => ({ x: 0, y: 0 }) })
+    if (snapshotSource) out.push(snapshotSource)
+    return out
+  }, [snapshotSource])
+
   // ---------------------------------------------------------------------
   // 阅读位置跟踪与持久化
   // ---------------------------------------------------------------------
@@ -576,9 +660,15 @@ export default function PaperWorkbenchPage() {
   const totalBlocks = blocks.length
   const ratio = totalBlocks ? Math.min(1, (maxBlockIndex + 1) / totalBlocks) : 0
 
+  // 视图/语言切换立刻落库（不等 600ms 防抖）：切完就刷新页面也要恢复到刚选的视图；
+  // 阅读位置仍按防抖写，滚动时不会每帧写库
+  const persistedViewKey = useRef('')
   useEffect(() => {
     if (!paperId || !totalBlocks || loading) return
+    const viewKey = `${paperId}:${mode}:${langMode}`
+    const delay = persistedViewKey.current === viewKey ? PROGRESS_DEBOUNCE_MS : 0
     const timer = setTimeout(() => {
+      persistedViewKey.current = viewKey
       void repo
         .updateProgress(paperId, {
           blockIndex: position.blockIndex,
@@ -590,7 +680,7 @@ export default function PaperWorkbenchPage() {
           updatedAt: Date.now(),
         })
         .catch(() => undefined)
-    }, PROGRESS_DEBOUNCE_MS)
+    }, delay)
     return () => clearTimeout(timer)
   }, [paperId, repo, loading, totalBlocks, position.blockIndex, position.page, maxBlockIndex, ratio, mode, langMode])
 
@@ -599,17 +689,18 @@ export default function PaperWorkbenchPage() {
   // ---------------------------------------------------------------------
 
   const anchorFromElement = useCallback((el: Element): SourceAnchor | null => {
+    // 不用 instanceof HTMLElement：快照 iframe 的元素属于另一个 realm，父窗口的构造器认不出
     const holder = el.closest('[data-block-index], [data-page]')
-    if (!(holder instanceof HTMLElement)) return null
+    if (!holder) return null
     const kind = formatRef.current
-    const rawBlock = holder.dataset.blockIndex
-    if (rawBlock !== undefined) {
+    const rawBlock = holder.getAttribute('data-block-index')
+    if (rawBlock !== null) {
       const blockIndex = Number(rawBlock)
       const block = blockByIndexRef.current[blockIndex]
       return { kind, blockIndex, page: block?.anchor.page, section: block?.anchor.section }
     }
     // 原版 PDF：文字层 span 的最近祖先是页容器，锚点精度只到页
-    const page = Number(holder.dataset.page)
+    const page = Number(holder.getAttribute('data-page'))
     const blockIndex = anchorCtxRef.current.firstBlockOfPage[page]
     return {
       kind,
@@ -636,7 +727,11 @@ export default function PaperWorkbenchPage() {
 
   const handleHighlight = useCallback(
     (range: Range) => {
-      const container = readerRef.current
+      // 网页原貌：选区在 iframe 文档里，容器取 iframe body（Range 与容器必须同文档）
+      const container =
+        modeRef.current === 'original' && isSnapshotRef.current
+          ? snapshotApiRef.current?.container()
+          : readerRef.current
       if (!container) return
       const captured = captureHighlightRanges(range, container)
       if (captured.length && addCaptured(captured, (i) => blockByIndexRef.current[i]?.id) > 0) {
@@ -645,8 +740,9 @@ export default function PaperWorkbenchPage() {
         // 起点不在高亮宿主内（表格等），或选中的全是空白
         setToast('这段内容暂不支持高亮')
       }
-      // 无论成败都清选区：快捷条已关闭，残留选区只会挡住刚生效的 mark
-      window.getSelection()?.removeAllRanges()
+      // 无论成败都清选区（选区所在文档的 selection，iframe 的选区不在父 window 上）：
+      // 快捷条已关闭，残留选区只会挡住刚生效的 mark
+      ;(range.startContainer.ownerDocument?.getSelection() ?? window.getSelection())?.removeAllRanges()
     },
     [addCaptured],
   )
@@ -733,10 +829,13 @@ export default function PaperWorkbenchPage() {
       const sel = window.getSelection()
       const container = readerRef.current
       const anchorNode = sel?.anchorNode ?? null
+      // 网页原貌：选区活在 iframe 窗口里，父 window 的 selection 看不到它
       const selection =
-        sel && !sel.isCollapsed && container && anchorNode && container.contains(anchorNode)
-          ? sel.toString().trim().slice(0, MAX_ASK_TEXT)
-          : ''
+        modeRef.current === 'original' && isSnapshotRef.current
+          ? (snapshotApiRef.current?.selectionText() ?? '').slice(0, MAX_ASK_TEXT)
+          : sel && !sel.isCollapsed && container && anchorNode && container.contains(anchorNode)
+            ? sel.toString().trim().slice(0, MAX_ASK_TEXT)
+            : ''
 
       const viewport = buildViewportContext(blockList, range, {
         selection: selection || null,
@@ -919,7 +1018,7 @@ export default function PaperWorkbenchPage() {
             </button>
             <h1 className="min-w-0 flex-1 truncate text-base font-bold md:flex-none md:text-xl">{paper.title}</h1>
             <p className="hidden text-xs text-dim md:block">
-              {FORMAT_LABEL[paper.format]}
+              {isSnapshot ? '网页原貌' : FORMAT_LABEL[paper.format]}
               {paper.pageCount ? ` · ${paper.pageCount} 页` : ''} · {totalBlocks} 段 · 已读 {Math.round(ratio * 100)}%
               {position.page !== undefined ? ` · 当前第 ${position.page} 页` : ''}
             </p>
@@ -928,6 +1027,13 @@ export default function PaperWorkbenchPage() {
           <div className="flex w-full items-center gap-2 md:w-auto md:flex-wrap">
             {paper.format === 'pdf' && (
               <SegmentedTabs tabs={isTablet ? MODE_TABS : MODE_TABS_SHORT} value={mode} onChange={changeMode} />
+            )}
+            {isSnapshot && (
+              <SegmentedTabs
+                tabs={isTablet ? SNAPSHOT_MODE_TABS : SNAPSHOT_MODE_TABS_SHORT}
+                value={mode}
+                onChange={changeMode}
+              />
             )}
             {/* 语言三态与视图正交；敏感论文禁用（灰化 + title，内层 pointer-events-none 让悬停落在外层出提示） */}
             <div
@@ -954,6 +1060,17 @@ export default function PaperWorkbenchPage() {
                 className="rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2"
               >
                 {outlineOpen ? '收起目录' : '展开目录'}
+              </button>
+            )}
+            {/* 单链接 URL 论文可原地重导成网页原貌快照（多链接合集会丢页，不给入口；论文库 ?reimport 弹窗接手；手机工具行无预算，md+ 才显示） */}
+            {paper.format === 'html' && paper.source?.type === 'url' && paper.source.entries.length === 1 && (
+              <button
+                type="button"
+                onClick={() => navigate(`/papers?reimport=${encodeURIComponent(paper.id)}`)}
+                title="用原网址重新抓取整页样式与图片，替换这篇的正文（保留 Copilot 会话与阅读进度）"
+                className="hidden rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:block"
+              >
+                重新导入（网页原貌）
               </button>
             )}
             {/* 布局控件放 header：与「收起目录」同列，不动 CopilotPanel 内部，也不污染手机端 */}
@@ -1031,18 +1148,68 @@ export default function PaperWorkbenchPage() {
 
           <main
             ref={readerRef}
-            className={`${readerHidden ? 'hidden' : 'min-w-0 flex-1'} overflow-y-auto rounded-xl border border-line bg-panel p-2 shadow-sm md:p-4`}
+            className={`${readerHidden ? 'hidden' : 'min-w-0 flex-1'} overflow-y-auto rounded-xl border border-line bg-panel shadow-sm ${
+              // 网页原貌：iframe 通栏、站点自己的横向溢出裁掉（宽布局站点在窄列里不该把 main 撑出横向滚动条）
+              mode === 'original' && isSnapshot && bytes ? 'p-0 overflow-x-hidden' : 'p-2 md:p-4'
+            }`}
           >
-            {mode === 'original' && paper.format === 'pdf' ? (
+            {/*
+              空心论文（papers 行说「可读」、本地一个正文块都没有）：原设备还没把 blocks 推上服务端。
+              渲染解释面板而不是空白阅读器/「0 段」——「重新拉取」每次打开都能再试（判定已不锁存），
+              URL 导入的还能原地重导一份正文。补拉进行中（pullingRemote）不抢在加载态之前显示。
+            */}
+            {isHollow(paper, blocks.length) && !pullingRemote ? (
+              <div className="mx-auto mt-6 max-w-xl rounded-xl border border-line bg-panel-2/40 p-6 text-center">
+                <p className="mb-2 font-medium text-fg">正文尚未从原设备同步</p>
+                <p className="mb-4 text-sm text-dim">原设备打开论文库即可自动补传；也可以在这里重新拉取。</p>
+                <div className="flex flex-wrap justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPullTick((t) => t + 1)}
+                    className="min-h-11 rounded-lg border border-line bg-panel px-4 py-2 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
+                  >
+                    重新拉取
+                  </button>
+                  {paper.source?.type === 'url' && paper.source.entries.length === 1 && (
+                    <button
+                      type="button"
+                      onClick={() => navigate(`/papers?reimport=${encodeURIComponent(paper.id)}`)}
+                      className="min-h-11 rounded-lg border border-line bg-panel px-4 py-2 text-sm text-fg transition-colors hover:bg-panel-2 md:min-h-0"
+                    >
+                      从原网址重新导入
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : mode === 'original' && (paper.format === 'pdf' || isSnapshot) ? (
               // 分支顺序：成功（bytes）永远赢——旧顺序 error 优先，重试成功后 bytes 与残留
               // error 并存时页面仍卡在错误框（错误态粘滞 bug）
               bytes ? (
-                <PdfViewer
-                  bytes={bytes}
-                  containerRef={readerRef}
-                  onVisiblePage={handleVisiblePage}
-                  onLoaded={handlePdfLoaded}
-                />
+                isSnapshot ? (
+                  <WebSnapshotView
+                    bytes={bytes}
+                    blocks={blocks}
+                    containerRef={readerRef}
+                    langMode={langMode}
+                    translations={translations}
+                    failedTranslations={failedTranslations}
+                    translationAuthIssue={translationAuthIssue}
+                    onRetryTranslation={retryBlock}
+                    highlights={highlightsByBlock}
+                    onVisibleBlock={handleVisibleBlock}
+                    onVisibleRange={handleVisibleRange}
+                    onReady={handleSnapshotReady}
+                    onSelectionSource={setSnapshotSource}
+                    onNavigate={navigate}
+                  />
+                ) : (
+                  <PdfViewer
+                    bytes={bytes}
+                    containerRef={readerRef}
+                    onVisiblePage={handleVisiblePage}
+                    onLoaded={handlePdfLoaded}
+                  />
+                )
               ) : bytesError ? (
                 <div className="rounded-lg border border-bad/40 p-4 text-sm text-bad">
                   <p>{bytesError}</p>
@@ -1164,10 +1331,11 @@ export default function PaperWorkbenchPage() {
           containerRef={readerRef}
           anchorFromElement={anchorFromElement}
           onAction={handleAskAction}
-          // 仅文本视图支持高亮：原版 PDF 的锚点只到页，捕获不出块内偏移
-          onHighlight={mode === 'text' ? handleHighlight : undefined}
+          // 文本视图与网页原貌支持高亮（块级宿主 + 字符偏移）；原版 PDF 的锚点只到页，捕获不出块内偏移
+          onHighlight={mode === 'text' || isSnapshot ? handleHighlight : undefined}
+          getSources={getSelectionSources}
         />
-        <HighlightActions onRemove={removeHighlight} />
+        <HighlightActions onRemove={removeHighlight} getSources={getSelectionSources} />
 
         {/* 语音陪读悬浮球：敏感论文一票否决（不采音），服务端未开启/未登录不渲染 */}
         {!paper.sensitive && voiceConfig?.enabled === true && !voiceBallHidden && (

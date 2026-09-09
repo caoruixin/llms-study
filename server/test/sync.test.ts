@@ -1,6 +1,7 @@
 /**
  * 同步服务端(P3):push/changes 游标分页、墓碑、paper-deleted 竞态、
  * tbl allowlist、配额 413 与记账、snapshot、论文级联删除。
+ * 另含 §1.3 对账端点 /sync/summary 与 §1.6 译文/高亮两张新表。
  */
 import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync } from 'node:fs'
@@ -12,6 +13,7 @@ import type {
   SyncChangesResponse,
   SyncPushResponse,
   SyncSnapshotResponse,
+  SyncSummaryResponse,
 } from '../../shared/apiTypes.js'
 import { createTestApp, createUser, login, postJson, withSid, type TestCtx } from './helpers.js'
 
@@ -54,6 +56,22 @@ function usedBytes(ctx: TestCtx, userId: number): number {
 
 /** 与服务端相同的记账口径:payload JSON 串的 utf8 字节数 */
 const bytesOf = (payload: unknown): number => Buffer.byteLength(JSON.stringify(payload), 'utf8')
+
+async function getSummary(ctx: TestCtx, sid: string): Promise<SyncSummaryResponse> {
+  const res = await ctx.app.request('/api/app/sync/summary', { headers: withSid(sid) })
+  expect(res.status).toBe(200)
+  return (await res.json()) as SyncSummaryResponse
+}
+
+/** summary.papers 的顺序是实现细节,断言一律走 paperId → blocks 的映射 */
+const blocksByPaper = (s: SyncSummaryResponse): Record<string, number> =>
+  Object.fromEntries(s.papers.map((p) => [p.paperId, p.blocks]))
+
+/** 服务端全局 seq 水位(cursor 的真相来源) */
+function globalSeq(ctx: TestCtx): number {
+  const row = ctx.db.prepare("SELECT v FROM sync_meta WHERE k = 'global_seq'").get() as { v: number }
+  return row.v
+}
 
 describe('push / changes', () => {
   it('push 赋 seq 单调递增,changes 拉回 payload 原样', async () => {
@@ -338,5 +356,167 @@ describe('snapshot 与级联删除', () => {
     }))
     const res = await push(ctx, sid, changes)
     expect(res.status).toBe(400)
+  })
+})
+
+describe('summary(客户端对账,§1.3)', () => {
+  it('未登录 → 401', async () => {
+    const { ctx } = await setupSync()
+    const res = await ctx.app.request('/api/app/sync/summary')
+    expect(res.status).toBe(401)
+  })
+
+  it('逐篇回 blocks 计数:只数 blocks 表,其它子表不掺和', async () => {
+    const { ctx, sid } = await setupSync()
+    await push(ctx, sid, [
+      { tbl: 'papers', id: 'p1', payload: { title: '一' } },
+      { tbl: 'blocks', id: 'p1-b0', paperId: 'p1', payload: { i: 0 } },
+      { tbl: 'blocks', id: 'p1-b1', paperId: 'p1', payload: { i: 1 } },
+      // 同篇的其它子表不该被算进 blocks(对账只关心正文到齐没有)
+      { tbl: 'messages', id: 'p1-m0', paperId: 'p1', payload: { t: 'hi' } },
+      { tbl: 'papers', id: 'p2', payload: { title: '二' } },
+      { tbl: 'blocks', id: 'p2-b0', paperId: 'p2', payload: { i: 0 } },
+      // 空心论文:papers 行在、一块正文都没推上来
+      { tbl: 'papers', id: 'p3', payload: { title: '三' } },
+    ])
+
+    expect(blocksByPaper(await getSummary(ctx, sid))).toEqual({ p1: 2, p2: 1, p3: 0 })
+  })
+
+  it('blocks 墓碑不计入计数', async () => {
+    const { ctx, sid } = await setupSync()
+    await push(ctx, sid, [
+      { tbl: 'papers', id: 'p1', payload: {} },
+      { tbl: 'blocks', id: 'b0', paperId: 'p1', payload: { i: 0 } },
+      { tbl: 'blocks', id: 'b1', paperId: 'p1', payload: { i: 1 } },
+    ])
+    expect(blocksByPaper(await getSummary(ctx, sid))).toEqual({ p1: 2 })
+
+    const res = await push(ctx, sid, [{ tbl: 'blocks', id: 'b1', paperId: 'p1', deleted: true }])
+    expect(res.status).toBe(200)
+    expect(blocksByPaper(await getSummary(ctx, sid))).toEqual({ p1: 1 })
+  })
+
+  it('已删论文(墓碑)整篇不出现', async () => {
+    const { ctx, sid } = await setupSync()
+    await push(ctx, sid, [
+      { tbl: 'papers', id: 'p1', payload: {} },
+      { tbl: 'blocks', id: 'b0', paperId: 'p1', payload: {} },
+      { tbl: 'papers', id: 'p2', payload: {} },
+    ])
+    const del = await ctx.app.request('/api/app/sync/papers/p2', {
+      method: 'DELETE',
+      headers: withSid(sid),
+    })
+    expect(del.status).toBe(200)
+    // push 的 papers 墓碑走同一条级联路径,也必须消失
+    await push(ctx, sid, [{ tbl: 'papers', id: 'p1', deleted: true }])
+
+    const summary = await getSummary(ctx, sid)
+    expect(summary.papers).toEqual([])
+  })
+
+  it('files 段带 sha256/byteSize,文件删除后消失', async () => {
+    const { ctx, sid } = await setupSync()
+    await push(ctx, sid, [{ tbl: 'papers', id: 'p1', payload: {} }])
+    expect((await getSummary(ctx, sid)).files).toEqual([])
+
+    const fileBytes = Buffer.from('%PDF-1.7 summary body')
+    const sha = createHash('sha256').update(fileBytes).digest('hex')
+    const up = await ctx.app.request('/api/app/files/p1', {
+      method: 'PUT',
+      headers: { ...withSid(sid), 'x-file-sha256': sha, 'content-type': 'application/pdf' },
+      body: fileBytes,
+    })
+    expect(up.status).toBe(200)
+
+    expect((await getSummary(ctx, sid)).files).toEqual([
+      { paperId: 'p1', sha256: sha, byteSize: fileBytes.length },
+    ])
+
+    await ctx.app.request('/api/app/sync/papers/p1', { method: 'DELETE', headers: withSid(sid) })
+    expect((await getSummary(ctx, sid)).files).toEqual([])
+  })
+
+  it('cursor = 当前 seq 水位(不分配新 seq),且只含本人数据', async () => {
+    const { ctx, sid } = await setupSync()
+    const pushed = (await (
+      await push(ctx, sid, [{ tbl: 'papers', id: 'p1', payload: {} }])
+    ).json()) as SyncPushResponse
+
+    const first = await getSummary(ctx, sid)
+    expect(first.cursor).toBe(pushed.cursor)
+    expect(first.cursor).toBe(globalSeq(ctx))
+    // 读端点不该动 seq:再读一次水位不变
+    expect((await getSummary(ctx, sid)).cursor).toBe(pushed.cursor)
+
+    // 另一个账号的论文/文件不出现在本人 summary 里
+    await createUser(ctx.db, 'bob', 'password-1')
+    const bobSid = await login(ctx.app, 'bob', 'password-1')
+    await push(ctx, bobSid, [
+      { tbl: 'papers', id: 'bob-p', payload: {} },
+      { tbl: 'blocks', id: 'bob-b', paperId: 'bob-p', payload: {} },
+    ])
+    expect(blocksByPaper(await getSummary(ctx, sid))).toEqual({ p1: 0 })
+    expect(blocksByPaper(await getSummary(ctx, bobSid))).toEqual({ 'bob-p': 1 })
+    // 但 cursor 是全局水位,会被别人的写入推高
+    expect((await getSummary(ctx, sid)).cursor).toBe(globalSeq(ctx))
+  })
+})
+
+describe('译文与高亮同步(§1.6)', () => {
+  it('translations / highlights 在 allowlist 内:push 被应用而非 tbl-not-allowed', async () => {
+    const { ctx, sid } = await setupSync()
+    const tr = { blockId: 'b0', text: '中文译文', srcHash: 'h1' }
+    const hl = { blockId: 'b0', start: 3, end: 9, color: 'yellow' }
+    const res = await push(ctx, sid, [
+      { tbl: 'papers', id: 'p1', payload: {} },
+      { tbl: 'translations', id: 't1', paperId: 'p1', payload: tr },
+      { tbl: 'highlights', id: 'h1', paperId: 'p1', payload: hl },
+    ])
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as SyncPushResponse
+    expect(body.rejected).toEqual([])
+    expect(body.applied.map((a) => a.tbl)).toEqual(['papers', 'translations', 'highlights'])
+
+    // 换设备增量拉取能原样收到
+    const changes = await getChanges(ctx, sid, 0)
+    expect(changes.changes.map((c) => [c.tbl, c.id, c.payload])).toEqual([
+      ['papers', 'p1', {}],
+      ['translations', 't1', tr],
+      ['highlights', 'h1', hl],
+    ])
+
+    // 墓碑同样可推(deleteHighlights 走这条路径)
+    const del = await push(ctx, sid, [{ tbl: 'highlights', id: 'h1', paperId: 'p1', deleted: true }])
+    expect(((await del.json()) as SyncPushResponse).rejected).toEqual([])
+  })
+
+  it('DELETE /sync/papers/:id 级联删掉译文与高亮', async () => {
+    const { ctx, sid, userId } = await setupSync()
+    const pushRes = (await (
+      await push(ctx, sid, [
+        { tbl: 'papers', id: 'p1', payload: {} },
+        { tbl: 'translations', id: 't1', paperId: 'p1', payload: { text: 'x'.repeat(200) } },
+        { tbl: 'highlights', id: 'h1', paperId: 'p1', payload: { start: 0, end: 5 } },
+      ])
+    ).json()) as SyncPushResponse
+    expect(usedBytes(ctx, userId)).toBeGreaterThan(0)
+
+    const res = await ctx.app.request('/api/app/sync/papers/p1', {
+      method: 'DELETE',
+      headers: withSid(sid),
+    })
+    expect(res.status).toBe(200)
+
+    const rows = ctx.db
+      .prepare('SELECT tbl, id, deleted FROM sync_records WHERE user_id = ?')
+      .all(userId) as { tbl: string; id: string; deleted: number }[]
+    expect(rows).toEqual([{ tbl: 'papers', id: 'p1', deleted: 1 }])
+    expect(usedBytes(ctx, userId)).toBe(0)
+
+    // 其它设备增量拉取只看到 papers 墓碑(子记录不留墓碑,整树按论文丢弃)
+    const changes = await getChanges(ctx, sid, pushRes.cursor)
+    expect(changes.changes.map((c) => [c.tbl, c.id, c.deleted])).toEqual([['papers', 'p1', true]])
   })
 })

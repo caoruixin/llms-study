@@ -6,6 +6,7 @@ import type {
   SyncPushChange,
   SyncPushResponse,
   SyncSnapshotResponse,
+  SyncSummaryResponse,
 } from '../../../../shared/apiTypes'
 import { ApiRequestError, apiFetch } from '../../auth/apiClient'
 
@@ -33,6 +34,9 @@ export const syncApi = {
   },
 
   snapshot: () => apiFetch<SyncSnapshotResponse>('/sync/snapshot'),
+
+  /** 对账摘要(§1.3):旧服务端 404 由调用方吞掉并跳过对账 */
+  summary: () => apiFetch<SyncSummaryResponse>('/sync/summary'),
 
   deletePaper: (paperId: string) =>
     apiFetch<DeletePaperResponse>(`/sync/papers/${encodeURIComponent(paperId)}`, { method: 'DELETE' }),

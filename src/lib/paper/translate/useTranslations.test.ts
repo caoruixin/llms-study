@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { LlmError } from '../../llmClient'
 import { GatewayError, type CompletePaperJsonRequest, type CompletePaperJsonResult } from '../modelGateway'
-import { createTranslationScheduler, type TranslationSchedulerDeps, type TranslationSnapshot } from './useTranslations'
+import { createTranslationScheduler, isPulledFor, type TranslationSchedulerDeps, type TranslationSnapshot } from './useTranslations'
 import { TRANSLATE_PROMPT_VERSION, srcHash } from './translateBatch'
 import type { BlockTranslation, PaperBlock } from '../types'
 
@@ -18,6 +18,27 @@ const blk = (index: number, text: string): PaperBlock => ({
   kind: 'paragraph',
   text,
   anchor: { kind: 'pdf', blockIndex: index, page: 1 },
+})
+
+/** 「另一台设备译好、被同步引擎补拉落库」的一行（reload 用） */
+const remoteRow = (
+  index: number,
+  srcText: string,
+  text: string,
+  patch: Partial<BlockTranslation> = {},
+): BlockTranslation => ({
+  id: `p1:${index}:zh`,
+  paperId: 'p1',
+  blockIndex: index,
+  blockId: `p1:${index}`,
+  targetLang: 'zh',
+  promptVersion: TRANSLATE_PROMPT_VERSION,
+  model: 'deepseek-v4-pro',
+  srcHash: srcHash(srcText),
+  text,
+  createdAt: 1,
+  updatedAt: 2,
+  ...patch,
 })
 
 /** 从请求 user 消息反解条目，逐条回填 zh —— 恒过校验的「好」响应 */
@@ -346,4 +367,79 @@ describe('createTranslationScheduler', () => {
     await h.settle()
     expect(h.calls).toHaveLength(0)
   })
+
+  // PLAN 1.6：另一台设备的译文被同步引擎补拉落库后，页面收到 paper-sync-pulled 调 reload()
+  it('reload()：远端补拉到的译文补进内存、清掉该块失败标记，且不重新出包', async () => {
+    const blocks = [blk(0, 'a'), blk(1, 'b'), blk(2, 'c')]
+    const cached: BlockTranslation[] = [] // 同一引用喂给 loadTranslations，推行即模拟远端落库
+    const h = makeHarness({ blocks, cached, respond: () => new Error('boom') })
+
+    await h.scheduler.activate()
+    await h.settle()
+    expect([...h.snapshot.failed].sort()).toEqual([0, 1, 2])
+    const callsBefore = h.calls.length
+
+    cached.push(remoteRow(1, 'b', '远端译文1'))
+    await h.scheduler.reload()
+    await h.settle()
+
+    expect(h.snapshot.texts.get(1)).toBe('远端译文1')
+    expect([...h.snapshot.failed].sort()).toEqual([0, 2]) // 远端已译好的块不再是失败态
+    expect(h.calls).toHaveLength(callsBefore) // 已有译文的块不会再花钱翻一遍
+  })
+
+  it('reload()：版本/哈希不符的远端行视同缺失；无变化不 emit，有变化以库为准覆盖', async () => {
+    const blocks = [blk(0, 'a')]
+    const cached: BlockTranslation[] = []
+    const h = makeHarness({ blocks, cached })
+
+    await h.scheduler.activate()
+    await h.settle()
+    expect(h.snapshot.texts.get(0)).toBe('译0#-')
+
+    // 协议版本/原文哈希不符 → 忽略；内存无变化 → 不重新 emit（不白重渲染整篇）
+    const stale = h.snapshot
+    cached.push(remoteRow(0, 'a', '旧协议', { promptVersion: 'tr0' }))
+    cached.push(remoteRow(0, 'a', '旧原文', { srcHash: '00000000' }))
+    await h.scheduler.reload()
+    expect(h.snapshot).toBe(stale)
+    expect(h.snapshot.texts.get(0)).toBe('译0#-')
+
+    // 合法且内容有变（另一台设备的 LWW 结果）→ 覆盖并 emit
+    cached.length = 0
+    cached.push(remoteRow(0, 'a', '远端译文0'))
+    await h.scheduler.reload()
+    expect(h.snapshot).not.toBe(stale)
+    expect(h.snapshot.texts.get(0)).toBe('远端译文0')
+  })
+
+  it('reload()：dispose 后是空操作', async () => {
+    const blocks = [blk(0, 'a')]
+    const cached: BlockTranslation[] = [remoteRow(0, 'a', '远端译文0')]
+    const h = makeHarness({ blocks, cached })
+    h.scheduler.dispose()
+    const before = h.snapshot
+    await h.scheduler.reload()
+    expect(h.snapshot).toBe(before)
+  })
+})
+
+describe('isPulledFor', () => {
+  const detail = { paperIds: ['p1', 'p3'], tables: ['blocks', 'translations'] }
+  const cases: { name: string; detail: unknown; want: boolean }[] = [
+    { name: '本篇 + 本表', detail, want: true },
+    { name: '别的论文', detail: { paperIds: ['p2'], tables: ['translations'] }, want: false },
+    { name: '别的表', detail: { paperIds: ['p1'], tables: ['highlights'] }, want: false },
+    { name: 'detail 缺失', detail: undefined, want: false },
+    { name: 'detail 为 null', detail: null, want: false },
+    { name: '字段缺失', detail: {}, want: false },
+    { name: '字段不是数组', detail: { paperIds: 'p1', tables: 'translations' }, want: false },
+    { name: 'detail 不是对象', detail: 'p1', want: false },
+  ]
+
+  for (const c of cases) {
+    it(`${c.name} → ${c.want}`, () => {
+      expect(isPulledFor(c.detail, 'p1', 'translations')).toBe(c.want)
+    })
+  }
 })

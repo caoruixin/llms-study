@@ -61,7 +61,25 @@ export interface SyncStateRow {
   value: unknown
 }
 
-/** 每论文的同步进展标记：徽标显示与「换设备补拉」判定用 */
+/** 同步失败记录（§1.5）：落在 syncMeta 行上供列表徽标显示原因；引擎每次成功即清 */
+export interface SyncMetaError {
+  /** 失败发生在制品序列/推送流程的哪一步 */
+  step: 'papers' | 'blocks' | 'file' | 'records' | 'delete' | 'pull' | 'reconcile'
+  /** ApiRequestError.code（network / internal / payload-too-large…）或 'unknown' */
+  code: string
+  message: string
+  /** 仅 HTTP 错误携带 */
+  status?: number
+  at: number
+}
+
+/**
+ * 每论文的同步进展标记：徽标显示与「换设备补拉」判定用。
+ * §1.2 起制品推送拆步：`blocksPushed`/`filePushed` 各自记步，`artifactsPushed` 语义不变
+ * （= 三者齐：papers 行 + blocks + 文件）。老行没有 `blocksPushed` 字段，兼容读法固定为
+ * `blocksDone = meta.blocksPushed ?? meta.artifactsPushed ?? false`（老行 artifactsPushed=true
+ * 必然 blocks 已推）。syncMeta 只索引主键，新增字段**无需 Dexie 升版**。
+ */
 export interface SyncMetaRow {
   paperId: string
   ownerId?: number
@@ -71,6 +89,14 @@ export interface SyncMetaRow {
   blocksPulled?: boolean
   /** 原始文件字节已 PUT 成功（同 sha 重试时跳过整个上传） */
   filePushed?: boolean
+  /** blocks 已分批推完（拆步后单独记；缺省时按上面的兼容读法回退到 artifactsPushed） */
+  blocksPushed?: boolean
+  /** 上次 pullPaper 拉完后本地 blocks 行数：=0 且 papers.blockCount>0 即「空心论文」 */
+  pulledBlockCount?: number
+  /** 最近一次失败；成功即删 */
+  lastError?: SyncMetaError
+  /** 连续失败次数；成功归零 */
+  attempts?: number
 }
 
 /**

@@ -3,12 +3,14 @@ import { PAPER_DB_NAME, getPaperDb, type PaperDb } from './db'
 import type { PaperRepository } from './paperRepo'
 import type { CopilotRepository } from './copilotRepo'
 import type { LearnerRepository } from './learnerRepo'
-import { createTranslationRepository, type TranslationRepository } from './translationRepo'
-import { createHighlightRepository, type HighlightRepository } from './highlightRepo'
+import type { TranslationRepository } from './translationRepo'
+import type { HighlightRepository } from './highlightRepo'
 import {
   createSyncedCopilotRepository,
+  createSyncedHighlightRepository,
   createSyncedLearnerRepository,
   createSyncedPaperRepository,
+  createSyncedTranslationRepository,
 } from './syncedRepos'
 
 /**
@@ -50,10 +52,9 @@ function bundleFor(db: PaperDb): Bundle {
       paper: createSyncedPaperRepository(db, deps),
       copilot: createSyncedCopilotRepository(db, deps),
       learner: createSyncedLearnerRepository(db, deps),
-      // 译文 V1 不入 outbox（可再生派生物，不占同步配额），挂裸实现即可
-      translation: createTranslationRepository(db),
-      // 高亮 V1 同样不入 outbox（本地阅读标记，照 translation 先例），挂裸实现
-      highlight: createHighlightRepository(db),
+      // §1.6 起译文/高亮也跨设备同步：与其它仓储同一套 shouldQueue 判定
+      translation: createSyncedTranslationRepository(db, deps),
+      highlight: createSyncedHighlightRepository(db, deps),
     }
     bundles.set(db.name, b)
   }

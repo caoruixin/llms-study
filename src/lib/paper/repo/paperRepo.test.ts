@@ -130,6 +130,108 @@ describe('createPaperRepository', () => {
     expect(after?.lastReadAt).toBe(1_700_000_000)
   })
 
+  it('replaceFile 换掉字节与元数据、进度归零、回 queued，并删掉译文与高亮', async () => {
+    const { db, repo } = freshRepo()
+    const paper = await repo.createPaper(input())
+    await repo.markReady(paper.id, { blockCount: 2, charCount: 9 })
+    await repo.updateProgress(paper.id, { blockIndex: 40, ratio: 0.9, page: 7, maxBlockIndex: 55, updatedAt: 1, mode: 'original', lang: 'zh' })
+    await db.translations.add({
+      id: `${paper.id}:0:zh`,
+      paperId: paper.id,
+      blockIndex: 0,
+      blockId: `${paper.id}:0`,
+      targetLang: 'zh',
+      promptVersion: 'v1',
+      model: 'm',
+      srcHash: 'h',
+      text: '译文',
+      createdAt: 1,
+      updatedAt: 2,
+    })
+    await db.highlights.add({
+      id: 'h1',
+      paperId: paper.id,
+      blockIndex: 0,
+      blockId: `${paper.id}:0`,
+      lang: 'orig',
+      start: 0,
+      end: 3,
+      text: 'abc',
+      createdAt: 3,
+    })
+
+    const bytes = bytesOf('PCS1 新的快照字节')
+    await repo.replaceFile(paper.id, {
+      bytes,
+      mime: 'application/x-paper-web-snapshot',
+      sha256: 'sha-new',
+      byteSize: bytes.byteLength,
+      format: 'html',
+      title: '新标题',
+      fileName: 'a.com',
+      source: { type: 'url', entries: [{ url: 'https://a.com/p', ok: true, fetchedAt: 9 }] },
+    })
+
+    const after = await repo.getPaper(paper.id)
+    expect(after).toMatchObject({
+      status: 'queued',
+      title: '新标题',
+      fileName: 'a.com',
+      mime: 'application/x-paper-web-snapshot',
+      sha256: 'sha-new',
+      byteSize: bytes.byteLength,
+      format: 'html',
+      parserVersion: PARSER_VERSION,
+    })
+    expect(after?.failure).toBeUndefined()
+    expect(after?.source?.entries[0].url).toBe('https://a.com/p')
+    // 位置类字段归零（新解析的块序号与旧的不可比），视图偏好保留
+    expect(after?.progress).toMatchObject({ blockIndex: 0, maxBlockIndex: 0, ratio: 0, mode: 'original', lang: 'zh' })
+    expect(after?.progress.page).toBeUndefined()
+
+    expect(new Uint8Array((await repo.getFileBytes(paper.id))!.bytes)).toEqual(new Uint8Array(bytes))
+    expect((await repo.getFileBytes(paper.id))?.mime).toBe('application/x-paper-web-snapshot')
+
+    const job = await db.jobs.where('paperId').equals(paper.id).first()
+    expect(job).toMatchObject({ stage: 'queued', attempts: 1 })
+
+    // 块级派生物作废；重打标后必然错位
+    expect(await db.translations.where('paperId').equals(paper.id).count()).toBe(0)
+    expect(await db.highlights.where('paperId').equals(paper.id).count()).toBe(0)
+  })
+
+  it('replaceFile 保留 Copilot 会话与 chunks（chunks 由随后的 reingest 重建），缺 title/fileName 时保留原值', async () => {
+    const { db, repo } = freshRepo()
+    const paper = await repo.createPaper(input())
+    const now = Date.now()
+    await db.sessions.add({ id: 's1', paperId: paper.id, title: '会话', createdAt: now, updatedAt: now })
+    await db.messages.add({ id: 'm1', sessionId: 's1', role: 'user', content: 'hi', createdAt: now })
+    await db.chunks.add({ id: 'c1', paperId: paper.id, order: 0, text: 'x', anchor: { kind: 'pdf', blockIndex: 0 }, blockStart: 0, blockEnd: 1 })
+    await repo.saveBlocks(paper.id, [block(0, '旧块')])
+
+    const bytes = bytesOf('新字节')
+    await repo.replaceFile(paper.id, { bytes, mime: 'text/html', sha256: 'sha-2', byteSize: bytes.byteLength, format: 'html' })
+
+    const after = await repo.getPaper(paper.id)
+    expect(after).toMatchObject({ title: '论文标题', fileName: 'paper.pdf' })
+    expect(after?.source).toBeUndefined()
+    expect(await db.sessions.where('paperId').equals(paper.id).count()).toBe(1)
+    expect(await db.messages.where('sessionId').equals('s1').count()).toBe(1)
+    // blocks/chunks 由 reingestPaper 的 saveBlocks/saveChunks 先清后写，replaceFile 不碰
+    expect(await db.chunks.where('paperId').equals(paper.id).count()).toBe(1)
+    expect(await db.blocks.where('paperId').equals(paper.id).count()).toBe(1)
+  })
+
+  it('replaceFile 对不存在的论文抛 IngestError，且不留下孤儿文件行', async () => {
+    const { db, repo } = freshRepo()
+    const bytes = bytesOf('x')
+    await expect(
+      repo.replaceFile('nope', { bytes, mime: 'text/html', sha256: 's', byteSize: 1, format: 'html' }),
+    ).rejects.toMatchObject({ kind: 'unknown', message: '论文记录不存在' })
+    expect(await db.files.count()).toBe(0)
+    expect(await db.jobs.count()).toBe(0)
+  })
+
   it('deletePaper 事务性级联清空全部关联表', async () => {
     const { db, repo } = freshRepo()
     const paper = await repo.createPaper(input())

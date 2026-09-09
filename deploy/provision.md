@@ -162,6 +162,45 @@ curl -s http://127.0.0.1:8787/api/app/health
 
 DB 与 files/ 必须恢复到**同一天**的备份:sync_records 里的 stored_files 元数据与磁盘文件要对得上;跨天混搭会出现"元数据在、文件 404"(后端会日志告警但不自愈)。若只能混搭,恢复后跑 `POST /api/app/admin/recount-quota` 重算配额。
 
+## 9. 空心论文核查(同步自愈,PLAN-web-snapshot-sync §1.8)
+
+"空心论文" = 客户端已把 `papers` 行推上来(`status='ready'`)、但正文 `blocks` 一条没到或原始文件没传成。
+表现是换设备打开只有标题没有正文。**同步自愈那次发版前后各跑一次**:发版前留基线(知道有几篇坏的、是谁的),
+发版后隔一天再跑——1.1/1.3 的自动补推生效后条数应当下降;若某篇长期不掉,说明原设备再没打开过论文库,
+需要联系用户在原设备上打开一次(或在新设备用「从原网址重新导入」)。
+
+只读查询,不改数据;以 `llmapp` 身份 `-readonly` 打开,避免 root 创建出 root 属主的 `-wal/-shm` 把服务写坏:
+
+```bash
+ssh llm-pro
+sudo -u llmapp sqlite3 -readonly -box /var/lib/llms-study/data.db <<'SQL'
+WITH ready AS (
+  SELECT p.user_id,
+         p.id                                     AS paper_id,
+         p.updated_at,
+         json_extract(p.payload, '$.title')       AS title,
+         json_extract(p.payload, '$.blockCount')  AS client_blocks,   -- 客户端自报的应有块数
+         (SELECT COUNT(*) FROM sync_records b
+           WHERE b.user_id = p.user_id AND b.paper_id = p.id
+             AND b.tbl = 'blocks' AND b.deleted = 0) AS server_blocks,
+         EXISTS (SELECT 1 FROM stored_files f
+                  WHERE f.user_id = p.user_id AND f.paper_id = p.id)  AS has_file
+    FROM sync_records p
+   WHERE p.tbl = 'papers' AND p.deleted = 0
+     AND json_extract(p.payload, '$.status') = 'ready'                -- 只查已就绪的:处理中的论文本就还没推完
+)
+SELECT u.username, r.paper_id, r.title, r.client_blocks, r.server_blocks, r.has_file,
+       datetime(r.updated_at / 1000, 'unixepoch', 'localtime') AS updated_at
+  FROM ready r JOIN users u ON u.id = r.user_id
+ WHERE r.server_blocks = 0 OR r.has_file = 0
+ ORDER BY u.username, r.updated_at DESC;
+SQL
+```
+
+`has_file = 0` 且 `server_blocks > 0` 只是原始文件缺失(正文能读,PDF 原貌打不开),比正文全缺轻一档。
+把最后的 `WHERE` 换成 `r.client_blocks IS NOT NULL AND r.server_blocks < r.client_blocks` 可再查"推了一半"的论文
+(推送中途被杀的典型形态)。同一份判定的在线版本是 `GET /api/app/sync/summary`,客户端对账用的就是它。
+
 ## 待办(后续阶段)
 
 - P2:nginx 翻转 5 条 LLM location(见 nginx-llm-pro.conf 头注释);同时把现网 `/api/app/` 的 client_max_body_size 从 1m 提到 10m(P3 同步 push 批上限 8MB)

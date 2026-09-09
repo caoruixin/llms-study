@@ -20,6 +20,7 @@ import {
   type SyncChangesResponse,
   type SyncPushResponse,
   type SyncSnapshotResponse,
+  type SyncSummaryResponse,
 } from '../../../shared/apiTypes.js'
 import { requireSession } from '../auth/middleware.js'
 import type { Db, StoredFileRow, SyncRecordRow } from '../db/db.js'
@@ -271,6 +272,40 @@ export function syncRoutes(deps: AppDeps): Hono<AppEnv> {
       )
       .all(c.get('user').id) as { tbl: string; id: string; seq: number }[]
     const body: SyncSnapshotResponse = { records: rows, cursor: currentSeq(db) }
+    return c.json(body)
+  })
+
+  /**
+   * 对账端点(PLAN-web-snapshot-sync §1.3):每篇存活论文在服务端的 blocks 行数 + 已存文件指纹。
+   * 刻意不扩 snapshot:snapshot 是 O(全部行) 且 records 不带 paperId,定位不了"papers 行在、
+   * blocks/文件缺"的空心论文;这里是 O(论文数) 行,blocks 子查询走 idx_sync_records_user_paper。
+   */
+  r.get('/summary', (c) => {
+    const userId = c.get('user').id
+    const papers = db
+      .prepare(
+        `SELECT p.id AS paper_id,
+                (SELECT COUNT(*) FROM sync_records b
+                  WHERE b.user_id = p.user_id AND b.paper_id = p.id
+                    AND b.tbl = 'blocks' AND b.deleted = 0) AS blocks
+           FROM sync_records p
+          WHERE p.user_id = ? AND p.tbl = 'papers' AND p.deleted = 0`,
+      )
+      .all(userId) as { paper_id: string; blocks: number }[]
+    // 文件段全量返回:stored_files 每篇至多一行,行数与 papers 同量级
+    const files = db
+      .prepare('SELECT paper_id, sha256, byte_size FROM stored_files WHERE user_id = ?')
+      .all(userId) as { paper_id: string; sha256: string; byte_size: number }[]
+
+    const body: SyncSummaryResponse = {
+      papers: papers.map((row) => ({ paperId: row.paper_id, blocks: row.blocks })),
+      files: files.map((row) => ({
+        paperId: row.paper_id,
+        sha256: row.sha256,
+        byteSize: row.byte_size,
+      })),
+      cursor: currentSeq(db),
+    }
     return c.json(body)
   })
 

@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import ClaimBanner from '../../components/papers/ClaimBanner'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
 import { useAuthStore } from '../../lib/auth/authStore'
@@ -21,12 +21,14 @@ import {
   scanClaimables,
   setClaimDismissed,
   type ClaimScanResult,
+  type SyncStatus,
 } from '../../lib/paper/sync/syncEngine'
 import { ensureStorageFor } from '../../lib/paper/storage'
 import { MAX_FILE_BYTES, MAX_PDF_PAGES, sha256Hex } from '../../lib/paper/validate'
 import type { IngestStage, PaperFormat, PaperRecord, UrlSourceEntry } from '../../lib/paper/types'
-import type { UrlProgressEvent } from '../../lib/paper/url/urlImport'
+import type { UrlImportDeps, UrlPresentation, UrlProgressEvent } from '../../lib/paper/url/urlImport'
 import { usePaperUi, type PaperFilter, type PaperSortBy } from './paperUiStore'
+import { syncBadgeFor, type SyncBadge } from './syncBadge'
 
 /** 「按 URL 导入」弹窗懒加载：@mozilla/readability 等抽取依赖只在用户点开时才会被拉取 */
 const UrlImportDialog = lazy(() => import('../../components/papers/UrlImportDialog'))
@@ -63,8 +65,9 @@ const fmtTime = (ts?: number): string =>
 const isProcessing = (s: IngestStage) => s !== 'ready' && s !== 'failed'
 
 /**
- * 解析器按格式动态 import：pdfjs / mammoth / urlBundle 都不进论文库入口 chunk，
- * 首次导入对应格式时才拉取。html = URL 导入产出的净化 HTML 合集（见 lib/paper/url/urlBundle.ts）。
+ * 解析器按格式动态 import：pdfjs / mammoth / 两种 html 容器解码器都不进论文库入口 chunk，
+ * 首次导入对应格式时才拉取。html 有两种源文件形态，由 parseHtmlBytes 按魔数再分流一次：
+ * 网页原貌快照（webSnapshot.ts）与 URL 净化正文合集（urlBundle.ts）。
  */
 async function parseByFormat(input: { bytes: ArrayBuffer; format: PaperFormat }): Promise<ParseResult> {
   if (input.format === 'pdf') {
@@ -72,11 +75,32 @@ async function parseByFormat(input: { bytes: ArrayBuffer; format: PaperFormat })
     return parsePdfBytes(input.bytes)
   }
   if (input.format === 'html') {
-    const { parseUrlBundleBytes } = await import('../../lib/paper/url/urlBundle')
-    return parseUrlBundleBytes(input.bytes)
+    const { parseHtmlBytes } = await import('../../lib/paper/url/parseHtmlBytes')
+    return parseHtmlBytes(input.bytes)
   }
   const { parseDocxBytes } = await import('../../lib/paper/parseDocx')
   return parseDocxBytes(input.bytes)
+}
+
+const hostnameOf = (url: string): string => {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
+
+/**
+ * 论文可用于「从原网址重新导入」的链接：优先取成功抓取过的那条的落地 URL。
+ * 返回 undefined = 这篇论文没有来源链接（本地文件上传，或 source 里一条 URL 都没有），
+ * 或是多链接合集（原地换成单页快照会丢掉其余几页，reimportUrlPaperInPlace 同样拒绝）。
+ */
+function reimportUrlOf(paper: PaperRecord | undefined): string | undefined {
+  if (!paper || paper.source?.type !== 'url') return undefined
+  const entries = paper.source.entries
+  if (entries.length !== 1) return undefined
+  const entry = entries.find((e) => e.ok) ?? entries[0]
+  return entry?.finalUrl ?? entry?.url
 }
 
 const FORMAT_BADGE: Record<PaperFormat, string> = { pdf: 'PDF', docx: 'DOCX', html: 'URL' }
@@ -103,16 +127,21 @@ interface ActiveJob {
   stage: IngestStage
 }
 
-/** 同步徽标：按登录态与 syncMeta 推导；处理中的论文不显示（状态列已足够） */
-function syncBadge(paper: PaperRecord, meta: SyncMetaRow | undefined, authed: boolean): string | null {
-  if (paper.status !== 'ready') return null
-  if (!authed) return '仅本地'
-  if (meta?.artifactsPushed) return '已同步'
-  return '同步中'
+/** 同步徽标语义 → 配色：判定本身在 syncBadge.ts（纯函数、可单测），这里只管颜色 */
+const BADGE_TONE: Record<NonNullable<SyncBadge>['tone'], string> = {
+  ok: 'border-ok/40 text-ok',
+  pending: 'border-line text-amber',
+  bad: 'border-bad/40 text-bad',
+  warn: 'border-warn/40 text-warn',
+  dim: 'border-line text-dim',
 }
+
+/** 头部状态行的错误摘要：服务端消息可能很长，截断避免把整行挤爆 */
+const truncateError = (s: string, max = 60): string => (s.length > max ? `${s.slice(0, max)}…` : s)
 
 export default function PapersPage() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   // 门面引用永不变（repos.ts 单例工厂），方法体内按登录态路由到游客库/账号库
   const repo = getRepos().paper
   const authStatus = useAuthStore((s) => s.status)
@@ -121,7 +150,11 @@ export default function PapersPage() {
   const inputRef = useRef<HTMLInputElement>(null)
   // 重复导入时暂存原始导入源（文件或 URL 列表），供「替换导入」重跑；
   // 串行队列保证同时只有一个待决项，两种来源互斥，泛化成联合类型统一处理
-  const duplicatePendingRef = useRef<{ kind: 'file'; file: File } | { kind: 'url'; urls: string[] } | null>(null)
+  // URL 来源还要记住呈现方式：「替换导入」必须以同一种方式重跑（原貌命中的是同链接去重，
+  // 用阅读模式重跑等于悄悄换了一篇论文的形态）
+  const duplicatePendingRef = useRef<
+    { kind: 'file'; file: File } | { kind: 'url'; urls: string[]; presentation: UrlPresentation } | null
+  >(null)
   const dragDepth = useRef(0)
 
   const [papers, setPapers] = useState<PaperRecord[]>([])
@@ -130,6 +163,8 @@ export default function PapersPage() {
   const [notice, setNotice] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
   const [syncMetas, setSyncMetas] = useState<Record<string, SyncMetaRow>>({})
+  // 引擎快照（待推送项数/领导者/上次同步/最近错误）；引擎未就绪时为 null，头部状态行整行不渲染
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
   const [claimScan, setClaimScan] = useState<ClaimScanResult | null>(null)
 
   // 「按 URL 导入」弹窗状态：running/progress/result 与弹窗开关是分开的——
@@ -138,6 +173,10 @@ export default function PapersPage() {
   const [urlRunning, setUrlRunning] = useState(false)
   const [urlProgress, setUrlProgress] = useState<UrlProgressEvent[]>([])
   const [urlResult, setUrlResult] = useState<{ outcome: ImportOutcome } | null>(null)
+  // 重导入模式（工作台/空心态按钮 → /papers?reimport=<id>）：弹窗锁定这篇论文的来源链接、只走原貌，
+  // 提交后跑 reimportUrlPaperInPlace 原地换正文（paperId 不变）
+  const [urlReimport, setUrlReimport] = useState<{ paperId: string; title: string } | null>(null)
+  const [urlInitialUrl, setUrlInitialUrl] = useState<string | undefined>(undefined)
 
   const { sortBy, filter, pendingDuplicate, confirmDeleteId, setSortBy, setFilter, setPendingDuplicate, setConfirmDeleteId } =
     usePaperUi()
@@ -150,6 +189,12 @@ export default function PapersPage() {
       setSyncMetas(Object.fromEntries(metas.map((m) => [m.paperId, m])))
     } catch {
       setSyncMetas({})
+    }
+    // 引擎状态与徽标同一轮读取：两者都源自 outbox/syncMeta，分开读会出现「已全部推送 + 同步中」的自相矛盾
+    try {
+      setSyncStatus((await getSyncEngine()?.getSyncStatus()) ?? null)
+    } catch {
+      setSyncStatus(null)
     }
   }, [repo])
 
@@ -195,11 +240,15 @@ export default function PapersPage() {
     }
   }, [authStatus, userId, refresh, rescanClaim])
 
-  // 同步引擎每推完一批就重读徽标(syncMeta)——否则「同步中」要停到下次手动刷新才变「已同步」
+  // 同步引擎每推完一批(flushed)/报错(error)/拉到新数据(pulled)就重读列表与徽标(syncMeta)——
+  // 否则「同步中」要停到下次手动刷新才变「已同步」，失败也只能等用户自己发现
   useEffect(() => {
-    const onFlushed = () => void refresh()
-    window.addEventListener('paper-sync-flushed', onFlushed)
-    return () => window.removeEventListener('paper-sync-flushed', onFlushed)
+    const onSync = () => void refresh()
+    const events = ['paper-sync-flushed', 'paper-sync-error', 'paper-sync-pulled']
+    for (const ev of events) window.addEventListener(ev, onSync)
+    return () => {
+      for (const ev of events) window.removeEventListener(ev, onSync)
+    }
   }, [refresh])
 
   // 回前台补拉一轮增量:页面常驻(移动端 webview 常见)时,另一设备新传的论文要能自动出现,
@@ -262,41 +311,88 @@ export default function PapersPage() {
     [depsFor, refresh, setPendingDuplicate],
   )
 
+  /** 进度合并：URL 导入预置了每条链接的 pending 行，重导入没有预置行，缺就补一条 */
+  const mergeProgress = useCallback((ev: UrlProgressEvent) => {
+    setUrlProgress((prev) =>
+      prev.some((p) => p.index === ev.index) ? prev.map((p) => (p.index === ev.index ? ev : p)) : [...prev, ev],
+    )
+  }, [])
+
+  /**
+   * URL 导入与原地重导入共用的依赖装配。抓取/抽取/原貌构建的重依赖全部动态 import：
+   * 论文库入口 chunk 里不含 readability、DOMPurify 原貌 profile、快照编解码器与渲染捕获，
+   * 只有真正点了「按 URL 导入」才会拉；原貌那一堆更是等到快照分支真正开跑时才拉。
+   */
+  const loadUrlDeps = useCallback(
+    async (jobId: string): Promise<UrlImportDeps> => {
+      const [{ fetchUrl }, { extractFromFetchedHtml }] = await Promise.all([
+        import('../../lib/paper/url/fetchUrlApi'),
+        import('../../lib/paper/url/extractArticle'),
+      ])
+      const buildSnapshot: NonNullable<UrlImportDeps['buildSnapshot']> = async (input, { onPhase }) => {
+        const [{ buildWebSnapshot }, { captureRendered }] = await Promise.all([
+          import('../../lib/paper/url/buildSnapshot'),
+          import('../../lib/paper/url/captureRendered'),
+        ])
+        return buildWebSnapshot(input, {
+          // 资源走 asset 通道：服务端另一套令牌桶与放行类型（css/字体/svg），不挤占正文抓取额度
+          fetchAsset: (u, signal) =>
+            fetchUrl(u, { kind: 'asset', signal }).then((r) => ({ bytes: r.bytes, contentType: r.contentType })),
+          hash: sha256Hex,
+          captureRendered: (i, o) => captureRendered(i, o),
+          onPhase,
+        })
+      }
+      return {
+        repo,
+        hash: sha256Hex,
+        parse: parseByFormat,
+        fetchUrl,
+        extract: extractFromFetchedHtml,
+        buildSnapshot,
+        // 原貌去重按落地 URL：渲染捕获的字节每次都不同，sha 去重对它不成立
+        findByFinalUrl: async (finalUrl) =>
+          (await repo.listPapers()).find(
+            (p) =>
+              p.status === 'ready' &&
+              p.source?.type === 'url' &&
+              p.source.entries.some((e) => e.ok && (e.finalUrl ?? e.url) === finalUrl),
+          ),
+        ensureStorage: (bytes) => ensureStorageFor(bytes),
+        replaceFile: (id, input) => repo.replaceFile(id, input),
+        onState: (s) => {
+          setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, stage: s.stage } : j)))
+          void refresh()
+        },
+      }
+    },
+    [repo, refresh],
+  )
+
   const runUrlImport = useCallback(
-    (urls: string[]) => {
+    (urls: string[], opts: { presentation: UrlPresentation }) => {
       const jobId = `url-${Date.now()}`
-      setJobs((prev) => [...prev, { id: jobId, name: `URL 导入（${urls.length} 个链接）`, stage: 'queued' }])
+      // 原貌是单链接单页，用域名比「1 个链接」更能说明正在干什么（这一步可能要跑 10–30s）
+      const jobName =
+        opts.presentation === 'snapshot' && urls.length === 1
+          ? `网页原貌导入（${hostnameOf(urls[0])}）`
+          : `URL 导入（${urls.length} 个链接）`
+      setJobs((prev) => [...prev, { id: jobId, name: jobName, stage: 'queued' }])
       setUrlRunning(true)
       setUrlResult(null)
       setUrlProgress(urls.map((url, index) => ({ index, total: urls.length, url, phase: 'pending' })))
       void queueRef.current
         .enqueue(jobId, async () => {
-          // 抓取/抽取相关依赖只在真正发起 URL 导入时才拉取，不进论文库入口 chunk
-          const [{ importFromUrls }, { fetchUrl }, { extractFromFetchedHtml }] = await Promise.all([
+          const [{ importFromUrls }, deps] = await Promise.all([
             import('../../lib/paper/url/urlImport'),
-            import('../../lib/paper/url/fetchUrlApi'),
-            import('../../lib/paper/url/extractArticle'),
+            loadUrlDeps(jobId),
           ])
-          const outcome = await importFromUrls(
-            urls,
-            {
-              repo,
-              hash: sha256Hex,
-              parse: parseByFormat,
-              fetchUrl,
-              extract: extractFromFetchedHtml,
-              onState: (s) => {
-                setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, stage: s.stage } : j)))
-                void refresh()
-              },
-            },
-            (ev) => setUrlProgress((prev) => prev.map((p) => (p.index === ev.index ? ev : p))),
-          )
+          const outcome = await importFromUrls(urls, deps, mergeProgress, { presentation: opts.presentation })
 
           if (outcome.kind === 'duplicate') {
             // 去重命中：关掉本弹窗，转交给页面既有的 pendingDuplicate 面板
-            duplicatePendingRef.current = { kind: 'url', urls }
-            setPendingDuplicate({ existing: outcome.existing, fileName: `URL 导入（${urls.length} 个链接）` })
+            duplicatePendingRef.current = { kind: 'url', urls, presentation: opts.presentation }
+            setPendingDuplicate({ existing: outcome.existing, fileName: jobName })
             setUrlDialogOpen(false)
           } else if (outcome.kind === 'ready') {
             const entries = outcome.paper.source?.entries ?? []
@@ -327,8 +423,85 @@ export default function PapersPage() {
           void refresh()
         })
     },
-    [repo, refresh, setPendingDuplicate],
+    [loadUrlDeps, mergeProgress, refresh, setPendingDuplicate],
   )
+
+  /**
+   * 原地重导入（网页原貌）：paperId 不变，只换源文件并重解析——Copilot 会话、阅读进度、
+   * 画像都挂在 id 上，全部保留；高亮与译文由 replaceFile 清除（弹窗已写明）。
+   * 与 URL 导入共用弹窗的 running/progress/result 状态：同一个串行队列，同一套进度视窗。
+   */
+  const runReimport = useCallback(
+    (paperId: string, url: string) => {
+      const jobId = `reimport-${paperId}`
+      setJobs((prev) => [...prev, { id: jobId, name: `网页原貌重新导入（${hostnameOf(url)}）`, stage: 'queued' }])
+      setUrlRunning(true)
+      setUrlResult(null)
+      setUrlProgress([{ index: 0, total: 1, url, phase: 'pending' }])
+      void queueRef.current
+        .enqueue(jobId, async () => {
+          const [{ reimportUrlPaperInPlace }, deps] = await Promise.all([
+            import('../../lib/paper/url/urlImport'),
+            loadUrlDeps(jobId),
+          ])
+          const outcome = await reimportUrlPaperInPlace(paperId, deps, mergeProgress)
+          if (outcome.kind === 'ready') {
+            setUrlDialogOpen(false)
+            setUrlReimport(null)
+            setUrlInitialUrl(undefined)
+            setNotice(`已重新导入「${outcome.paper.title}」`)
+            navigate(`/papers/${outcome.paper.id}`)
+          } else if (outcome.kind === 'failed') {
+            // 失败不动原论文的正文（replaceFile 之前失败）或留在 queued 等重试（之后失败），
+            // 两种情形都把原因留在弹窗里
+            setUrlResult({ outcome })
+            setNotice(`重新导入失败：${outcome.failure.message}`)
+          }
+        })
+        .catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : '重新导入失败'
+          setUrlResult({ outcome: { kind: 'failed', failure: { kind: 'unknown', message, at: Date.now() } } })
+          setNotice(`重新导入失败：${message}`)
+        })
+        .finally(() => {
+          setJobs((prev) => prev.filter((j) => j.id !== jobId))
+          setUrlRunning(false)
+          void refresh()
+        })
+    },
+    [loadUrlDeps, mergeProgress, navigate, refresh],
+  )
+
+  /**
+   * `?reimport=<paperId>`（工作台头部与空心态面板的入口，§1.4/§2.4）：找到这篇 URL 论文
+   * 就以重导入模式打开弹窗，然后立刻把查询参数摘掉——否则任何一次重渲染都会把弹窗重新弹开。
+   * authStatus 未定时先不处理：那时 repo 指向游客库，会误判成「找不到这篇论文」。
+   */
+  useEffect(() => {
+    const id = searchParams.get('reimport')
+    if (!id || authStatus === 'unknown') return
+    let alive = true
+    void (async () => {
+      const paper = await repo.getPaper(id).catch(() => undefined)
+      if (!alive) return
+      setSearchParams({}, { replace: true })
+      const url = reimportUrlOf(paper)
+      if (!paper || paper.status !== 'ready' || !url) {
+        setNotice('这篇论文不能从原网址重新导入')
+        return
+      }
+      if (!urlRunning) {
+        setUrlResult(null)
+        setUrlProgress([])
+      }
+      setUrlReimport({ paperId: paper.id, title: paper.title })
+      setUrlInitialUrl(url)
+      setUrlDialogOpen(true)
+    })()
+    return () => {
+      alive = false
+    }
+  }, [searchParams, setSearchParams, repo, authStatus, urlRunning])
 
   const handleFiles = useCallback(
     async (files: FileList | File[]) => {
@@ -369,6 +542,25 @@ export default function PapersPage() {
     [depsFor, refresh],
   )
 
+  /**
+   * 「重试同步」：清掉这篇的 lastError/attempts 并重新入队 push-artifacts。
+   * 已完成的步骤按 flag 幂等跳过，所以重复点只是白跑一轮，不会重传已上去的字节。
+   * 未登录（引擎为 null）时按钮本来就不显示，这里再兜一层。
+   */
+  const retrySync = useCallback(
+    async (paperId: string) => {
+      const engine = getSyncEngine()
+      if (!engine) return
+      try {
+        await engine.retryArtifacts(paperId)
+      } catch (e) {
+        setNotice(e instanceof Error ? e.message : '重试同步失败')
+      }
+      await refresh()
+    },
+    [refresh],
+  )
+
   const remove = useCallback(
     async (paperId: string) => {
       setConfirmDeleteId(null)
@@ -397,7 +589,7 @@ export default function PapersPage() {
     }
     await refresh()
     if (pending.kind === 'file') runImport(pending.file)
-    else runUrlImport(pending.urls)
+    else runUrlImport(pending.urls, { presentation: pending.presentation })
   }, [pendingDuplicate, repo, refresh, runImport, runUrlImport, setPendingDuplicate])
 
   const visible = useMemo(() => {
@@ -423,6 +615,16 @@ export default function PapersPage() {
             ? '已登录：文档与阅读记录会自动同步到你的账号，换设备打开即得；向模型发送内容前会单独征求授权。'
             : '文档与阅读记录只保存在当前浏览器（IndexedDB），不会自动外发；登录后可自动同步到账号。'}
         </p>
+        {/* 同步可观测性（§1.5）：推送是后台行为，出问题时用户此前只能看到「一直同步中」。
+            领导者提示解释了为什么这个 tab 自己不推送——多 tab 时只有持锁的那个会推。 */}
+        {authStatus === 'authed' && syncStatus && (
+          <p className="text-xs text-dim">
+            {syncStatus.pending > 0 ? `${syncStatus.pending} 项待推送` : '已全部推送'}
+            {` · 上次同步 ${fmtTime(syncStatus.lastSyncAt ?? undefined)}`}
+            {` · ${syncStatus.leader ? '本标签页负责推送' : '由其它标签页推送'}`}
+            {syncStatus.lastError && ` · 最近错误：${truncateError(syncStatus.lastError.message)}`}
+          </p>
+        )}
       </header>
 
       {claimScan && (
@@ -500,6 +702,9 @@ export default function PapersPage() {
                 setUrlResult(null)
                 setUrlProgress([])
               }
+              // 普通入口一律回到「新导入」形态：上一次可能是从 ?reimport 打开的
+              setUrlReimport(null)
+              setUrlInitialUrl(undefined)
               setUrlDialogOpen(true)
             }}
             className="rounded-lg border border-line bg-panel px-5 py-2 text-sm font-semibold text-fg transition-colors hover:bg-panel-2"
@@ -525,16 +730,24 @@ export default function PapersPage() {
           <UrlImportDialog
             onClose={() => {
               setUrlDialogOpen(false)
+              setUrlReimport(null)
+              setUrlInitialUrl(undefined)
               // 只在没有任务运行时清空——仍在后台跑的任务下次打开弹窗还要能看到当前进度
               if (!urlRunning) {
                 setUrlResult(null)
                 setUrlProgress([])
               }
             }}
-            onSubmit={runUrlImport}
+            onSubmit={(urls, o) => {
+              // 重导入模式下链接是锁定的（弹窗只读回填），走原地替换而不是新建论文
+              if (urlReimport) runReimport(urlReimport.paperId, urls[0] ?? urlInitialUrl ?? '')
+              else runUrlImport(urls, { presentation: o?.presentation ?? 'snapshot' })
+            }}
             running={urlRunning}
             progress={urlProgress}
             result={urlResult}
+            initialUrl={urlInitialUrl}
+            reimport={urlReimport ?? undefined}
           />
         </Suspense>
       )}
@@ -551,8 +764,9 @@ export default function PapersPage() {
       {pendingDuplicate && (
         <div className="rounded-xl border border-warn/40 bg-panel shadow-sm p-4">
           <p className="mb-1 font-medium text-warn">该文件已导入过</p>
+          {/* 去重有两条判据：文件/阅读模式按字节 sha，网页原貌按落地链接（渲染捕获的字节每次都不同） */}
           <p className="mb-3 text-sm text-dim">
-            「{pendingDuplicate.fileName}」与已有论文「{pendingDuplicate.existing.title}」内容完全相同（SHA-256 一致）。
+            「{pendingDuplicate.fileName}」与已有论文「{pendingDuplicate.existing.title}」相同（同一链接或字节一致）。
           </p>
           <div className="flex flex-wrap gap-2">
             <button
@@ -666,16 +880,27 @@ export default function PapersPage() {
                       {STAGE_LABEL[p.status]}
                     </span>
                     {(() => {
-                      const badge = syncBadge(p, syncMetas[p.id], authStatus === 'authed')
-                      return badge ? (
-                        <span
-                          className={`shrink-0 rounded border px-1.5 py-0.5 text-[0.65rem] ${
-                            badge === '已同步' ? 'border-ok/40 text-ok' : 'border-line text-dim'
-                          }`}
-                        >
-                          {badge}
-                        </span>
-                      ) : null
+                      const badge = syncBadgeFor(p, syncMetas[p.id], authStatus === 'authed')
+                      if (!badge) return null
+                      return (
+                        <>
+                          <span
+                            title={badge.title}
+                            className={`shrink-0 rounded border px-1.5 py-0.5 text-[0.65rem] ${BADGE_TONE[badge.tone]}`}
+                          >
+                            {badge.label}
+                          </span>
+                          {badge.label === '同步失败' && (
+                            <button
+                              type="button"
+                              onClick={() => void retrySync(p.id)}
+                              className="shrink-0 rounded border border-line px-1.5 py-0.5 text-[0.65rem] text-dim transition-colors hover:bg-panel-2 hover:text-fg"
+                            >
+                              重试同步
+                            </button>
+                          )}
+                        </>
+                      )
                     })()}
                   </div>
                   <p className="mt-1 truncate text-xs text-dim">{p.fileName}</p>

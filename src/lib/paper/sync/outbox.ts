@@ -1,4 +1,5 @@
 import type { OutboxItem } from '../repo/db'
+import { onSyncMessage, postSyncMessage } from './crossTab'
 
 /**
  * outbox 合并规划（纯函数）：把队列压缩成最小推送计划。
@@ -131,6 +132,9 @@ export function chunkRows<T>(rows: readonly T[], maxRows = ARTIFACT_BLOCKS_PER_B
 // 入队通知：syncedRepos 写完 outbox 后发信号，引擎据此调度 flush。
 // 放这里而不是 syncEngine：repos → syncedRepos → outbox 的依赖是单向的，
 // 引擎订阅信号即可，不产生 syncEngine ↔ repos 环。
+// §1.1：信号同时广播到其它 tab（领导者往往不是写入者），远端 enqueued 转成
+// **无 payload** 的合成项喂给本地监听器——引擎 kick() 因此不会用别的 tab 的进度
+// 污染本 tab 的 progressCache。
 // ---------------------------------------------------------------------------
 
 type OutboxListener = (dbName: string, item: OutboxItem) => void
@@ -144,5 +148,12 @@ export const outboxSignal = {
   },
   emit(dbName: string, item: OutboxItem): void {
     for (const fn of listeners) fn(dbName, item)
+    postSyncMessage({ kind: 'enqueued', dbName, op: item.op, paperId: item.paperId })
   },
 }
+
+onSyncMessage((msg) => {
+  if (msg.kind !== 'enqueued') return
+  const synthetic: OutboxItem = { op: msg.op, paperId: msg.paperId, createdAt: Date.now() }
+  for (const fn of listeners) fn(msg.dbName, synthetic)
+})

@@ -1,6 +1,7 @@
 // 从叶子文件取常量而非 './url/urlBundle'：urlBundle.ts 依赖 ingest.ts，ingest.ts 又依赖本文件，
 // 直接从 urlBundle.ts 取值会形成循环 import（细节见 urlBundleMime.ts 头注释）
 import { URL_BUNDLE_MIME } from './url/urlBundleMime'
+import { WEB_SNAPSHOT_MIME } from './url/webSnapshotMime'
 import type { IngestFailureKind, PaperFormat } from './types'
 
 // §4.5 默认约束
@@ -30,7 +31,8 @@ const MIME_BY_FORMAT: Record<PaperFormat, string[]> = {
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'application/zip',
   ],
-  html: [URL_BUNDLE_MIME],
+  // html 两种源文件形态：URL 净化正文合集（阅读模式）与网页原貌快照容器
+  html: [URL_BUNDLE_MIME, WEB_SNAPSHOT_MIME],
 }
 
 const LENIENT_MIME = ['', 'application/octet-stream']

@@ -3,6 +3,8 @@ import { outboxSignal } from '../sync/outbox'
 import { createPaperRepository, type PaperRepository } from './paperRepo'
 import { createCopilotRepository, type CopilotRepository } from './copilotRepo'
 import { createLearnerRepository, profileToRow, type LearnerRepository } from './learnerRepo'
+import { createTranslationRepository, type TranslationRepository } from './translationRepo'
+import { createHighlightRepository, type HighlightRepository } from './highlightRepo'
 
 /**
  * 同步装饰器（P4）：先写本地（完全委托原仓储，字节级不变），再把「值得同步的写入」
@@ -55,12 +57,49 @@ export function createSyncedPaperRepository(db: PaperDb, deps: SyncedDeps): Pape
 
     // ready 是制品定稿点：papers 行 + 原始文件 + blocks 由引擎按序列一次性整推
     markReady: async (paperId, stats) => {
+      // 上一版的块数：replaceFile/retryPaper 都不动 blockCount，它一直是服务端已有块数的忠实记录
+      const prevBlockCount = (await db.papers.get(paperId))?.blockCount ?? 0
       await local.markReady(paperId, stats)
       if (deps.shouldQueue()) {
-        // 覆盖既有 meta 的 artifactsPushed：重新解析（retry）后制品变了，必须重推
-        await db.syncMeta.put({ paperId, artifactsPushed: false, blocksPulled: true, filePushed: false })
+        // 整行覆盖既有 meta（含 lastError/attempts）：重新解析（retry）后制品变了，三步全部重推
+        await db.syncMeta.put({
+          paperId,
+          artifactsPushed: false,
+          blocksPushed: false,
+          filePushed: false,
+          blocksPulled: true,
+        })
+      }
+      // 重解析/原地重导入后块数变少：blocks 行 id 是 `${paperId}:${index}` 确定性拼接，push-artifacts
+      // 只 upsert 现有行，服务端与其它设备会永远留着旧尾块（旧段落接在新正文后面，译文/高亮还锚着旧文）。
+      // 尾巴逐行入队墓碑；record 批先于制品序列推送，且索引与新块不重叠，不存在与 upsert 的竞争。
+      for (let index = stats.blockCount; index < prevBlockCount; index++) {
+        await enqueue({ op: 'record', tbl: 'blocks', recordId: `${paperId}:${index}`, paperId, deleted: true })
       }
       await enqueue({ op: 'push-artifacts', paperId })
+    },
+
+    /**
+     * 原地重导入：本地换字节 + 清译文/高亮，队列里只补两类**墓碑**——
+     * 那两张表的行是逐行同步的（§1.6），删掉后不推墓碑，另一台设备会把陈旧译文/高亮拉回来。
+     * 制品本身不在这里入队：随后 reingestPaper 的 markReady 会整行重置 syncMeta 并入队
+     * push-artifacts，新 sha 的文件届时自然重传（服务端只在 sha 相同时短路）；
+     * 新正文比旧的短时多出来的旧尾块也由 markReady 按旧 blockCount 补墓碑。
+     */
+    replaceFile: async (paperId, input) => {
+      // 先取将被删的行 id：replaceFile 返回时它们已经不在库里了
+      const queueing = deps.shouldQueue()
+      const translationIds = queueing
+        ? (await db.translations.where('paperId').equals(paperId).toArray()).map((r) => r.id)
+        : []
+      const highlightIds = queueing ? (await db.highlights.where('paperId').equals(paperId).toArray()).map((r) => r.id) : []
+      await local.replaceFile(paperId, input)
+      for (const id of translationIds) {
+        await enqueue({ op: 'record', tbl: 'translations', recordId: id, paperId, deleted: true })
+      }
+      for (const id of highlightIds) {
+        await enqueue({ op: 'record', tbl: 'highlights', recordId: id, paperId, deleted: true })
+      }
     },
 
     deletePaper: async (paperId) => {
@@ -192,6 +231,73 @@ export function createSyncedLearnerRepository(db: PaperDb, deps: SyncedDeps): Le
       }
       for (const id of evidenceIds) {
         await enqueue({ op: 'record', tbl: 'evidence', recordId: id, paperId, deleted: true })
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TranslationRepository（§1.6：译文跨设备同步）
+// ---------------------------------------------------------------------------
+
+export function createSyncedTranslationRepository(db: PaperDb, deps: SyncedDeps): TranslationRepository {
+  const local = createTranslationRepository(db)
+  const enqueue = makeEnqueue(db, deps)
+
+  return {
+    ...local,
+
+    // 每行一条 record：id 是确定性拼接键，重译是幂等覆盖（LWW 靠 updatedAt）；
+    // deleteByPaper 只在整篇删除的级联里调用，服务端按 paper_id 级联，无需逐行墓碑
+    putTranslations: async (rows) => {
+      await local.putTranslations(rows)
+      for (const row of rows) {
+        await enqueue({ op: 'record', tbl: 'translations', recordId: row.id, paperId: row.paperId, payload: row })
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HighlightRepository（§1.6：高亮跨设备同步）
+// ---------------------------------------------------------------------------
+
+export function createSyncedHighlightRepository(db: PaperDb, deps: SyncedDeps): HighlightRepository {
+  const local = createHighlightRepository(db)
+  const enqueue = makeEnqueue(db, deps)
+
+  /** 墓碑要带 paperId（服务端级联列）：删之前先把归属论文查出来 */
+  const paperIdsOf = async (ids: readonly string[]): Promise<Map<string, string>> => {
+    const out = new Map<string, string>()
+    if (!ids.length) return out
+    const rows = await db.highlights.bulkGet([...ids])
+    rows.forEach((row, i) => {
+      if (row) out.set(ids[i], row.paperId)
+    })
+    return out
+  }
+
+  return {
+    ...local,
+
+    applyMerge: async (toDelete, toPut) => {
+      const owners = await paperIdsOf(toDelete)
+      await local.applyMerge(toDelete, toPut)
+      for (const id of toDelete) {
+        // 被吞并的旧行若本地查不到（已被别处删过），退回合并行的论文：同一次合并必然同篇
+        const paperId = owners.get(id) ?? toPut[0]?.paperId
+        if (paperId) await enqueue({ op: 'record', tbl: 'highlights', recordId: id, paperId, deleted: true })
+      }
+      for (const row of toPut) {
+        await enqueue({ op: 'record', tbl: 'highlights', recordId: row.id, paperId: row.paperId, payload: row })
+      }
+    },
+
+    deleteHighlights: async (ids) => {
+      const owners = await paperIdsOf(ids)
+      await local.deleteHighlights(ids)
+      for (const [id, paperId] of owners) {
+        await enqueue({ op: 'record', tbl: 'highlights', recordId: id, paperId, deleted: true })
       }
     },
   }

@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { SelectionSource } from './SelectionActions'
 
 /**
  * 已高亮文本的「取消高亮」小浮层：document 级 click 委托命中 `<mark data-highlight-id>` 时弹出。
@@ -6,10 +7,15 @@ import { useEffect, useState } from 'react'
  * 与 SelectionActions 的分工：那边管「有选区」的动作，这边只管「点一下已有 mark」——
  * click 时选区未塌陷（用户在划词）就不弹，两个浮层不会同时出现。
  * 根节点同样挂 `data-paper-selection-ui`：两个组件的 document 监听互相豁免对方的 UI。
+ *
+ * 网页原貌视图的 mark 在 iframe 文档里（click 不冒泡到父 document）：与 SelectionActions 同一套
+ * `getSources` 逐文档挂监听，矩形加上该文档在父视口里的偏移。
  */
 
 interface Props {
   onRemove: (id: string) => void
+  /** 选区源列表（同 SelectionActions）；缺省只监听父 document */
+  getSources?: () => SelectionSource[]
 }
 
 interface PopState {
@@ -21,30 +27,42 @@ interface PopState {
 /** 单按钮小浮层：宽度远小于快捷条，钳位与上下翻转沿 SelectionActions 同一套思路 */
 const POP_WIDTH = 96
 
-export default function HighlightActions({ onRemove }: Props) {
+export default function HighlightActions({ onRemove, getSources }: Props) {
   const [pop, setPop] = useState<PopState | null>(null)
+  const getSourcesRef = useRef(getSources)
+  getSourcesRef.current = getSources
 
   useEffect(() => {
-    const asElement = (node: EventTarget | null): Element | null =>
-      node instanceof Element ? node : node instanceof Node ? node.parentElement : null
+    // 按 nodeType 判定而非 instanceof：iframe 文档的节点属于另一个 realm，父窗口的 Element 认不出
+    const asElement = (node: EventTarget | null): Element | null => {
+      const n = node as Node | null
+      if (!n || typeof n.nodeType !== 'number') return null
+      return n.nodeType === 1 ? (n as Element) : (n.parentElement ?? null)
+    }
+    const offsetFor = (doc: Document): { x: number; y: number } =>
+      getSourcesRef.current?.().find((s) => s.doc === doc)?.offset() ?? { x: 0, y: 0 }
 
-    const onClick = (e: MouseEvent) => {
+    const onClick = (e: Event) => {
+      const doc = e.currentTarget as Document
       const el = asElement(e.target)
       // 自己/快捷条内部的点击不处理：按钮各自的 onClick 负责
       if (el?.closest('[data-paper-selection-ui]')) return
       const mark = el?.closest('[data-highlight-id]')
-      if (!(mark instanceof HTMLElement)) {
+      if (!mark) {
         setPop(null)
         return
       }
       // 划词落点恰好在 mark 上：选区未塌陷说明用户在选文字，让位给 SelectionActions
-      const sel = window.getSelection()
+      const sel = doc.getSelection()
       if (sel && !sel.isCollapsed && sel.toString().trim() !== '') return
-      const id = mark.dataset.highlightId
+      const id = mark.getAttribute('data-highlight-id')
       if (!id) return
       const r = mark.getBoundingClientRect()
-      const x = Math.min(Math.max(r.left + r.width / 2 - POP_WIDTH / 2, 8), window.innerWidth - POP_WIDTH - 8)
-      const y = r.top > 108 ? r.top - 44 : r.bottom + 10
+      const off = offsetFor(doc)
+      const top = r.top + off.y
+      const x = Math.min(Math.max(r.left + off.x + r.width / 2 - POP_WIDTH / 2, 8), window.innerWidth - POP_WIDTH - 8)
+      // 钳进视口（与 SelectionActions 同一口径）：mark 矩形越界时浮层仍可点
+      const y = Math.min(Math.max(top > 108 ? top - 44 : r.bottom + off.y + 10, 8), window.innerHeight - 48)
       setPop({ x, y, id })
     }
 
@@ -53,19 +71,24 @@ export default function HighlightActions({ onRemove }: Props) {
       if (el?.closest('[data-paper-selection-ui]')) return
       setPop(null)
     }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPop(null)
+    const onKeyDown = (e: Event) => {
+      if ((e as KeyboardEvent).key === 'Escape') setPop(null)
     }
 
-    document.addEventListener('click', onClick)
-    document.addEventListener('keydown', onKeyDown)
+    const docs = new Set<Document>([document, ...(getSourcesRef.current?.() ?? []).map((s) => s.doc)])
+    for (const doc of docs) {
+      doc.addEventListener('click', onClick)
+      doc.addEventListener('keydown', onKeyDown)
+    }
     window.addEventListener('scroll', onScroll, { capture: true, passive: true })
     return () => {
-      document.removeEventListener('click', onClick)
-      document.removeEventListener('keydown', onKeyDown)
+      for (const doc of docs) {
+        doc.removeEventListener('click', onClick)
+        doc.removeEventListener('keydown', onKeyDown)
+      }
       window.removeEventListener('scroll', onScroll, { capture: true })
     }
-  }, [])
+  }, [getSources])
 
   if (!pop) return null
 

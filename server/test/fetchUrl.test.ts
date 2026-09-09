@@ -11,7 +11,7 @@ import { createServer, type IncomingHttpHeaders, type Server, type ServerRespons
 import type { AddressInfo } from 'node:net'
 import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
-import { FETCH_URL_HEADER_FINAL_URL } from '../../shared/apiRoutes.js'
+import { FETCH_ASSET_MAX_BYTES, FETCH_URL_HEADER_FINAL_URL } from '../../shared/apiRoutes.js'
 import { nodeTransport, type FetchLookup, type FetchTransport } from '../src/lib/fetchRaw.js'
 import { createTestApp, createUser, login, postJson, withSid, type TestCtx } from './helpers.js'
 
@@ -35,6 +35,9 @@ async function startOrigin(): Promise<OriginStub> {
   const server: Server = createServer((req, res) => {
     requests.push({ url: req.url ?? '', headers: req.headers })
     req.resume()
+    // 客户端在 Content-Length 预检里会直接 destroy 连接,写到一半的响应会 EPIPE:
+    // ServerResponse 的 'error' 无监听会变成未捕获异常,这里吞掉(它不是被测对象)
+    res.on('error', () => {})
     responder(req.url ?? '', res)
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -63,6 +66,10 @@ interface FetchCtx {
   sid: string
   origin: OriginStub
   post(url: unknown, headers?: Record<string, string>): Promise<Response>
+  /** 任意 body(kind 用例:合法的 asset、非法的 kind 值) */
+  postBody(body: unknown): Promise<Response>
+  /** kind:'asset' 便捷入口 */
+  postAsset(url: unknown): Promise<Response>
 }
 
 async function setup(
@@ -90,6 +97,18 @@ async function setup(
     origin,
     post: async (url, headers = {}) =>
       await ctx.app.request(PATH, postJson({ url }, { ...withSid(sid), ...headers })),
+    postBody: async (body) => await ctx.app.request(PATH, postJson(body, withSid(sid))),
+    postAsset: async (url) =>
+      await ctx.app.request(PATH, postJson({ url, kind: 'asset' }, withSid(sid))),
+  }
+}
+
+/** 轮询等待条件成立(并发用例:等前 n 个请求确实抵达上游、即确实占住了并发名额) */
+async function waitFor(cond: () => boolean, label: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`等待超时:${label}`)
+    await new Promise((r) => setTimeout(r, 5))
   }
 }
 
@@ -506,5 +525,226 @@ describe('限流', () => {
     expect((await f.post('not a url')).status).toBe(400)
     expect((await f.post('http://origin.test/a')).status).toBe(200)
     expect((await f.post('http://origin.test/b')).status).toBe(200)
+  })
+})
+
+/**
+ * kind=asset:网页原貌导入抓样式表/图片/字体的通道。
+ * 与 page 同一条 SSRF 防线(那部分不重复覆盖),差异全在这里:内容类型白名单、
+ * 独立的令牌桶与并发闸、独立的字节上限、出站 accept。
+ */
+describe('资源抓取(kind=asset)', () => {
+  it('text/css 放行:声明 charset 时透传,未声明时就是 text/css', async () => {
+    const f = await setup()
+    const css = '@font-face{font-family:X}body{color:red}'
+    f.origin.respond((url, res) => {
+      res.writeHead(200, {
+        'content-type': url === '/plain.css' ? 'text/css' : 'text/css; charset=utf-8',
+      })
+      res.end(css)
+    })
+    const withCharset = await f.postAsset('http://origin.test/a.css')
+    expect(withCharset.status).toBe(200)
+    expect(withCharset.headers.get('content-type')).toBe('text/css; charset=utf-8')
+    expect(await withCharset.text()).toBe(css)
+    expect(withCharset.headers.get(FETCH_URL_HEADER_FINAL_URL)).toBe('http://origin.test/a.css')
+    expect(withCharset.headers.get('cache-control')).toBe('no-store')
+
+    const plain = await f.postAsset('http://origin.test/plain.css')
+    expect(plain.status).toBe(200)
+    expect(plain.headers.get('content-type')).toBe('text/css')
+  })
+
+  it('image/svg+xml:asset 放行(只进无脚本沙箱的图像上下文),page 仍拒 415', async () => {
+    const f = await setup()
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4"/></svg>'
+    f.origin.respond((_url, res) => {
+      res.writeHead(200, { 'content-type': 'image/svg+xml' })
+      res.end(svg)
+    })
+    const asAsset = await f.postAsset('http://origin.test/i.svg')
+    expect(asAsset.status).toBe(200)
+    expect(asAsset.headers.get('content-type')).toBe('image/svg+xml')
+    expect(await asAsset.text()).toBe(svg)
+
+    const asPage = await f.post('http://origin.test/i.svg')
+    expect(asPage.status).toBe(415)
+    expect(await asPage.json()).toMatchObject({ error: 'unsupported-content' })
+  })
+
+  it('font/woff2 放行,字节原样回传', async () => {
+    const f = await setup()
+    const woff2 = Buffer.concat([Buffer.from('wOF2', 'latin1'), Buffer.alloc(64, 3)])
+    f.origin.respond((_url, res) => {
+      res.writeHead(200, { 'content-type': 'font/woff2' })
+      res.end(woff2)
+    })
+    const res = await f.postAsset('http://origin.test/f.woff2')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('font/woff2')
+    expect(Buffer.from(await res.arrayBuffer()).equals(woff2)).toBe(true)
+  })
+
+  it('octet-stream 按魔数嗅探:wOF2 → font/woff2、PNG → image/png、认不出 → 415', async () => {
+    const f = await setup()
+    f.origin.respond((url, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' })
+      if (url === '/f.woff2') res.end(Buffer.concat([Buffer.from('wOF2', 'latin1'), Buffer.alloc(32, 5)]))
+      else if (url === '/i.png')
+        res.end(
+          Buffer.concat([
+            Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+            Buffer.alloc(32, 7),
+          ]),
+        )
+      else res.end(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x01]))
+    })
+    const font = await f.postAsset('http://origin.test/f.woff2')
+    expect(font.status).toBe(200)
+    expect(font.headers.get('content-type')).toBe('font/woff2')
+    const png = await f.postAsset('http://origin.test/i.png')
+    expect(png.status).toBe(200)
+    expect(png.headers.get('content-type')).toBe('image/png')
+    const zip = await f.postAsset('http://origin.test/x.zip')
+    expect(zip.status).toBe(415)
+  })
+
+  it('非资源类型一律 415:video/mp4、以及文档类的 text/html(asset 只服务附属资源)', async () => {
+    const f = await setup()
+    f.origin.respond((url, res) => {
+      if (url === '/a.mp4') {
+        res.writeHead(200, { 'content-type': 'video/mp4' })
+        res.end(Buffer.from([0x00, 0x00, 0x00, 0x18]))
+      } else {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<html>doc</html>')
+      }
+    })
+    const mp4 = await f.postAsset('http://origin.test/a.mp4')
+    expect(mp4.status).toBe(415)
+    expect(await mp4.json()).toMatchObject({ error: 'unsupported-content' })
+    const html = await f.postAsset('http://origin.test/doc.html')
+    expect(html.status).toBe(415)
+  })
+
+  it('出站 accept:asset 表态 css/图片/字体,page 仍是正文那套,其余出站头不变', async () => {
+    const f = await setup()
+    f.origin.respond((url, res) => {
+      if (url === '/s.css') {
+        res.writeHead(200, { 'content-type': 'text/css' })
+        res.end('a{}')
+      } else {
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<html>p</html>')
+      }
+    })
+    expect((await f.postAsset('http://origin.test/s.css')).status).toBe(200)
+    const assetHeaders = f.origin.requests[0].headers
+    const assetAccept = String(assetHeaders.accept)
+    expect(assetAccept).toContain('image/*')
+    expect(assetAccept).toContain('text/css')
+    expect(assetAccept).toContain('font/*')
+    // accept 之外的出站头两种 kind 完全一致,且照样不带任何凭据
+    expect(assetHeaders['accept-encoding']).toBe('identity')
+    expect(assetHeaders['accept-language']).toBe('zh-CN,zh;q=0.9,en;q=0.8')
+    expect(assetHeaders.cookie).toBeUndefined()
+
+    expect((await f.post('http://origin.test/p.html')).status).toBe(200)
+    const pageAccept = String(f.origin.requests[1].headers.accept)
+    expect(pageAccept).toContain('text/html')
+    expect(pageAccept).not.toContain('image/*')
+  })
+
+  it('page 令牌桶耗尽不影响 asset 桶', async () => {
+    const f = await setup()
+    f.origin.respond((_url, res) => {
+      res.writeHead(200, { 'content-type': 'text/css' })
+      res.end('a{}')
+    })
+    // 畸形 URL 抽干 page 桶(桶在参数校验之前扣):5 次 400 + 第 6 次 429
+    for (let i = 0; i < 5; i++) expect((await f.post('not a url')).status).toBe(400)
+    expect((await f.post('not a url')).status).toBe(429)
+    const asset = await f.postAsset('http://origin.test/a.css')
+    expect(asset.status).toBe(200)
+  })
+
+  it('asset 令牌桶耗尽不影响 page 桶', async () => {
+    const f = await setup()
+    // 容量 60、每 200ms 回一枚:循环到出现 429 为止,不假定"恰好第 61 次"(途中会回填)
+    let limited: Response | null = null
+    for (let i = 0; i < 300 && !limited; i++) {
+      const res = await f.postBody({ url: 'not a url', kind: 'asset' })
+      if (res.status === 429) limited = res
+      else expect(res.status).toBe(400)
+    }
+    expect(limited).not.toBeNull()
+    expect(await limited!.json()).toMatchObject({ error: 'rate-limited' })
+    expect(Number(limited!.headers.get('retry-after'))).toBeGreaterThan(0)
+    expect((await f.post('http://origin.test/still-ok')).status).toBe(200)
+  })
+
+  it('asset 并发闸(3)与 page 并发闸(1)彼此独立', async () => {
+    const f = await setup()
+    let release = (): void => {}
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    f.origin.respond((url, res) => {
+      if (url.startsWith('/hold')) {
+        void held.then(() => {
+          res.writeHead(200, { 'content-type': 'text/css' })
+          res.end('a{}')
+        })
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/html' })
+      res.end('<html>p</html>')
+    })
+    const inFlight = [0, 1, 2].map((i) => f.postAsset(`http://origin.test/hold${i}`))
+    await waitFor(
+      () => f.origin.requests.filter((r) => r.url.startsWith('/hold')).length === 3,
+      '3 个资源请求占住并发名额',
+    )
+    // 第 4 个资源请求撞闸:429,且根本不出网
+    const fourth = await f.postAsset('http://origin.test/hold3')
+    expect(fourth.status).toBe(429)
+    expect(await fourth.json()).toMatchObject({ error: 'rate-limited' })
+    // 正文闸(容量 1)完全没被资源占用
+    expect((await f.post('http://origin.test/p.html')).status).toBe(200)
+    expect(f.origin.requests.filter((r) => r.url.startsWith('/hold')).length).toBe(3)
+
+    release()
+    for (const p of inFlight) expect((await p).status).toBe(200)
+  })
+
+  it('单个资源超过 8MB → 413,同样字节走 page(20MB 上限)则放行', async () => {
+    const f = await setup()
+    const size = FETCH_ASSET_MAX_BYTES + 1
+    const big = Buffer.alloc(size, 0)
+    // PNG 魔数:page 通道认它是白名单位图,于是差异只剩"字节上限按 kind 取"
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(big)
+    f.origin.respond((_url, res) => {
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(size) })
+      res.end(big)
+    })
+    const asAsset = await f.postAsset('http://origin.test/huge.png')
+    expect(asAsset.status).toBe(413)
+    const json = (await asAsset.json()) as { error: string; message: string }
+    expect(json.error).toBe('fetch-too-large')
+    expect(json.message).toContain('声明')
+
+    const asPage = await f.post('http://origin.test/huge.png')
+    expect(asPage.status).toBe(200)
+    expect(Number(asPage.headers.get('content-length'))).toBe(size)
+  })
+
+  it('kind 非法 → 400 invalid-input,不出网', async () => {
+    const f = await setup()
+    const res = await f.postBody({ url: 'http://origin.test/', kind: 'bogus' })
+    expect(res.status).toBe(400)
+    const json = (await res.json()) as { error: string; message: string }
+    expect(json.error).toBe('invalid-input')
+    expect(json.message).toContain('kind')
+    expect(f.origin.requests).toHaveLength(0)
   })
 })

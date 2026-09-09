@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { SyncTable } from '../../../../shared/apiTypes'
 import { PAPER_TASKS, buildStructuredFallbackSpec } from '../../../data/paperPolicy'
 import { LlmError, type LlmAuthCode } from '../../llmClient'
 import { GatewayError, type ModelGateway } from '../modelGateway'
@@ -50,6 +51,11 @@ export interface TranslationScheduler {
   setWindow(currentBlockIndex: number): void
   /** 单块重试：清失败标记并重新入窗 */
   retryBlock(blockIndex: number): void
+  /**
+   * 重读译文表并补进内存（跨设备同步补拉后的失效通知，见 PLAN 1.6）：
+   * 只补缺失/有变化的块、把这些块从 failed 里剔除；不改停机/授权状态。
+   */
+  reload(): Promise<void>
   dispose(): void
 }
 
@@ -86,20 +92,35 @@ export function createTranslationScheduler(opts: {
     if (!disposed) opts.onChange({ texts: new Map(texts), failed: new Set(failed), authIssue })
   }
 
-  const load = async () => {
-    let rows: BlockTranslation[] = []
-    try {
-      rows = await deps.loadTranslations(paper.id)
-    } catch {
-      // 读缓存失败按空缓存处理：代价是重译，不阻断阅读
-    }
+  /**
+   * 把库里的译文行灌进内存 Map，返回实际写入（新增或内容有变）的块序号。
+   * load 与 reload 共用同一套校验口径，reload 据返回值精准清 failed。
+   */
+  const applyRows = (rows: readonly BlockTranslation[]): number[] => {
+    const applied: number[] = []
     for (const row of rows) {
       const block = blockByIndex.get(row.blockIndex)
       if (!block) continue
       // promptVersion / srcHash 不符视同缺失（协议升级或原文重解析后懒重译）
       if (row.promptVersion !== TRANSLATE_PROMPT_VERSION || row.srcHash !== srcHash(block.text)) continue
+      if (texts.get(row.blockIndex) === row.text) continue // 已是同一份译文：不动、不算变化
       texts.set(row.blockIndex, row.text)
+      applied.push(row.blockIndex)
     }
+    return applied
+  }
+
+  const readRows = async (): Promise<BlockTranslation[]> => {
+    try {
+      return await deps.loadTranslations(paper.id)
+    } catch {
+      // 读缓存失败按空缓存处理：代价是重译，不阻断阅读
+      return []
+    }
+  }
+
+  const load = async () => {
+    applyRows(await readRows())
     emit()
   }
 
@@ -272,6 +293,21 @@ export function createTranslationScheduler(opts: {
       recompute()
       schedule()
     },
+    async reload() {
+      if (disposed) return
+      const rows = await readRows()
+      if (disposed) return
+      const applied = applyRows(rows)
+      if (!applied.length) return // 无新增/无变化：不 emit，免得每次同步补拉都白重渲染整篇
+      // 本地翻译失败的块，远端（另一台设备）已经译好了：清掉失败标记，chip 变回正文
+      for (const i of applied) failed.delete(i)
+      emit()
+      // 新到的译文可能正好补上当前窗口的缺口：重算，别再花钱翻已经有的块。
+      // 未 activate（loadPromise 为空）时不出包——与 setWindow 同一道门槛
+      if (paper.sensitive || !loadPromise) return
+      recompute()
+      schedule()
+    },
     retryBlock(blockIndex) {
       if (disposed) return
       failed.delete(blockIndex)
@@ -300,6 +336,17 @@ export interface UseTranslationsResult extends TranslationSnapshot {
 }
 
 const EMPTY_SNAPSHOT: TranslationSnapshot = { texts: new Map(), failed: new Set(), authIssue: null }
+
+/**
+ * `paper-sync-pulled`（同步引擎补拉落库后派发）的 detail 过滤：只认「这篇论文 + 这张表」的补拉。
+ * detail 缺失/字段畸形一律忽略——窗口事件是跨模块契约，别让一个坏消息把重读打成异常。
+ */
+export function isPulledFor(detail: unknown, paperId: string, table: SyncTable): boolean {
+  if (!detail || typeof detail !== 'object') return false
+  const { paperIds, tables } = detail as { paperIds?: unknown; tables?: unknown }
+  if (!Array.isArray(paperIds) || !Array.isArray(tables)) return false
+  return paperIds.includes(paperId) && tables.includes(table)
+}
 
 export function useTranslations(opts: {
   paper: PaperRecord | null
@@ -363,6 +410,18 @@ export function useTranslations(opts: {
     const timer = setTimeout(() => schedulerRef.current?.setWindow(currentBlockIndex), WINDOW_DEBOUNCE_MS)
     return () => clearTimeout(timer)
   }, [langMode, currentBlockIndex, paper, blocks])
+
+  // 跨设备同步：另一台设备译好的行被补拉进本地库后，引擎派 paper-sync-pulled；
+  // Dexie 里已经是新真相，重读补进内存即可（PLAN 1.6 的客户端失效通知）
+  const syncPaperId = paper?.id
+  useEffect(() => {
+    if (!syncPaperId) return
+    const onPulled = (e: Event) => {
+      if (isPulledFor((e as CustomEvent).detail, syncPaperId, 'translations')) void schedulerRef.current?.reload()
+    }
+    window.addEventListener('paper-sync-pulled', onPulled)
+    return () => window.removeEventListener('paper-sync-pulled', onPulled)
+  }, [syncPaperId])
 
   const retryBlock = useCallback((blockIndex: number) => {
     schedulerRef.current?.retryBlock(blockIndex)

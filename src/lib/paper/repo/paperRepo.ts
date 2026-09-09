@@ -34,6 +34,22 @@ export interface ReadyStats {
 }
 
 /**
+ * 原地替换论文源文件（「网页原貌」重新导入用，见 url/urlImport.ts 的 reimportUrlPaperInPlace）。
+ * 定义放在这里而不是 url/ 里：仓储不该反向依赖导入管线（会形成 repo → url → repo 的环），
+ * urlImport 直接复用本类型。title/fileName/source 缺省 = 保留原值。
+ */
+export interface ReplaceFileInput {
+  bytes: ArrayBuffer
+  mime: string
+  sha256: string
+  byteSize: number
+  format: PaperFormat
+  source?: PaperSource
+  title?: string
+  fileName?: string
+}
+
+/**
  * §4.3 可替换服务边界：论文、正文块、导入任务与阅读进度的持久化。
  * v1 是 Dexie/IndexedDB 实现；接口本身不含任何 Dexie 类型，未来可整体换成服务端实现。
  */
@@ -42,6 +58,8 @@ export interface PaperRepository {
   getPaper(id: string): Promise<PaperRecord | undefined>
   findBySha256(sha: string): Promise<PaperRecord | undefined>
   createPaper(input: NewPaperInput): Promise<PaperRecord>
+  /** 保 paperId 换源文件：状态回 queued 等待 reingestPaper 重解析，块级派生物（译文/高亮）作废 */
+  replaceFile(paperId: string, input: ReplaceFileInput): Promise<void>
   getFileBytes(paperId: string): Promise<PaperFileBytes | undefined>
   saveBlocks(paperId: string, blocks: NormalizedBlock[]): Promise<void>
   getBlocks(paperId: string): Promise<PaperBlock[]>
@@ -147,6 +165,54 @@ export function createPaperRepository(db: PaperDb): PaperRepository {
           })
         })
         return paper
+      }),
+
+    /**
+     * 原地重导入的落库点：paperId 不变（Copilot 会话、阅读进度、画像都挂在它上面），
+     * 只把源文件与派生状态换掉。单事务覆盖五张表：
+     *   papers  → 新字节的元数据 + status:'queued' + 进度归零（新解析的块序号与旧的不可比）
+     *   files   → 新字节
+     *   jobs    → 回 queued 并 attempts+1（与 retryPaper 同语义；老论文缺 job 行就补一条）
+     *   translations / highlights → **删除**：两者都按块序号+文本锚定，重打标后必然错位，
+     *                               留着比丢掉更糟（弹窗已写明会清除）
+     * blocks/chunks 不在这里动——紧随其后的 reingestPaper 会以「先清后写」整体重建。
+     */
+    replaceFile: (paperId, input) =>
+      guard(async () => {
+        const now = Date.now()
+        await db.transaction('rw', [db.papers, db.files, db.jobs, db.translations, db.highlights], async () => {
+          const paper = await db.papers.get(paperId)
+          if (!paper) throw new IngestError('unknown', '论文记录不存在')
+
+          const patch: Partial<PaperRecord> = {
+            mime: input.mime,
+            byteSize: input.byteSize,
+            sha256: input.sha256,
+            format: input.format,
+            status: 'queued',
+            failure: undefined,
+            parserVersion: PARSER_VERSION,
+            // 保留 mode/lang（用户的视图偏好与新旧正文无关），位置类字段全部归零
+            progress: { ...paper.progress, blockIndex: 0, maxBlockIndex: 0, ratio: 0, page: undefined, updatedAt: now },
+            updatedAt: now,
+          }
+          if (input.title) patch.title = input.title
+          if (input.fileName) patch.fileName = input.fileName
+          if (input.source) patch.source = input.source
+          await db.papers.update(paperId, patch)
+
+          await db.files.put({ paperId, bytes: input.bytes, mime: input.mime })
+
+          const job = await db.jobs.where('paperId').equals(paperId).first()
+          if (job) {
+            await db.jobs.update(job.id, { stage: 'queued', attempts: job.attempts + 1, failure: undefined, updatedAt: now })
+          } else {
+            await db.jobs.add({ id: newId(), paperId, stage: 'queued', attempts: 1, startedAt: now, updatedAt: now })
+          }
+
+          await db.translations.where('paperId').equals(paperId).delete()
+          await db.highlights.where('paperId').equals(paperId).delete()
+        })
       }),
 
     getFileBytes: (paperId) => guard(() => db.files.get(paperId)),

@@ -86,6 +86,12 @@ export interface SafeFetchOptions {
   transport?: FetchTransport
   lookup?: FetchLookup
   /**
+   * 覆盖出站 `Accept` 头(其余出站头不可覆盖)。
+   * 抓资源时正文那套 `text/html,...,application/pdf` 会让部分 CDN 按内容协商回错东西
+   * (甚至 406),所以调用方按 kind 给一个贴切的 accept;不传则用正文默认值。
+   */
+  accept?: string
+  /**
    * 【仅本机开发】跳过"域名解析结果落禁区"检查(config.fetchUrlAllowForbiddenDev 透传)。
    * fake-IP DNS 环境里所有公网域名都解析进 198.18/15,不跳过则寸步难行;
    * 字面 IP 的 URL 仍在 validateTargetUrl 被拒,其余防线(端口/重定向/限额)全部保留。
@@ -258,6 +264,8 @@ export async function safeFetchUrl(
   const maxRedirects = opts.maxRedirects ?? FETCH_URL_MAX_REDIRECTS
   const transport = opts.transport ?? nodeTransport
   const lookup = opts.lookup ?? defaultLookup
+  // accept 之外的出站头恒定:身份相关的头(cookie/authorization/referer)永远不出现
+  const headers = opts.accept ? { ...OUTBOUND_HEADERS, accept: opts.accept } : OUTBOUND_HEADERS
   // 总预算跨跳共享:否则 3 跳重定向能把 20s 变成 80s
   const deadline = Date.now() + timeoutMs
 
@@ -301,7 +309,7 @@ export async function safeFetchUrl(
       address: target.address,
       family: target.family,
       port: url.port !== '' ? Number(url.port) : url.protocol === 'https:' ? 443 : 80,
-      headers: OUTBOUND_HEADERS,
+      headers,
       maxBytes,
       timeoutMs: remaining,
     })

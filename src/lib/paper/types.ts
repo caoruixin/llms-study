@@ -99,6 +99,19 @@ export interface UrlSourceEntry {
 export interface PaperSource {
   type: 'url'
   entries: UrlSourceEntry[]
+  /**
+   * 「网页原貌」导入的捕获摘要（阅读模式导入没有该字段）。
+   * 只存摘要不存明细：明细在快照文件头里（webSnapshot.ts 的 stats），而这里随 papers 行
+   * 免费同步——尚未拉到文件的设备也能展示「原貌 / 12 张资源 / 跳过 3 个」并决定要不要懒拉文件。
+   */
+  capture?: {
+    mode: 'rendered' | 'static'
+    assetCount: number
+    assetBytes: number
+    /** 被跳过的资源数（超上限/过大/抓取失败/类型不允许） */
+    skipped: number
+    katex?: boolean
+  }
 }
 
 export interface PaperRecord {

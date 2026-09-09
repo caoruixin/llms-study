@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getRepos } from '../repo/repos'
+// 事件过滤只此一份定义（paper-sync-pulled 的 detail 契约对译文/高亮完全相同），
+// 免得两处守卫各自漂移；useTranslations 无模块级副作用（网关是懒单例）
+import { isPulledFor } from '../translate/useTranslations'
 import type { PaperHighlight } from '../types'
 import { mergeRanges, newHighlightId } from './highlightModel'
 import type { CapturedRange } from './selectionOffsets'
@@ -30,6 +33,24 @@ export function useHighlights(paperId: string | undefined): UseHighlightsResult 
     setRows(next)
   }, [])
 
+  /**
+   * 本地写入的在途链：同步补拉后的重读排在它之后，才不会读到「还没落库的本机新行」。
+   * （同步装饰器的 applyMerge 会先 await 一次 bulkGet 查归属，写事务不是同步开的——
+   * 单靠 IndexedDB 的事务排队保证不了顺序。）失败也要让链继续，故 catch 成 resolved。
+   */
+  const localWrites = useRef<Promise<void>>(Promise.resolve())
+  const trackWrite = useCallback((p: Promise<unknown>) => {
+    // 立刻吞掉 p 的失败（等入链再挂 handler 会漏出 unhandledrejection），链本身永不 reject
+    const settled = p.then(
+      () => undefined,
+      () => undefined,
+    )
+    localWrites.current = localWrites.current.then(
+      () => settled,
+      () => settled,
+    )
+  }, [])
+
   useEffect(() => {
     rowsRef.current = []
     setRows([])
@@ -49,6 +70,27 @@ export function useHighlights(paperId: string | undefined): UseHighlightsResult 
       alive = false
     }
   }, [paperId])
+
+  // 跨设备同步：另一台设备的高亮被补拉进本地库后重读整表（PLAN 1.6 的客户端失效通知）。
+  // Dexie 是真相，直接覆盖内存态即可——重读排在本地在途写入之后，刚在本机划的行不会被吞掉。
+  useEffect(() => {
+    if (!paperId) return
+    let alive = true
+    const onPulled = (e: Event) => {
+      if (!isPulledFor((e as CustomEvent).detail, paperId, 'highlights')) return
+      void localWrites.current
+        .then(() => getRepos().highlight.getHighlights(paperId))
+        .then((loaded) => {
+          if (alive) commit(loaded)
+        })
+        .catch(() => undefined) // 读库失败保留现有内存态：下次补拉/重开还有机会
+    }
+    window.addEventListener('paper-sync-pulled', onPulled)
+    return () => {
+      alive = false
+      window.removeEventListener('paper-sync-pulled', onPulled)
+    }
+  }, [paperId, commit])
 
   const addCaptured = useCallback(
     (captured: readonly CapturedRange[], blockIdOf: (blockIndex: number) => string | undefined): number => {
@@ -79,18 +121,18 @@ export function useHighlights(paperId: string | undefined): UseHighlightsResult 
       }
       commit(next)
       // 落库失败不回滚内存态：本会话仍可见，刷新后丢这一笔
-      void getRepos().highlight.applyMerge(toDelete, toPut).catch(() => undefined)
+      trackWrite(getRepos().highlight.applyMerge(toDelete, toPut))
       return toPut.length
     },
-    [paperId, commit],
+    [paperId, commit, trackWrite],
   )
 
   const remove = useCallback(
     (id: string) => {
       commit(rowsRef.current.filter((r) => r.id !== id))
-      void getRepos().highlight.deleteHighlights([id]).catch(() => undefined)
+      trackWrite(getRepos().highlight.deleteHighlights([id]))
     },
-    [commit],
+    [commit, trackWrite],
   )
 
   const byBlock = useMemo(() => {

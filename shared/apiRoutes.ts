@@ -95,6 +95,61 @@ export const MAX_URLS_PER_IMPORT = 20
  */
 export const FETCH_URL_HEADER_FINAL_URL = 'x-fetch-final-url'
 
+// ---- 资源抓取(网页原貌导入的 kind=asset)----
+//
+// 「资源」= 一次网页原貌导入所需的样式表/图片/字体。它与正文抓取共用同一条通道
+// (同一套 SSRF 防线、同一个 safeFetchUrl、同一组出站头),只在**限额维度**上分家:
+// 一次快照要顺序抓几十个小文件,若共用 FETCH_URL_* 的 5 枚/10s 桶与并发 1,
+// 单篇快照会把用户自己的正常导入饿死。所以给 asset 一套独立的桶与并发闸。
+
+/**
+ * 单个资源字节上限 8MB:样式表通常 <500KB、字体 <1MB、图片极少超过 8MB。
+ * 比 FETCH_URL_MAX_BYTES(20MB)小得多——快照要抓几十个资源,单个上限必须更保守,
+ * 否则总内存峰值随资源数线性放大。
+ */
+export const FETCH_ASSET_MAX_BYTES = 8 * 1024 * 1024
+/** 单个资源抓取总超时 15s:比正文短——快照有几十个资源要抓,慢资源应尽早放弃并跳过 */
+export const FETCH_ASSET_TIMEOUT_MS = 15_000
+/**
+ * 每用户资源令牌桶:60 容量、每 200ms 回一枚。
+ * 容量按"一篇快照的资源上限(≤80)"量级取,回填速率(5 枚/秒)保证连抓不至于卡死;
+ * 与正文桶完全独立——快照抓资源永远不该挤占用户正常导入网页的额度。
+ */
+export const FETCH_ASSET_RATE_CAPACITY = 60
+export const FETCH_ASSET_RATE_REFILL_MS = 200
+/** 每用户并发资源抓取 3:与客户端 fetchAssets 的并发 3 对齐,再多只放大探测能力与内存峰值 */
+export const FETCH_ASSET_MAX_CONCURRENT = 3
+
+/**
+ * 资源 media type 白名单(样式表 / 图片 / 字体三组),前后端共用:
+ * 服务端 fetch-url 的 asset 通道只放行这三组(嗅探结果也只落在这里面的规范写法),
+ * 客户端 fetchAssets 再按"这条资源计划的是哪一类"逐组核对——两端一份清单,不会再漂移。
+ * 刻意**不含** HTML/PDF:asset 通道只服务「一篇网页原貌的附属资源」。
+ * image/svg+xml 仅 asset 放行(page 仍拒):它只会被喂给无脚本沙箱 iframe 里的 `<img>`/CSS url()。
+ */
+export const FETCH_ASSET_CSS_MEDIA_TYPES: readonly string[] = ['text/css']
+export const FETCH_ASSET_IMAGE_MEDIA_TYPES: readonly string[] = [
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+  'image/svg+xml',
+  'image/x-icon',
+  'image/vnd.microsoft.icon',
+]
+export const FETCH_ASSET_FONT_MEDIA_TYPES: readonly string[] = [
+  'font/woff',
+  'font/woff2',
+  'font/ttf',
+  'font/otf',
+  'application/font-woff',
+  'application/font-woff2',
+  'application/x-font-ttf',
+  'application/x-font-opentype',
+  'application/vnd.ms-fontobject',
+]
+
 // ---- 语音助手(Voice Copilot)----
 
 /**

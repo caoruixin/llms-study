@@ -30,6 +30,11 @@ export class ApiRequestError extends Error {
   code: ApiFailureCode
   /** 仅 HTTP 错误携带；network 错误没有状态码 */
   status?: number
+  /**
+   * 仅 429 携带：服务端 `Retry-After`（秒）换算成毫秒，供调用方退避重试。
+   * 刻意不进构造函数——绝大多数调用点不关心它，由抛错处按需挂上（见 fetchUrlApi.ts）。
+   */
+  retryAfterMs?: number
   constructor(code: ApiFailureCode, message: string, status?: number) {
     super(message)
     this.code = code

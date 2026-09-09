@@ -149,6 +149,10 @@ export const SYNC_TABLES = [
   'conceptStates',
   'evidence',
   'usage',
+  // 译文与高亮(PLAN-web-snapshot-sync §1.6):同账号换设备不丢高亮、不重复付费翻译。
+  // 服务端 allowlist 由本数组派生 → 必须服务端先发版,旧服务端会以 tbl-not-allowed 拒收
+  'translations',
+  'highlights',
 ] as const
 export type SyncTable = (typeof SYNC_TABLES)[number]
 
@@ -204,6 +208,17 @@ export interface DeletePaperResponse {
   cursor: number
 }
 
+/**
+ * GET /sync/summary(PLAN-web-snapshot-sync §1.3 对账用):每篇存活论文在服务端的 blocks 行数
+ * 与已存文件的 sha。比 snapshot 轻得多(O(论文数) 而非 O(全部行)),客户端据此发现
+ * 「papers 行在、blocks/文件缺」的空心论文并重新入队 push-artifacts。
+ */
+export interface SyncSummaryResponse {
+  papers: { paperId: string; blocks: number }[]
+  files: { paperId: string; sha256: string; byteSize: number }[]
+  cursor: number
+}
+
 export interface FilePutResponse {
   ok: true
   sha256: string
@@ -215,9 +230,15 @@ export interface FilePutResponse {
 /**
  * POST /api/app/fetch-url 请求体:一次一个 URL(前端逐条串行抓)。
  * 成功响应不是 JSON 而是原始字节 + `X-Fetch-Final-Url` 头,正文抽取在客户端做。
+ *
+ * `kind` 只决定**限额与内容类型白名单**,安全防线(SSRF/端口/重定向逐跳重验)两者完全一致:
+ * - `page`(默认,老客户端不传即此值):正文/PDF/位图,走 FETCH_URL_* 限额;
+ * - `asset`:网页原貌导入所需的样式表/图片/字体,走独立的 FETCH_ASSET_* 桶与并发闸,
+ *   放行 text/css 与字体类型(正文抓取一律拒),不放行 HTML/PDF。
  */
 export interface FetchUrlBody {
   url: string
+  kind?: 'page' | 'asset'
 }
 
 // ---- 语音助手(Voice Copilot)----
