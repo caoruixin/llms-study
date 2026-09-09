@@ -50,6 +50,11 @@ export interface CaptureAgentConfig {
   quietMs: number
   /** load 之后最多再等多久（静默判定的封顶，防无限动画/轮询页面永远不静默） */
   maxAfterLoadMs: number
+  /**
+   * 文档解析完毕后，最多再给 `load` 事件多久。
+   * 沙箱里 `load` 常常永不触发（子资源被 CSP/跨源挡住），到点就往下走。
+   */
+  afterParsedMs: number
   /** 代理自己的硬超时：到点有什么序列化什么 */
   hardTimeoutMs: number
   /** 序列化结果的字节上限，超了回 `{ok:false, reason:'too-large'}` */
@@ -61,6 +66,7 @@ export interface CaptureAgentConfig {
 export const DEFAULT_CAPTURE_CONFIG: Omit<CaptureAgentConfig, 'parentOrigin'> = {
   quietMs: 700,
   maxAfterLoadMs: 6000,
+  afterParsedMs: 1500,
   hardTimeoutMs: 20000,
   maxHtmlBytes: 8 * 1024 * 1024,
   sweep: true,
@@ -383,19 +389,53 @@ export function captureAgentMain(
     }
   }
 
+  /**
+   * 等页面「可以开始抓」——**解析完毕即可，不死等 `load`**。
+   *
+   * 捕获 iframe 是 `sandbox="allow-scripts"` 的不透明源：站点脚本一上来就可能因跨源访问抛错，
+   * 子资源也常常永远落不了地（实测 openai.com 文章页在沙箱里 `readyState` 恒为 `interactive`，
+   * `load` 从不触发）。旧代码把整条链吊在 `load` 上，于是只能等硬超时兜底，
+   * `annotate()+serialize()` 被挤到最后 2s，父级先超时、iframe 被销毁，消息永远送不到。
+   *
+   * 与 reader 侧 0325c63「解析就绪即绑定不等 load」同一个道理：readyState 过了 loading 就推进，
+   * 再给 `load` 一个**有上限**的额外窗口（真能 load 的页面照旧等它，等不到也不拖死）。
+   */
   function whenLoaded(): Promise<void> {
     return new Promise(function (resolve) {
       if (doc.readyState === 'complete') {
         resolve()
         return
       }
-      try {
-        w.addEventListener('load', function () {
-          resolve()
-        }, { once: true })
-      } catch {
+      let done = false
+      function finishWait(): void {
+        if (done) return
+        done = true
         resolve()
       }
+      try {
+        w.addEventListener('load', finishWait, { once: true })
+      } catch {
+        finishWait()
+        return
+      }
+      // 解析完毕后最多再给 load 这么久；到点就走，不把整次捕获赌在 load 上
+      function pollParsed(): void {
+        if (done) return
+        if (doc.readyState !== 'loading') {
+          try {
+            w.setTimeout(finishWait, cfg.afterParsedMs)
+          } catch {
+            finishWait()
+          }
+          return
+        }
+        try {
+          w.setTimeout(pollParsed, 50)
+        } catch {
+          finishWait()
+        }
+      }
+      pollParsed()
     })
   }
 
@@ -552,12 +592,28 @@ export function captureAgentMain(
     })
   }
 
+  /**
+   * 硬超时**只保护到 `finish()` 开始为止**，不能在开跑前就解除。
+   *
+   * 旧写法是 `clearHard(); finish()`——在最贵的一步（annotate + cloneNode(true) + 九次树遍历 +
+   * outerHTML + encode，2MB 文档动辄数秒）之前先把自己的保险拆了，只剩父级的绝对超时兜底；
+   * 而硬超时又刚好设在父级预算减 2s 处，序列化根本做不完，父级先超时销毁 iframe，消息永远送不到。
+   *
+   * 现在：定时器只在 `finish()` **真正开始**时清除（`posted` 保证只发一条，重入无害）。
+   */
   function run(): void {
     let hard: any = 0
+    let started = false
+    function startFinish(): void {
+      if (started) return
+      started = true
+      try {
+        w.clearTimeout(hard)
+      } catch {}
+      finish()
+    }
     try {
-      hard = w.setTimeout(function () {
-        finish()
-      }, cfg.hardTimeoutMs)
+      hard = w.setTimeout(startFinish, cfg.hardTimeoutMs)
     } catch {
       hard = 0
     }
@@ -572,16 +628,10 @@ export function captureAgentMain(
         .then(sweep)
         .then(quiesce)
         .then(twoFrames)
-        .then(
-          function () {
-            clearHard()
-            finish()
-          },
-          function (e: any) {
-            clearHard()
-            fail(errText(e))
-          },
-        )
+        .then(startFinish, function (e: any) {
+          clearHard()
+          fail(errText(e))
+        })
     } catch (e) {
       clearHard()
       fail(errText(e))

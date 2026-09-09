@@ -240,6 +240,39 @@ describe('buildWebSnapshot：Tier 2 开关', () => {
       warn.mockRestore()
     }
   })
+
+  /**
+   * 回归：openai.com 文章页。SSR 的 HTML 里正文完好，但在不透明源沙箱里跑站点 JS 后
+   * 捕获到的是空壳，而 Tier 2 **没有抛错** —— 旧代码原样采信，一路到「未得到正文」才炸。
+   */
+  it('captureRendered 成功但产物近乎空白 → 与静态对照后改用静态，不再误报「未得到正文」', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { deps } = fakeDeps()
+      const blank = '<html><head><title>空壳</title></head><body><div id="root"></div></body></html>'
+      const { header, renderFallback } = await buildWebSnapshot(
+        { url: PAGE, html: HTML, finalUrl: PAGE },
+        { ...deps, captureRendered: async () => ({ html: blank, title: '空壳', finalUrl: PAGE, viewportWidth: 1280, agentVersion: 3 }) },
+      )
+      expect(header.capture.mode).toBe('static')
+      expect(renderFallback).toMatch(/渲染捕获退化/)
+      expect(header.title).toBe('快照标题')
+      expect(warn).toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('渲染产物本来就短、静态也没更多 → 保持 rendered，不因字数少就误退静态', async () => {
+    const { deps } = fakeDeps()
+    const short = '<html><head><title>短</title></head><body><h1>标题</h1><p>都很短。</p></body></html>'
+    const err = await buildWebSnapshot(
+      { url: PAGE, html: short, finalUrl: PAGE },
+      { ...deps, captureRendered: async () => ({ html: short, title: '短', finalUrl: PAGE, viewportWidth: 1280, agentVersion: 3 }) },
+    ).catch((e: unknown) => e)
+    // 两边一样少 → 不切静态，最终仍按「正文太少」失败，但文案要说清是渲染捕获
+    expect((err as Error).message).toContain('渲染捕获')
+  })
 })
 
 describe('buildWebSnapshot：失败判定', () => {
@@ -250,6 +283,8 @@ describe('buildWebSnapshot：失败判定', () => {
     expect(err).toBeInstanceOf(IngestError)
     expect((err as InstanceType<typeof IngestError>).kind).toBe('empty')
     expect((err as Error).message).toContain('阅读模式')
+    // 文案要说清「哪条路、拿到多少字」，不再一口咬定「依赖脚本渲染」
+    expect((err as Error).message).toMatch(/静态捕获只得到 \d+ 字/)
   })
 
   it('sanitize 后 html > 8MB → IngestError(too-large)', async () => {

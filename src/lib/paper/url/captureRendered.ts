@@ -59,12 +59,21 @@ export interface RenderedCapture {
 export interface CaptureRenderedOptions {
   signal?: AbortSignal
   config?: Partial<Omit<CaptureAgentConfig, 'parentOrigin'>>
-  /** 外层超时：默认比代理自己的硬超时多 2s，留给「代理已发消息但还在路上」的窗口 */
+  /** 外层超时：默认比代理自己的硬超时多 `SERIALIZE_HEADROOM_MS`，留给硬超时那一刻才开始的序列化 */
   outerTimeoutMs?: number
   /** 注入点（测试用）：iframe 建在哪个文档、消息监听挂在哪个窗口 */
   doc?: Document
   parentWindow?: Window
 }
+
+/**
+ * 代理硬超时之后再留给父页的窗口。
+ *
+ * 硬超时到点时代理**才刚开始** `finish()`（annotate + cloneNode(true) + 九次树遍历 + outerHTML +
+ * encode）。原来只留 2s，2MB 级文档做不完——父页先超时、iframe 被移除，代理消息永远送不到，
+ * 于是一次「其实能抓到」的捕获被记成 timeout。给足余量，让慢但有效的捕获能落地。
+ */
+const SERIALIZE_HEADROOM_MS = 8000
 
 /** 在视口内但完全隐身：见文件头第 3 条，不能换成 display:none / left:-9999px */
 const IFRAME_STYLE =
@@ -116,7 +125,7 @@ function runCapture(
     ...opts.config,
     parentOrigin: parentOriginOf(parentWindow),
   }
-  const outerTimeoutMs = opts.outerTimeoutMs ?? cfg.hardTimeoutMs + 2000
+  const outerTimeoutMs = opts.outerTimeoutMs ?? cfg.hardTimeoutMs + SERIALIZE_HEADROOM_MS
 
   const iframe = doc.createElement('iframe')
   iframe.setAttribute('sandbox', 'allow-scripts')

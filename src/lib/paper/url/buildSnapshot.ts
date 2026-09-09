@@ -67,6 +67,13 @@ export interface BuildSnapshotResult {
 
 /** 全文（所有块 text 之和）低于此值判「未得到正文」 */
 const MIN_TOTAL_CHARS = 200
+/**
+ * 渲染产物「可疑」的字数线：低于它才去解析一份静态产物来对照。
+ * 只在可疑时才多解析一次，正常导入零额外开销。
+ */
+const RENDER_SUSPECT_CHARS = MIN_TOTAL_CHARS * 5
+/** 静态产物要比渲染产物多这么多倍，才认定渲染退化、改用静态 */
+const RENDER_DEGRADED_RATIO = 2
 /** `@import` 拉平深度：页面样式表 → 一层 → 两层；再深的保留为绝对 `@import` */
 const MAX_IMPORT_DEPTH = 2
 /** 静态路径没有视口概念 */
@@ -272,6 +279,16 @@ function reconcileBlocks(sanitizedHtml: string, blocks: NormalizedBlock[]): { ht
 // 主入口
 // ---------------------------------------------------------------------------
 
+/**
+ * 一份捕获产物能出多少正文字符：直接用 `stampBlocks` 这个唯一口径，
+ * 免得判据和 341 行的阈值各算各的。`stampBlocks` 自己会先 `unstamp`，可重复调用。
+ */
+function blockTextTotal(captured: CapturedDocument): number {
+  let total = 0
+  for (const b of stampBlocks(captured.doc)) total += b.text.length
+  return total
+}
+
 async function capture(input: BuildSnapshotInput, deps: BuildSnapshotDeps): Promise<{
   captured: CapturedDocument
   viewportWidth: number
@@ -289,10 +306,40 @@ async function capture(input: BuildSnapshotInput, deps: BuildSnapshotDeps): Prom
         katex: deps.katex,
         mode: 'rendered',
       })
+      /**
+       * 渲染产物健全性检查：**跑站点 JS 有可能比不跑更糟**。
+       *
+       * 实测 openai.com 的文章页：SSR 的 HTML 里正文完好（静态口径 106 块 / 15,920 字），
+       * 但在 `sandbox="allow-scripts"` 的不透明源里，站点 JS 一上来就 `SecurityError`、
+       * `load` 事件永不触发，最终捕获到的是一份近乎空白的文档。Tier 2 **没有抛错**，
+       * 于是旧代码原样采信，一路到「未得到正文」才炸——而同一份 HTML 走静态必定成功。
+       *
+       * 所以这里不再无条件相信 Tier 2：产物字数可疑时解析一份静态产物对照，谁多用谁。
+       * 只在可疑时才对照，正常页面不多花一次解析。
+       */
+      const renderedChars = blockTextTotal(captured)
+      if (renderedChars < RENDER_SUSPECT_CHARS) {
+        throwIfAborted(deps.signal, ABORT_MESSAGE)
+        const fallback = await captureStatic({ html: input.html, finalUrl: input.finalUrl, katex: deps.katex })
+        const staticChars = blockTextTotal(fallback)
+        if (staticChars >= renderedChars * RENDER_DEGRADED_RATIO && staticChars >= MIN_TOTAL_CHARS) {
+          const reason = `渲染捕获退化（渲染 ${renderedChars} 字 < 静态 ${staticChars} 字），改用静态捕获`
+          console.warn('[web-snapshot]', reason)
+          return {
+            captured: fallback,
+            viewportWidth: STATIC_VIEWPORT_WIDTH,
+            agentVersion: STATIC_AGENT_VERSION,
+            renderFallback: reason,
+          }
+        }
+      }
       return { captured, viewportWidth: rendered.viewportWidth, agentVersion: rendered.agentVersion ?? 1 }
     } catch (e) {
       if (isAbortError(e)) throw e
-      const reason = e instanceof Error ? e.message : String(e)
+      // CaptureError 的结构化 reason（timeout / too-large / agent-error / unavailable）以前被
+      // e.message 抹平，生产上只能靠中文散文猜是哪种失败——带上它，下次复发一眼能定位。
+      const kind = typeof (e as { reason?: unknown } | null)?.reason === 'string' ? `${(e as { reason: string }).reason}: ` : ''
+      const reason = `${kind}${e instanceof Error ? e.message : String(e)}`
       console.warn('[web-snapshot] 渲染捕获失败，回退静态捕获：', reason)
       const captured = await captureStatic({ html: input.html, finalUrl: input.finalUrl, katex: deps.katex })
       return { captured, viewportWidth: STATIC_VIEWPORT_WIDTH, agentVersion: STATIC_AGENT_VERSION, renderFallback: reason }
@@ -338,7 +385,10 @@ export async function buildWebSnapshot(input: BuildSnapshotInput, deps: BuildSna
   let totalChars = 0
   for (const b of blocks) totalChars += b.text.length
   if (totalChars < MIN_TOTAL_CHARS) {
-    throw new IngestError('empty', '页面依赖脚本渲染，原貌抓取未得到正文；可改用「阅读模式」重试')
+    // 别再一口咬定「依赖脚本渲染」：静态与渲染两条路都可能走到这里，说清是哪条、拿到了多少字，
+    // 下次复发照着这行就能定位，不必再从头排查一遍。
+    const how = renderFallback ? `静态捕获（${renderFallback}）` : `${captured.mode === 'rendered' ? '渲染' : '静态'}捕获`
+    throw new IngestError('empty', `${how}只得到 ${totalChars} 字正文，未能生成网页原貌；可改用「阅读模式」重试`)
   }
   if (new TextEncoder().encode(html).byteLength > MAX_SNAPSHOT_HTML_BYTES) {
     throw new IngestError('too-large', '网页原貌超过 8MB，请改用阅读模式')
