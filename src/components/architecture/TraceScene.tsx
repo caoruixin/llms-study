@@ -1,141 +1,103 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { HEADS, TOKENS, isLatent, isRecurrent, kvHeadCount, type AttentionStep } from '../../lib/attention/engine'
-import type { MechanismId } from '../../data/architectureTypes'
-
-export interface SceneProps { playing: boolean; mechanism: MechanismId; step: AttentionStep; stage: number; head: number; selection: string; onSelect: (id: string) => void; cameraReset: number; onUnavailable: () => void }
-const PALETTE = ['#9e2b3a', '#6d28d9', '#147d80', '#b06d14']
-const tokenX = (i: number) => -5 + i * 1.42
+import type { SceneFrame, TraceNode } from '../../lib/attention/sceneGraph'
+export interface SceneProps { graph: SceneFrame; progress: number; selection: string; focus: number | null; onSelect: (id: string) => void; cameraReset: number; onUnavailable: () => void; mechanism: string }
+export const HEAD_COLORS = ['#a32b42', '#7651bb', '#168a88', '#b27519']
 export default function TraceScene(props: SceneProps) {
-  const host = useRef<HTMLDivElement>(null)
-  const latest = useRef(props); latest.current = props
-  const api = useRef<{ refresh: () => void; reset: () => void }>()
+  const host = useRef<HTMLDivElement>(null), latest = useRef(props); latest.current = props
+  const api = useRef<{ refresh: () => void; reset: () => void; invalidate: () => void }>()
   useEffect(() => {
     const element = host.current!
     let renderer: THREE.WebGLRenderer
-    try { renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false }); if (!renderer.getContext()) throw new Error('No WebGL') }
+    try { renderer = new THREE.WebGLRenderer({ antialias: true }); if (!renderer.getContext()) throw new Error('No WebGL') }
     catch { latest.current.onUnavailable(); return }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); renderer.setClearColor('#f6f3ea')
-    renderer.outputColorSpace = THREE.SRGBColorSpace
-    element.appendChild(renderer.domElement)
-    renderer.domElement.setAttribute('aria-label', '3D Attention scene · 拖动旋转，滚轮缩放；下方提供可键盘操作的等价选择器')
-    const scene = new THREE.Scene(); scene.background = new THREE.Color('#f6f3ea')
-    const camera = new THREE.PerspectiveCamera(39, 1, .1, 100)
-    const controls = new OrbitControls(camera, renderer.domElement)
-    controls.enableDamping = true; controls.dampingFactor = .12; controls.minDistance = 9; controls.maxDistance = 33
-    controls.maxPolarAngle = Math.PI * .83; controls.enablePan = false
-    const reset = () => { camera.position.set(7, 11, 17); controls.target.set(0, .4, 0); controls.update(); invalidate() }
-    const ambient = new THREE.HemisphereLight('#ffffff', '#bbb2a1', 2.4); scene.add(ambient)
-    const light = new THREE.DirectionalLight('#ffffff', 3); light.position.set(4, 12, 8); scene.add(light)
-    const group = new THREE.Group(); scene.add(group)
-    let clickable: THREE.Object3D[] = [], animation = 0, disposed = false
-    const particles: { mesh: THREE.Mesh; from: THREE.Vector3; to: THREE.Vector3; phase: number }[] = []
-    let animatedUntil = 0
-    function render(now = performance.now()) {
-      animation = 0
-      if (disposed || document.hidden) return
-      const moving = controls.update()
-      particles.forEach(p => { const f = (latest.current.playing ? ((now / 1700 + p.phase) % 1) : .5); p.mesh.position.copy(p.from).lerp(p.to, f); p.mesh.position.y += Math.sin(f * Math.PI) * .6 })
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setClearColor('#f6f3ea'); renderer.outputColorSpace = THREE.SRGBColorSpace
+    renderer.domElement.setAttribute('aria-label', '3D Attention scene · all Heads · drag to orbit, scroll to zoom'); element.appendChild(renderer.domElement)
+    const labels = document.createElement('div'); labels.className = 'arch-scene-labels'; element.appendChild(labels)
+    const scene = new THREE.Scene(), group = new THREE.Group(); scene.add(group); scene.add(new THREE.HemisphereLight('#ffffff', '#c3b7a2', 2.5))
+    const light = new THREE.DirectionalLight('#ffffff', 3); light.position.set(3, 15, 8); scene.add(light)
+    const camera = new THREE.PerspectiveCamera(40, 1, .1, 200), controls = new OrbitControls(camera, renderer.domElement)
+    controls.enableDamping = true; controls.enablePan = true; controls.maxPolarAngle = Math.PI * .44
+    let request = 0, disposed = false, bounds = new THREE.Box3(), savedShape = ''
+    let clickable: THREE.Object3D[] = []
+    const labelNodes: { element: HTMLButtonElement; node: TraceNode }[] = [], moving: { mesh: THREE.Mesh; curve: THREE.QuadraticBezierCurve3; segment: [number, number] }[] = []
+    const projected = new THREE.Vector3()
+    const invalidate = () => { if (!disposed && !request && !document.hidden) request = requestAnimationFrame(render) }
+    function render() {
+      request = 0; if (disposed || document.hidden) return
+      const changed = controls.update(), progress = latest.current.progress
+      moving.forEach(p => { const [a, b] = p.segment, f = (progress - a) / (b - a); p.mesh.visible = f >= 0 && f <= 1; if (p.mesh.visible) p.mesh.position.copy(p.curve.getPoint(f)) })
       renderer.render(scene, camera)
-      if (!animation && (moving || latest.current.playing && now < animatedUntil)) animation = requestAnimationFrame(render)
+      labelNodes.forEach(({ element: label, node }) => {
+        projected.set(node.position[0], .7, node.position[2]).project(camera)
+        label.style.left = `${(projected.x + 1) * element.clientWidth / 2}px`; label.style.top = `${(1 - projected.y) * element.clientHeight / 2}px`
+        label.hidden = projected.z < -1 || projected.z > 1 || Math.abs(projected.x) > 1.05 || Math.abs(projected.y) > 1.05
+        const neighbor = new THREE.Vector3(node.position[0] + (node.kind === 'memory' && node.tokens ? 1.55 : 3.85), .7, node.position[2]).project(camera)
+        label.style.maxWidth = `${Math.max(25, Math.min(node.kind === 'memory' && node.tokens ? 70 : 110, Math.abs(neighbor.x - projected.x) * element.clientWidth / 2))}px`
+      })
+      if (changed) invalidate()
     }
-    function invalidate() { if (!disposed && !animation && !document.hidden) animation = requestAnimationFrame(render) }
-    const resize = () => { const width = element.clientWidth, height = element.clientHeight; if (!width || !height) return; renderer.setSize(width, height); camera.aspect = width / height; camera.updateProjectionMatrix(); invalidate() }
-    const observer = new ResizeObserver(resize); observer.observe(element)
-    controls.addEventListener('change', invalidate)
-    function disposeGroup() {
-      group.traverse(object => {
-        const mesh = object as THREE.Mesh
-        mesh.geometry?.dispose()
-        if (mesh.material) (Array.isArray(mesh.material) ? mesh.material : [mesh.material]).forEach(m => { const texture = (m as THREE.MeshBasicMaterial).map; texture?.dispose(); m.dispose() })
-      }); group.clear(); clickable = []; particles.length = 0
+    const reset = () => {
+      const center = bounds.getCenter(new THREE.Vector3()), size = bounds.getSize(new THREE.Vector3()), aspect = element.clientWidth / Math.max(1, element.clientHeight)
+      const distance = Math.max((size.x + 2) / aspect, size.z + 2) / (2 * Math.tan(THREE.MathUtils.degToRad(20)))
+      camera.position.copy(center).add(new THREE.Vector3(0, distance, distance * .52)); controls.target.copy(center); controls.minDistance = 8; controls.maxDistance = distance * 2.2; controls.update(); invalidate()
     }
-    function label(text: string, x: number, y: number, z: number, color = '#50493f', width = 2) {
-      const canvas = document.createElement('canvas'); const ctx = canvas.getContext('2d')!
-      ctx.font = '600 38px system-ui, sans-serif'; canvas.width = Math.ceil(ctx.measureText(text).width + 24); canvas.height = 64
-      ctx.font = '600 38px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = color; ctx.fillText(text, canvas.width / 2, 32)
-      const texture = new THREE.CanvasTexture(canvas); texture.colorSpace = THREE.SRGBColorSpace
-      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false, transparent: true })); const fittedWidth = Math.min(width, .55 * canvas.width / 64); sprite.scale.set(fittedWidth, fittedWidth * 64 / canvas.width, 1); sprite.position.set(x, y, z); group.add(sprite)
+    const resize = () => { const w = element.clientWidth, h = element.clientHeight; if (!w || !h) return; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); reset() }
+    function clear() {
+      group.traverse(o => { const m = o as THREE.Mesh; m.geometry?.dispose(); if (m.material) (Array.isArray(m.material) ? m.material : [m.material]).forEach(x => x.dispose()) })
+      group.clear(); labels.replaceChildren(); clickable = []; labelNodes.length = 0; moving.length = 0
     }
-    function box(id: string, position: number[], size: number[], color: string, opacity = 1) {
-      const selected = latest.current.selection === id
-      const mat = new THREE.MeshStandardMaterial({ color, roughness: .6, metalness: .04, transparent: opacity < 1, opacity, emissive: selected ? '#f5b25d' : '#000000', emissiveIntensity: selected ? .3 : 0 })
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size as [number, number, number]), mat); mesh.position.set(...position as [number, number, number]); mesh.userData.id = id; group.add(mesh)
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), new THREE.LineBasicMaterial({ color: selected ? '#c67618' : color, transparent: true, opacity: selected ? 1 : .35 })); edges.position.copy(mesh.position); edges.scale.setScalar(1.01); group.add(edges)
-      if (id) clickable.push(mesh)
-      return mesh
-    }
-    function path(from: THREE.Vector3, to: THREE.Vector3, color: string, active: boolean, phase: number) {
-      const mid = from.clone().lerp(to, .5); mid.y += .7
-      const curve = new THREE.QuadraticBezierCurve3(from, mid, to)
-      group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(20)), new THREE.LineBasicMaterial({ color, transparent: true, opacity: active ? .55 : .1 })))
-      if (active) { const mesh = new THREE.Mesh(new THREE.SphereGeometry(.06, 8, 6), new THREE.MeshBasicMaterial({ color })); group.add(mesh); particles.push({ mesh, from, to, phase }) }
-    }
-    const refresh = () => {
-      disposeGroup()
-      const { mechanism, step, head, stage } = latest.current, recurrent = isRecurrent(mechanism), latent = isLatent(mechanism), h = step.heads[head]
-      // Depth plates communicate layers; only one layer's numerical operator is evaluated.
-      for (let layer = 3; layer >= 0; layer--) {
-        box('', [0, -1.1 - layer * .48, -.5], [12.5, .07, 6.4], layer === 0 ? '#e1d8c5' : '#e9e2d5', .26 + (3 - layer) * .05)
-        label(step.layerModes.length ? `L${layer + 1} · ${step.layerModes[layer]}` : `Layer ${layer + 1}`, -6.2, -1.1 - layer * .48, 3.6, '#787062', 2.1)
-      }
-      const grid = new THREE.GridHelper(12, 24, '#d6cdbd', '#e6dfd2'); grid.position.y = -1; group.add(grid)
-      if (recurrent) {
-        const r = h.recurrent!, matrix = stage === 0 ? r.before : stage < 3 ? r.decayed : r.after
-        for (let row = 0; row < 4; row++) for (let col = 0; col < 4; col++) {
-          const v = matrix[row][col]; box(`state-${row}-${col}`, [(col - 1.5) * 1.0, .18, (row - 1.5) * .95 - .7], [.9, .2 + Math.abs(v) * .5, .82], v < 0 ? '#147d80' : PALETTE[head], .25 + Math.min(.75, Math.abs(v)))
-          label(v.toFixed(2), (col - 1.5) * 1, .8, (row - 1.5) * .95 - .7, '#403b35', .74)
+    function refresh() {
+      clear(); bounds = new THREE.Box3()
+      const { graph, focus, selection } = latest.current, locations = new Map(graph.nodes.map(n => [n.id, new THREE.Vector3(...n.position)]))
+      for (const n of graph.nodes) {
+        const color = n.head !== undefined ? HEAD_COLORS[n.head] : n.group !== undefined ? HEAD_COLORS[n.group] : n.kind === 'output' ? '#168a88' : n.kind === 'memory' ? '#9a8260' : '#807664'
+        const focused = focus === null || n.head === undefined || n.head === focus, selected = selection === n.id
+        const width = n.kind === 'memory' && n.tokens ? 1.35 : n.kind === 'state' ? 2.8 : 3.1, depth = n.kind === 'state' ? 2 : .78
+        const material = new THREE.MeshStandardMaterial({ color, roughness: .65, transparent: true, opacity: n.available ? focused ? .86 : .52 : .13, emissive: selected || n.active ? color : '#000000', emissiveIntensity: selected ? .35 : n.active ? .15 : 0 })
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, n.active ? .28 : .16, depth), material); mesh.position.set(...n.position); mesh.userData.id = n.id; group.add(mesh); clickable.push(mesh)
+        const outline = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), new THREE.LineBasicMaterial({ color: selected ? '#ba6d17' : color, transparent: true, opacity: selected ? 1 : .5 })); outline.position.copy(mesh.position); group.add(outline)
+        if (n.values && n.available) {
+          const values = n.values.flat(), cols = n.kind === 'state' ? 4 : Math.min(8, Math.max(1, values.length)), rows = Math.ceil(Math.min(values.length, 16) / cols)
+          values.slice(0, 16).forEach((v, i) => {
+            const cell = new THREE.Mesh(new THREE.BoxGeometry(width / (cols + 1) * .75, .04 + Math.min(.12, Math.abs(v) * .08), depth / (rows + 1) * .7), new THREE.MeshStandardMaterial({ color: v < 0 ? '#b4e6dd' : '#fff6de', transparent: true, opacity: .7 }))
+            cell.position.set(n.position[0] + ((i % cols) - (cols - 1) / 2) * width / (cols + 1), .23, n.position[2] + (Math.floor(i / cols) - (rows - 1) / 2) * depth / (rows + 1)); cell.userData.id = n.id; group.add(cell); clickable.push(cell)
+          })
         }
-        label(`S · 4 × 4 · H${head}`, 0, .4, -3.3, PALETTE[head], 3)
-        label(stage === 1 ? 'State Decay' : stage === 2 ? 'Prediction Error' : stage === 3 ? 'Delta Write' : 'Recurrent State', 0, 1.3, -4.1, '#655746', 3.6)
-      } else {
-        const count = kvHeadCount(mechanism)
-        for (let kv = 0; kv < count; kv++) {
-          const z = count === 1 ? -.5 : (kv - (count - 1) / 2) * 1.15 - .5
-          const activeGroup = kv === h.kvHead
-          label(latent ? 'Latent KV + RoPE' : `KV ${kv}`, -6, .3, z, PALETTE[kv], latent ? 2.5 : 1)
-          // Entries, not raw-token copies: compressed summaries occupy a single storage block.
-          for (const e of h.entries) {
-            const x = e.tokens.reduce((sum, t) => sum + tokenX(t), 0) / e.tokens.length
-            const isNew = e.tokens.includes(step.t), opacity = activeGroup ? e.selected ? .9 : .22 : .23
-            const color = e.kind === 'summary' ? '#b06d14' : PALETTE[kv]
-            const mesh = box(`entry-${e.id}`, [x, 0, z], [e.kind === 'summary' ? 1.15 : .92, isNew && stage < 4 ? .2 : .45, .7], color, opacity)
-            const cells = latent ? 4 : 8
-            for (let c = 0; c < cells; c++) box(`entry-${e.id}`, [x - .3 + (c % 4) * .2, .27, z - .18 + Math.floor(c / 4) * .26], [.13, .055, .16], '#ffffff', .45)
-            if (activeGroup) { label(e.kind === 'summary' ? `${e.label} · ${e.tokens.map(t => t + 1).join(',')}` : `t${e.tokens[0] + 1}`, x, .6, z, color, 1.1); if (e.selected) path(mesh.position.clone(), new THREE.Vector3((head - 1.5) * 1.5, .55, 4.3), PALETTE[head], stage >= 1 && stage <= 3, e.tokens[0] / 8) }
-          }
-        }
-        step.evictedTokens.forEach(t => { box(`token-${t}`, [tokenX(t), -.05, -.5], [.85, .04, .7], '#d0c7b8', .3); label('Evicted', tokenX(t), .4, -.5, '#948a7a', 1) })
-        label(mechanism === 'csa2' ? 'Shared Global KV · 1 copy' : 'KV Cache · Time →', 0, .3, -4.1, '#766653', 4)
+        const label = document.createElement('button'); label.type = 'button'; label.textContent = n.label; label.title = n.detail; label.dataset.nodeId = n.id
+        label.setAttribute('aria-label', `Inspect ${n.label}`); label.className = `${n.available ? '' : 'is-pending'} ${selected ? 'is-selected' : ''} ${n.head !== undefined && !focused ? 'is-background' : ''}`
+        label.style.color = color; label.style.maxWidth = n.kind === 'memory' && n.tokens ? '70px' : '110px'; label.onclick = () => latest.current.onSelect(n.id); labels.appendChild(label); labelNodes.push({ element: label, node: n })
+        bounds.expandByPoint(new THREE.Vector3(n.position[0] - width / 2, 0, n.position[2] - depth / 2)); bounds.expandByPoint(new THREE.Vector3(n.position[0] + width / 2, 0, n.position[2] + depth / 2))
       }
-      for (let qh = 0; qh < HEADS; qh++) {
-        const x = (qh - 1.5) * 1.5, chosen = qh === head
-        box(`head-${qh}`, [x, .55, 4.3], [1.08, .35, .9], PALETTE[qh], chosen ? .95 : .25)
-        for (let c = 0; c < 4; c++) box(`head-${qh}`, [x - .28 + c % 2 * .42, .76, 4.1 + Math.floor(c / 2) * .4], [.25, .04, .24], '#ffffff', .6)
-        label(`Q${qh} → ${recurrent ? 'S' + qh : 'KV' + step.heads[qh].kvHead}`, x, 1.25, 4.3, PALETTE[qh], 1.7)
+      for (const e of graph.edges) {
+        const from = locations.get(e.from), to = locations.get(e.to); if (!from || !to) continue
+        const a = from.clone().setY(.4), b = to.clone().setY(.4), mid = a.clone().lerp(b, .5); mid.y += .45 + (e.head ?? 0) * .14
+        const curve = new THREE.QuadraticBezierCurve3(a, mid, b), color = e.head === undefined ? '#686252' : HEAD_COLORS[e.head]
+        const style = { color, transparent: true, opacity: focus === null || e.head === undefined || e.head === focus ? .65 : .32 }
+        const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(32)), e.path === 'score' ? new THREE.LineDashedMaterial({ ...style, dashSize: .25, gapSize: .14 }) : new THREE.LineBasicMaterial(style)); line.computeLineDistances(); line.userData.edgeId = e.id; group.add(line)
+        const point = new THREE.Mesh(new THREE.SphereGeometry(.085, 8, 6), new THREE.MeshBasicMaterial({ color })); group.add(point); moving.push({ mesh: point, curve, segment: e.segment })
+        group.add(new THREE.ArrowHelper(curve.getTangent(.93).normalize(), curve.getPoint(.9), .3, color, .22, .13))
       }
-      const out = box('output', [5, .55, 4.3], [1.0, .5, 1.0], '#147d80', stage >= 3 ? .95 : .25)
-      label('Output', 5, 1.25, 4.3, '#147d80', 1.7)
-      path(new THREE.Vector3((head - 1.5) * 1.5, .55, 4.3), out.position, '#147d80', stage >= 3, .1)
-      if (recurrent) path(new THREE.Vector3(0, .8, 0), new THREE.Vector3((head - 1.5) * 1.5, .55, 4.3), PALETTE[head], stage >= 1, .5)
-      if (step.layerModes.length) { path(new THREE.Vector3(5.8, 0, 0), new THREE.Vector3(5.8, -2.55, 0), '#147d80', true, .7); label('Cross-layer sharing', 5.9, -.9, -2.9, '#147d80', 2.7) }
-      animatedUntil = performance.now() + 1800; invalidate()
+      const shape = latest.current.mechanism + ':' + (graph.structural ? 'structure' : graph.nodes.some(n => n.kind === 'state') ? 'state' : graph.nodes.some(n => n.id.startsWith('latent-agg')) ? 'latent' : 'attention')
+      if (savedShape !== shape) { savedShape = shape; reset() } else invalidate()
+      element.dataset.nodeCount = String(graph.nodes.length); element.dataset.edgeCount = String(graph.edges.length); element.dataset.activeHeads = [...new Set(graph.edges.flatMap(e => e.head === undefined ? [] : [e.head]))].sort().join(','); element.dataset.stage = String(graph.stage)
     }
-    const raycaster = new THREE.Raycaster(), pointer = new THREE.Vector2(); let start = [0, 0]
+    const observer = new ResizeObserver(resize); observer.observe(element); controls.addEventListener('change', invalidate)
+    const ray = new THREE.Raycaster(), pointer = new THREE.Vector2(); let start = [0, 0]
     const down = (e: PointerEvent) => { start = [e.clientX, e.clientY] }
     const pick = (e: PointerEvent) => {
       if (Math.hypot(e.clientX - start[0], e.clientY - start[1]) > 5) return
-      const rect = renderer.domElement.getBoundingClientRect(); pointer.set((e.clientX - rect.left) / rect.width * 2 - 1, -(e.clientY - rect.top) / rect.height * 2 + 1); raycaster.setFromCamera(pointer, camera)
-      const hit = raycaster.intersectObjects(clickable)[0]; if (hit) latest.current.onSelect(hit.object.userData.id)
+      const r = renderer.domElement.getBoundingClientRect(); pointer.set((e.clientX - r.left) / r.width * 2 - 1, -(e.clientY - r.top) / r.height * 2 + 1); ray.setFromCamera(pointer, camera)
+      const hit = ray.intersectObjects(clickable)[0]; if (hit) latest.current.onSelect(hit.object.userData.id)
     }
-    const lost = (e: Event) => { e.preventDefault(); latest.current.onUnavailable() }
-    const visibility = () => { if (document.hidden) { cancelAnimationFrame(animation); animation = 0 } else invalidate() }
+    const lost = (e: Event) => { e.preventDefault(); latest.current.onUnavailable() }, visibility = () => { if (document.hidden) { cancelAnimationFrame(request); request = 0 } else invalidate() }
     renderer.domElement.addEventListener('pointerdown', down); renderer.domElement.addEventListener('pointerup', pick); renderer.domElement.addEventListener('webglcontextlost', lost); document.addEventListener('visibilitychange', visibility)
-    api.current = { refresh, reset }; reset(); resize(); refresh()
-    return () => { disposed = true; cancelAnimationFrame(animation); observer.disconnect(); document.removeEventListener('visibilitychange', visibility); renderer.domElement.removeEventListener('pointerdown', down); renderer.domElement.removeEventListener('pointerup', pick); renderer.domElement.removeEventListener('webglcontextlost', lost); controls.dispose(); disposeGroup(); renderer.dispose(); renderer.forceContextLoss(); renderer.domElement.remove(); api.current = undefined }
+    api.current = { refresh, reset, invalidate }; refresh(); resize()
+    return () => { disposed = true; cancelAnimationFrame(request); observer.disconnect(); controls.dispose(); clear(); renderer.domElement.removeEventListener('pointerdown', down); renderer.domElement.removeEventListener('pointerup', pick); renderer.domElement.removeEventListener('webglcontextlost', lost); document.removeEventListener('visibilitychange', visibility); renderer.dispose(); renderer.forceContextLoss(); renderer.domElement.remove(); labels.remove(); api.current = undefined }
   }, [])
-  useEffect(() => { api.current?.refresh() }, [props.mechanism, props.step, props.stage, props.head, props.selection, props.playing])
+  useEffect(() => { api.current?.refresh() }, [props.graph, props.selection, props.focus])
+  useEffect(() => { api.current?.invalidate() }, [props.progress])
   useEffect(() => { api.current?.reset() }, [props.cameraReset])
-  return <div ref={host} className="arch-three-scene" data-testid={`scene-${props.mechanism}`}><div className="arch-scene-caption">Time × KV Heads × Layers <span>Drag to orbit · Scroll to zoom</span></div><span className="sr-only">{TOKENS[props.step.t]}，当前步骤 {props.stage + 1}</span></div>
+  return <div className="arch-three-scene" ref={host} data-testid={`scene-${props.mechanism}`}><div className="arch-scene-caption">{props.graph.structural ? 'Layers × Shared memory' : 'All Heads · one computed layer'}<span>Drag to orbit · Scroll to zoom</span></div></div>
 }
