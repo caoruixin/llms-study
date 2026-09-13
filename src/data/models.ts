@@ -11,7 +11,7 @@ export const MODELS: ModelSpec[] = [
     activeParamsB: 70,
     attentionType: 'GQA',
     kvSpec: { kind: 'mha-gqa', numLayers: 80, kvHeads: 8, headDim: 128 },
-    contextK: 128,
+    contextK: 8, // Original Llama 3 (April 2024); 128K belongs to Llama 3.1.
     license: 'Llama 3 Community License',
     multimodal: false,
     sourceUrl: 'https://huggingface.co/meta-llama/Meta-Llama-3-70B',
@@ -46,7 +46,7 @@ export const MODELS: ModelSpec[] = [
     attentionType: 'MLA',
     kvSpec: { kind: 'mla', numLayers: 61, kvLatentDim: 576 },
     contextK: 128,
-    license: 'MIT',
+    license: 'DeepSeek License Agreement v1.0 (weights)',
     multimodal: false,
     sourceUrl: 'https://arxiv.org/abs/2412.19437',
     asOf: '2024-12',

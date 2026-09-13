@@ -137,7 +137,7 @@ export default function QKVFlow() {
         </motion.text>
       </svg>
       <p className="mt-1 text-[11px] leading-relaxed text-dim">
-        推理时历史 K/V（红/紫点）就是被缓存的 KV cache；每个新 token 只需算自己的 Q 再与缓存交互——这就是「KV cache 避免重算」的含义。
+        推理时历史 K/V（红/紫点）就是被缓存的 KV cache；每个新 token 仍需生成自己的 Q/K/V，再用 Q 读取历史与当前 K/V；缓存避免重复计算的是历史 token 的 K/V。
       </p>
     </div>
   )

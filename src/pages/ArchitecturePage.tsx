@@ -1,9 +1,11 @@
-import { useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { lazy, Suspense } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import SegmentedTabs from '../components/ui/SegmentedTabs'
 import TransformerDiagram from '../components/TransformerDiagram'
 import ModelEvolution from '../components/ModelEvolution'
 import { ATTENTION_EVOLUTION, ATTENTION_SUMMARY } from '../data/attention'
+import { Glossary } from '../components/architecture/Term'
+const AttentionLab = lazy(() => import('../components/architecture/AttentionLab'))
 import { isPromoExpired, PRICING, PRICING_NOTES, PRICING_VERIFIED_ON } from '../data/pricing'
 import type { PriceRow } from '../data/types'
 
@@ -46,12 +48,14 @@ function SourceLink({ p }: { p: PriceRow }) {
 const MAX_AS_OF = PRICING.reduce((m, p) => (p.asOf > m ? p.asOf : m), PRICING[0].asOf)
 
 export default function ArchitecturePage() {
-  // ?tab= 仅作初值（如 /kda 页返回链接落在「注意力演进」）；切 tab 不写回 URL，保持现有轻量行为
-  const [params] = useSearchParams()
-  const [tab, setTab] = useState<TabId>(() => {
-    const q = params.get('tab')
-    return TABS.some((t) => t.id === q) ? (q as TabId) : 'transformer'
-  })
+  const [params, setParams] = useSearchParams()
+  const requested = params.get('tab')
+  const tab: TabId = TABS.some(t => t.id === requested) ? requested as TabId : 'transformer'
+  const setTab = (tab: TabId) => setParams(p => { p.set('tab', tab); return p })
+  const openMechanism = (id: string) => {
+    setParams(p => { p.set('tab', 'attention'); p.set('mechanism', id); return p })
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
 
   return (
     <div className="space-y-5">
@@ -62,6 +66,8 @@ export default function ArchitecturePage() {
 
       {tab === 'attention' && (
         <div className="space-y-4">
+          <Suspense fallback={<div className="arch-box">Loading Attention laboratory…</div>}><AttentionLab /></Suspense>
+          <h3 className="pt-5 text-lg font-semibold">Attention reference · 机制速查</h3>
           <div className="rounded-xl border border-accent/40 bg-accent/10 p-4 text-sm leading-relaxed">
             {ATTENTION_SUMMARY}
           </div>
@@ -79,13 +85,7 @@ export default function ArchitecturePage() {
                 {ATTENTION_EVOLUTION.map((a, i) => (
                   <tr key={a.id} className={i % 2 ? '' : 'bg-panel-2/60'}>
                     <td className="px-4 py-3 font-semibold whitespace-nowrap text-accent">
-                      {a.id === 'kda' ? (
-                        <Link to="/kda" className="hover:underline">
-                          {a.name} <span className="text-xs font-normal">→ 交互式拆解</span>
-                        </Link>
-                      ) : (
-                        a.name
-                      )}
+                      <button onClick={() => openMechanism(a.id)} className="text-left hover:underline">{a.name}<span className="block text-xs font-normal">Open lab ↗</span></button>
                     </td>
                     <td className="px-4 py-3 leading-relaxed">{a.mechanism}</td>
                     <td className="px-4 py-3 leading-relaxed text-dim">{a.kvCost}</td>
@@ -99,13 +99,7 @@ export default function ArchitecturePage() {
             {ATTENTION_EVOLUTION.map((a) => (
               <div key={a.id} className="rounded-xl border border-line bg-panel p-4">
                 <div className="font-semibold text-accent">
-                  {a.id === 'kda' ? (
-                    <Link to="/kda" className="hover:underline">
-                      {a.name} <span className="text-xs font-normal">→ 交互式拆解</span>
-                    </Link>
-                  ) : (
-                    a.name
-                  )}
+                  <button onClick={() => openMechanism(a.id)} className="text-left hover:underline">{a.name} <span className="text-xs font-normal">Open lab ↗</span></button>
                 </div>
                 <div className="mt-3 space-y-2">
                   <div>
@@ -124,6 +118,7 @@ export default function ArchitecturePage() {
               </div>
             ))}
           </div>
+          <Glossary />
         </div>
       )}
 
