@@ -78,6 +78,13 @@ with sync_playwright() as p:
   # Picking a different KV group must display that object's actual ID, not H0's cache.
   page.get_by_label('Inspect MHA tensor').select_option('kv:g2:t5');expect(page.locator('.arch-inspector')).to_contain_text('Object ID: kv:g2:t5')
   page.get_by_label('Inspect MHA Q Head').select_option('all')
+  # External hash navigation cancels a pending playhead write, including legacy migration.
+  for target in [37,32,27]:
+   seek(0)
+   page.evaluate('(f) => { location.hash = "/architecture?tab=attention&mechanism=mha&frame=" + f }',target)
+   migrated=(target//5)*6+3
+   expect(page.get_by_test_id('trace-position')).to_have_text(f'{migrated+1} / 48')
+   expect(page).to_have_url(re.compile(r'frame='+str(migrated)+r'(?:&|$)'))
   for m in mechanisms:
    page.get_by_label('Primary mechanism').select_option(m)
    for phase in range(6):

@@ -112,22 +112,28 @@ export default function AttentionLab() {
   const [params, setParams] = useSearchParams(), raw = params.get('mechanism'), rawCompare = params.get('compare')
   const id = isMechanism(raw) ? raw : 'gqa', compare = isMechanism(rawCompare) && rawCompare !== id ? rawCompare : undefined
   const routeFrame = frameFromUrl(params.get('frame'), params.get('trace'), id)
-  const [frame, setPlayhead] = useState(routeFrame), urlFrameKey = `${params.get('trace') ?? '1'}:${routeFrame}`
-  const observedFrameKey = useRef(urlFrameKey)
+  const [playhead, setPlayhead] = useState(routeFrame), urlFrameKey = `${params.get('trace') ?? '1'}:${routeFrame}`
+  const observedFrameKey = useRef(urlFrameKey), ownFrameKeys = useRef(new Set<string>())
+  const urlChanged = urlFrameKey !== observedFrameKey.current, externalNavigation = urlChanged && !ownFrameKeys.current.has(urlFrameKey)
+  const frame = externalNavigation ? routeFrame : playhead
+  // Reconcile external navigation before committing effects from the old playhead.
+  if (urlChanged) { observedFrameKey.current = urlFrameKey; ownFrameKeys.current.delete(urlFrameKey); if (externalNavigation) { ownFrameKeys.current.clear(); setPlayhead(routeFrame) } }
   const [playing, setPlaying] = useState(false), [speed, setSpeed] = useState(1), [reset, setReset] = useState(0), [failed, setFailed] = useState(false), [progress, setProgress] = useState(0)
   const clock = useRef({ frame, progress: 0 }), [reduced, setReduced] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches)
   const fallback = failed || reduced || params.get('view') === '2d', t = Math.floor(frame / PHASES)
   const focusOf = (key: string) => { const v = params.get(key); return v !== null && /^[0-3]$/.test(v) ? Number(v) : null }
-  const update = (key: string, value: string) => setParams(p => { const next = new URLSearchParams(p); if (value) next.set(key, value); else next.delete(key); next.set('trace', TRACE_VERSION); next.set('frame', String(frame)); observedFrameKey.current = `${TRACE_VERSION}:${frame}`; return next }, { replace: true })
+  const markOwnFrame = () => { const key = `${TRACE_VERSION}:${frame}`; if (key !== observedFrameKey.current) ownFrameKeys.current.add(key) }
+  const update = (key: string, value: string) => setParams(p => { const next = new URLSearchParams(p); if (value) next.set(key, value); else next.delete(key); next.set('trace', TRACE_VERSION); next.set('frame', String(frame)); markOwnFrame(); return next }, { replace: true })
   const setFrame = (f: number) => setPlayhead(Math.max(0, Math.min(LAST_FRAME, f)))
-  useEffect(() => {
-    if (urlFrameKey !== observedFrameKey.current) { observedFrameKey.current = urlFrameKey; setPlayhead(routeFrame) }
-  }, [urlFrameKey, routeFrame])
   useEffect(() => {
     if (frame === routeFrame && params.get('trace') === TRACE_VERSION) return
     // Coalesce scrubbing/rapid stepping; WebKit limits history writes per time window.
     // The scene clock stays immediate. Other navigation flushes the current playhead above.
-    const timer = window.setTimeout(() => setParams(p => { const next = new URLSearchParams(p); next.set('trace', TRACE_VERSION); next.set('frame', String(frame)); observedFrameKey.current = `${TRACE_VERSION}:${frame}`; return next }, { replace: true }), 400)
+    const scheduledLocation = window.location.hash
+    const timer = window.setTimeout(() => {
+      if (window.location.hash !== scheduledLocation) return
+      setParams(p => { const next = new URLSearchParams(p); next.set('trace', TRACE_VERSION); next.set('frame', String(frame)); markOwnFrame(); return next }, { replace: true })
+    }, 400)
     return () => window.clearTimeout(timer)
   }, [frame, routeFrame, params, setParams])
   useEffect(() => {
