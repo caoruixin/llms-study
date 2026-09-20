@@ -2,7 +2,7 @@
 // @vitest-environment-options { "settings": { "disableCSSFileLoading": true, "disableJavaScriptFileLoading": true, "disableJavaScriptEvaluation": true } }
 import { describe, expect, it } from 'vitest'
 import { captureRendered, CaptureError, isCaptureMessage } from './captureRendered'
-import type { CaptureAgentMessage } from './captureAgent'
+import { CAPTURE_AGENT_VERSION, type CaptureAgentMessage } from './captureAgent'
 
 /**
  * 父页驱动的单测。iframe 建在**未接入文档树**的 div 里（happy-dom 不会真的去加载 srcdoc），
@@ -73,7 +73,8 @@ const okMessage = (over: Record<string, unknown> = {}): CaptureAgentMessage =>
     viewportWidth: 1280,
     hidden: 3,
     fixed: 1,
-    agentVersion: 1,
+    blockedScripts: 0,
+    agentVersion: 2,
     ...over,
   }) as CaptureAgentMessage
 
@@ -159,10 +160,41 @@ describe('captureRendered', () => {
       viewportWidth: 1280,
       hidden: 3,
       fixed: 1,
-      agentVersion: 1,
+      blockedScripts: 0,
+      agentVersion: 2,
     })
     expect(h.body.children).toHaveLength(0)
     expect(h.listeners).toHaveLength(0)
+  })
+
+  it('blockedScripts 原样带出；字段缺失（v1 代理）或不是有限数一律按 0', async () => {
+    const run = async (over: Record<string, unknown>): Promise<unknown> => {
+      const h = harness()
+      const promise = captureRendered(INPUT, { doc: h.doc, parentWindow: h.parentWindow, outerTimeoutMs: 2000 })
+      await until(() => h.created.length === 1)
+      h.send(okMessage(over))
+      return promise
+    }
+    await expect(run({ blockedScripts: 3 })).resolves.toMatchObject({ blockedScripts: 3 })
+    // v1 代理的消息里压根没有这个字段；agentVersion 如实保留 1，不被「升级」
+    await expect(run({ blockedScripts: undefined, agentVersion: 1 })).resolves.toMatchObject({
+      blockedScripts: 0,
+      agentVersion: 1,
+    })
+    // 消息来自不可信的沙箱：站点脚本可以伪造任意形状
+    await expect(run({ blockedScripts: Number.NaN })).resolves.toMatchObject({ blockedScripts: 0 })
+    await expect(run({ blockedScripts: Number.POSITIVE_INFINITY })).resolves.toMatchObject({ blockedScripts: 0 })
+    await expect(run({ blockedScripts: '7' })).resolves.toMatchObject({ blockedScripts: 0 })
+    await expect(run({ blockedScripts: null })).resolves.toMatchObject({ blockedScripts: 0 })
+  })
+
+  it('agentVersion 缺失时回落到当前代理版本（2）', async () => {
+    const h = harness()
+    const promise = captureRendered(INPUT, { doc: h.doc, parentWindow: h.parentWindow, outerTimeoutMs: 2000 })
+    await until(() => h.created.length === 1)
+    h.send(okMessage({ agentVersion: undefined }))
+    await expect(promise).resolves.toMatchObject({ agentVersion: CAPTURE_AGENT_VERSION })
+    expect(CAPTURE_AGENT_VERSION).toBe(2)
   })
 
   it('finalUrl 为空时回落到入参', async () => {
@@ -196,13 +228,14 @@ describe('captureRendered', () => {
     const big = harness()
     const p1 = captureRendered(INPUT, { doc: big.doc, parentWindow: big.parentWindow, outerTimeoutMs: 2000 })
     await until(() => big.created.length === 1)
-    big.send({ type: 'pc-capture', ok: false, reason: 'too-large', agentVersion: 1 })
+    big.send({ type: 'pc-capture', ok: false, reason: 'too-large', blockedScripts: 0, agentVersion: 2 })
     await expect(p1).rejects.toMatchObject({ reason: 'too-large' })
     expect(big.body.children).toHaveLength(0)
 
     const bad = harness()
     const p2 = captureRendered(INPUT, { doc: bad.doc, parentWindow: bad.parentWindow, outerTimeoutMs: 2000 })
     await until(() => bad.created.length === 1)
+    // v1 形状的失败消息（没有 blockedScripts）照样认
     bad.send({ type: 'pc-capture', ok: false, reason: 'TypeError: boom', agentVersion: 1 })
     await expect(p2).rejects.toMatchObject({ reason: 'agent-error' })
     await expect(p2).rejects.toThrow(/boom/)

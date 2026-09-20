@@ -35,6 +35,13 @@ export interface Config {
   fetchUrlAllowForbiddenDev: boolean
   /** 语音助手(转写/合成);provider='none' = 整体关闭,前端不渲染麦克风球 */
   voice: VoiceConfig
+  /**
+   * 服务端渲染兜底(网页原貌 Tier 3)的功能开关 = 渲染服务的 unix socket 路径;null = 整体关闭
+   * (/api/app/render-url 回 503 render-unavailable,前端回落到如实报错)。
+   * 渲染服务是另一个进程、另一个 systemd unit(src/render/,deploy/llms-study-render.service);
+   * 这里只存"去哪儿找它"。删掉这一行 env 再重启 API 就是即时生效的总闸。
+   */
+  renderServiceSocket: string | null
 }
 
 /** 语音 provider allowlist;刻意不并进 LLM_PROVIDERS——语音不走 /api/{provider} 网关那套 */
@@ -145,7 +152,23 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     adminDailyCallLimit,
     fetchUrlAllowForbiddenDev: parseBool(env.FETCH_URL_ALLOW_FORBIDDEN_DEV, false),
     voice: loadVoiceConfig(env),
+    renderServiceSocket: loadRenderServiceSocket(env),
   }
+}
+
+/**
+ * 可选功能,缺省即关(同 VOICE_PROVIDER=none 的先例)。配了就必须是绝对路径:
+ * 相对路径会随 cwd 漂移,"以为开了其实连不上"只会在用户导入失败时才暴露,宁可起不来。
+ * 不在这里检查 socket 文件是否存在——渲染服务可以晚于 API 启动、也可以随时重启,
+ * 连不上由路由按请求如实回 503。
+ */
+function loadRenderServiceSocket(env: Record<string, string | undefined>): string | null {
+  const raw = env.RENDER_SERVICE_SOCKET
+  if (!raw) return null
+  if (!path.isAbsolute(raw)) {
+    throw new Error(`RENDER_SERVICE_SOCKET 必须是绝对路径,得到:${raw}`)
+  }
+  return raw
 }
 
 /**

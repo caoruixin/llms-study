@@ -21,6 +21,16 @@ Everything runs local-first: your notes, papers, and practice history stay in yo
 | **Pre-sales Trainer** | `/interview` | Rubric-based question bank (must-cover points + red flags per question), answers graded live by an LLM, voice input, mastery dashboard, attempt history |
 | **Paper Copilot** | `/papers` | Import PDF/DOCX papers, read in original PDF or semantic text view, select-to-ask, streaming AI copilot with citations, reading progress; guest-local by default, account sync when signed in |
 
+### Paper Copilot: importing by URL — known limits
+
+"按 URL 导入" offers two presentations: **网页原貌** (web snapshot, the default: keeps the page's own styles and images) and **阅读模式** (reader: extracted article text only). The snapshot is captured in your own browser, inside a sandboxed frame that does not run on the page's real origin, so:
+
+- **Pages rendered entirely by scripts** (an empty HTML shell whose content lives in a JS bundle) usually cannot be captured in the browser: module scripts are always loaded under CORS rules, and most sites do not send CORS headers for them. Reader mode cannot help either, because it never runs page scripts. Deployments that enable the optional server-side render fallback (`deploy/provision.md` §10) can import these pages; without it the import fails quickly with a message that says so.
+- Content inside **shadow DOM** or **embedded iframes** is not captured.
+- **Video** is not kept, and content that only appears on hover or click is saved in its initial state.
+- The page's media queries apply at the reading column's width, so a snapshot can look like the site's narrow layout.
+- WeChat articles and multi-link imports always use reader mode.
+
 ## Engineering highlights
 
 - **Data-driven extensibility.** All content — models, hardware, attention stages, questions, pricing — is typed data under `src/data/`; components only render. Adding a model or question means appending one object, no component changes. See [EXTENDING.md](EXTENDING.md).

@@ -1,6 +1,7 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { IngestError, type ParseResult } from '../ingest'
+import { abortError } from './abort'
 import { PaperDb } from '../repo/db'
 import { createPaperRepository } from '../repo/paperRepo'
 import type { NormalizedBlock } from '../types'
@@ -418,6 +419,88 @@ describe('importFromUrls：网页原貌（presentation=snapshot）', () => {
     expect(outcome.kind).toBe('failed')
     if (outcome.kind !== 'failed') return
     expect(outcome.failure).toMatchObject({ kind: 'empty', message: expect.stringContaining('阅读模式') })
+    expect(outcome.failure.hint).toBeUndefined()
+    expect(await repo.listPapers()).toHaveLength(0)
+  })
+
+  it('IngestError 携带 hint → 原样透到 outcome.failure.hint（弹窗据此隐藏「改用阅读模式重试」）', async () => {
+    const repo = freshRepo()
+    const url = 'https://a.com/page'
+    const snap = fakeSnapshotBuilder({
+      throwError: new IngestError('empty', '该页面正文完全由脚本生成，阅读模式同样无法抓取', { hint: 'reader-wont-help' }),
+    })
+    const deps = makeDeps(repo, { [url]: { html: '<p>x</p>' } }, { buildSnapshot: snap.build })
+    const outcome = await importFromUrls([url], deps, undefined, { presentation: 'snapshot' })
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind !== 'failed') return
+    expect(outcome.failure).toMatchObject({ kind: 'empty', hint: 'reader-wont-help' })
+  })
+
+  it('其它失败（storage）不凭空生出 hint', async () => {
+    const repo = freshRepo()
+    const url = 'https://a.com/page'
+    const snap = fakeSnapshotBuilder()
+    const deps = makeDeps(repo, { [url]: { html: '<p>x</p>' } }, {
+      buildSnapshot: snap.build,
+      ensureStorage: async () => ({ ok: false, message: '空间不足' }),
+    })
+    const outcome = await importFromUrls([url], deps, undefined, { presentation: 'snapshot' })
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind !== 'failed') return
+    expect(outcome.failure.kind).toBe('storage')
+    expect('hint' in outcome.failure).toBe(false)
+  })
+
+  it('快照构建中途取消：AbortError 原样抛出（不是 failed），不落任何论文行', async () => {
+    const repo = freshRepo()
+    const url = 'https://a.com/page'
+    const controller = new AbortController()
+    // 真实实现里是 buildWebSnapshot 的 throwIfAborted 抛出同形错误，这里直接造一个
+    const build: NonNullable<UrlImportDeps['buildSnapshot']> = async () => {
+      controller.abort()
+      throw abortError('原貌抓取已取消', controller.signal)
+    }
+    const deps = makeDeps(repo, { [url]: { html: '<p>x</p>' } }, { buildSnapshot: build, signal: controller.signal })
+    await expect(importFromUrls([url], deps, undefined, { presentation: 'snapshot' })).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(await repo.listPapers()).toHaveLength(0)
+  })
+
+  it('快照已构建完、落库前才收到取消：同样抛 AbortError，不留论文行', async () => {
+    const repo = freshRepo()
+    const url = 'https://a.com/page'
+    const controller = new AbortController()
+    const snap = fakeSnapshotBuilder()
+    const build: NonNullable<UrlImportDeps['buildSnapshot']> = async (input, o) => {
+      const result = await snap.build(input, o)
+      controller.abort() // 构建成功了，但用户在落库前按下了「取消导入」
+      return result
+    }
+    const deps = makeDeps(repo, { [url]: { html: '<p>x</p>' } }, { buildSnapshot: build, signal: controller.signal })
+    await expect(importFromUrls([url], deps, undefined, { presentation: 'snapshot' })).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(await repo.listPapers()).toHaveLength(0)
+  })
+
+  it('阅读模式抓取中途取消：AbortError 不被归一成「该链接失败」，整体抛出且不落库', async () => {
+    const repo = freshRepo()
+    const urls = ['https://a.com/1', 'https://a.com/2']
+    const controller = new AbortController()
+    const base = makeDeps(repo, { [urls[0]]: { title: 'A', html: '<h1>A</h1><p>a</p>' }, [urls[1]]: { title: 'B', html: '<h1>B</h1><p>b</p>' } })
+    const deps: UrlImportDeps = {
+      ...base,
+      signal: controller.signal,
+      fetchUrl: async (url) => {
+        if (url === urls[1]) {
+          controller.abort()
+          throw abortError('URL 导入已取消', controller.signal)
+        }
+        return base.fetchUrl(url)
+      },
+    }
+    await expect(importFromUrls(urls, deps)).rejects.toMatchObject({ name: 'AbortError' })
     expect(await repo.listPapers()).toHaveLength(0)
   })
 
@@ -559,5 +642,34 @@ describe('reimportUrlPaperInPlace', () => {
     const after = await repo.getPaper(paper.id)
     expect(after?.sha256).toBe('x')
     expect(after?.source?.type === 'url' ? after.source.entries : []).toHaveLength(2)
+  })
+
+  it('replaceFile 之前取消：抛 AbortError，原论文的 sha/块一个字节都没动', async () => {
+    const repo = freshRepo()
+    const url = 'https://a.com/page'
+    const controller = new AbortController()
+    const snap = fakeSnapshotBuilder()
+    const replaceFile = vi.fn<NonNullable<UrlImportDeps['replaceFile']>>(async () => {})
+    const deps = makeDeps(repo, { [url]: { html: '<p>第一版</p>', finalUrl: url } }, { buildSnapshot: snap.build, replaceFile })
+
+    const first = await importFromUrls([url], deps, undefined, { presentation: 'snapshot' })
+    if (first.kind !== 'ready') throw new Error('setup failed')
+
+    // 第二次构建成功后立刻取消：replaceFile 前的 throwIfAborted 必须拦住，否则正文已被换掉
+    const cancelling: UrlImportDeps = {
+      ...deps,
+      signal: controller.signal,
+      buildSnapshot: async (input, o) => {
+        const result = await snap.build(input, o)
+        controller.abort()
+        return result
+      },
+    }
+    await expect(reimportUrlPaperInPlace(first.paper.id, cancelling)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(replaceFile).not.toHaveBeenCalled()
+    const after = await repo.getPaper(first.paper.id)
+    expect(after?.sha256).toBe(first.paper.sha256)
+    expect(after?.status).toBe('ready')
+    expect((await repo.getBlocks(first.paper.id)).map((b) => b.text)).toEqual(['快照标题', '第一版'])
   })
 })

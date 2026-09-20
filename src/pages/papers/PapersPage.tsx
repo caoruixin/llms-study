@@ -26,6 +26,8 @@ import {
 import { ensureStorageFor } from '../../lib/paper/storage'
 import { MAX_FILE_BYTES, MAX_PDF_PAGES, sha256Hex } from '../../lib/paper/validate'
 import type { IngestStage, PaperFormat, PaperRecord, UrlSourceEntry } from '../../lib/paper/types'
+// 取消判定只此一份（abort.ts 是零依赖常量模块，静态引它不会把抓取那一堆拖进入口 chunk）
+import { isAbortError } from '../../lib/paper/url/abort'
 import type { UrlImportDeps, UrlPresentation, UrlProgressEvent } from '../../lib/paper/url/urlImport'
 import { usePaperUi, type PaperFilter, type PaperSortBy } from './paperUiStore'
 import { syncBadgeFor, type SyncBadge } from './syncBadge'
@@ -156,6 +158,9 @@ export default function PapersPage() {
     { kind: 'file'; file: File } | { kind: 'url'; urls: string[]; presentation: UrlPresentation } | null
   >(null)
   const dragDepth = useRef(0)
+  // 当前这一个 URL 导入/重导入任务的队列 id：「取消导入」按钮据此 abort 队列信号。
+  // 用 ref 而非 state：弹窗关掉再打开、任务仍在后台跑时，按钮照样能取消同一个任务
+  const urlJobIdRef = useRef<string | null>(null)
 
   const [papers, setPapers] = useState<PaperRecord[]>([])
   const [loading, setLoading] = useState(true)
@@ -322,34 +327,46 @@ export default function PapersPage() {
    * URL 导入与原地重导入共用的依赖装配。抓取/抽取/原貌构建的重依赖全部动态 import：
    * 论文库入口 chunk 里不含 readability、DOMPurify 原貌 profile、快照编解码器与渲染捕获，
    * 只有真正点了「按 URL 导入」才会拉；原貌那一堆更是等到快照分支真正开跑时才拉。
+   *
+   * signal 是串行队列交给这个任务的取消信号：抓页面、抓资源、渲染捕获、快照编排全都接它，
+   * 「取消导入」才能真的把正在飞的请求断掉，而不是等它自己跑完（缺陷 H）。
    */
   const loadUrlDeps = useCallback(
-    async (jobId: string): Promise<UrlImportDeps> => {
-      const [{ fetchUrl }, { extractFromFetchedHtml }] = await Promise.all([
+    async (jobId: string, signal: AbortSignal): Promise<UrlImportDeps> => {
+      const [{ fetchUrl, fetchUrlWithBusyRetry }, { extractFromFetchedHtml }] = await Promise.all([
         import('../../lib/paper/url/fetchUrlApi'),
         import('../../lib/paper/url/extractArticle'),
       ])
       const buildSnapshot: NonNullable<UrlImportDeps['buildSnapshot']> = async (input, { onPhase }) => {
-        const [{ buildWebSnapshot }, { captureRendered }] = await Promise.all([
+        const [{ buildWebSnapshot }, { captureRendered }, { renderUrl }] = await Promise.all([
           import('../../lib/paper/url/buildSnapshot'),
           import('../../lib/paper/url/captureRendered'),
+          import('../../lib/paper/url/renderUrlApi'),
         ])
         return buildWebSnapshot(input, {
-          // 资源走 asset 通道：服务端另一套令牌桶与放行类型（css/字体/svg），不挤占正文抓取额度
-          fetchAsset: (u, signal) =>
-            fetchUrl(u, { kind: 'asset', signal }).then((r) => ({ bytes: r.bytes, contentType: r.contentType })),
+          // 资源走 asset 通道：服务端另一套令牌桶与放行类型（css/字体/svg），不挤占正文抓取额度。
+          // s 是 buildWebSnapshot 透传下来的同一个 signal；`?? signal` 只是兜底，别让取消漏掉资源请求
+          fetchAsset: (u, s) =>
+            fetchUrl(u, { kind: 'asset', signal: s ?? signal }).then((r) => ({ bytes: r.bytes, contentType: r.contentType })),
           hash: sha256Hex,
+          // 渲染捕获的 signal 由 buildWebSnapshot 按自己的阶段节奏透传（见 buildSnapshot.ts 的 capture）
           captureRendered: (i, o) => captureRendered(i, o),
+          // Tier 3：只有本地两层都拿不到正文时 buildSnapshot 才会调它；没装渲染服务的部署回
+          // render-unavailable，失败说明里如实带一句，不影响其它任何导入
+          captureRemote: (i, o) => renderUrl(i.finalUrl, { signal: o?.signal ?? signal }),
           onPhase,
+          signal,
         })
       }
       return {
         repo,
         hash: sha256Hex,
         parse: parseByFormat,
-        fetchUrl,
+        // 正文抓取遇到「名额被占，稍后再来」（取消后立刻再导一篇）短暂重试，见 fetchUrlWithBusyRetry
+        fetchUrl: (url) => fetchUrlWithBusyRetry(url, { signal }),
         extract: extractFromFetchedHtml,
         buildSnapshot,
+        signal,
         // 原貌去重按落地 URL：渲染捕获的字节每次都不同，sha 去重对它不成立
         findByFinalUrl: async (finalUrl) =>
           (await repo.listPapers()).find(
@@ -381,11 +398,12 @@ export default function PapersPage() {
       setUrlRunning(true)
       setUrlResult(null)
       setUrlProgress(urls.map((url, index) => ({ index, total: urls.length, url, phase: 'pending' })))
+      urlJobIdRef.current = jobId
       void queueRef.current
-        .enqueue(jobId, async () => {
+        .enqueue(jobId, async (signal) => {
           const [{ importFromUrls }, deps] = await Promise.all([
             import('../../lib/paper/url/urlImport'),
-            loadUrlDeps(jobId),
+            loadUrlDeps(jobId, signal),
           ])
           const outcome = await importFromUrls(urls, deps, mergeProgress, { presentation: opts.presentation })
 
@@ -413,6 +431,12 @@ export default function PapersPage() {
           }
         })
         .catch((e: unknown) => {
+          // 用户自己按的「取消导入」：不报失败、不留结果，弹窗退回输入表单（urlImport 保证没留下论文行）
+          if (isAbortError(e)) {
+            setUrlProgress([])
+            setUrlResult(null)
+            return
+          }
           const message = e instanceof Error ? e.message : '导入失败'
           setUrlResult({ outcome: { kind: 'failed', failure: { kind: 'unknown', message, at: Date.now() } } })
           setNotice(`URL 导入失败：${message}`)
@@ -420,6 +444,7 @@ export default function PapersPage() {
         .finally(() => {
           setJobs((prev) => prev.filter((j) => j.id !== jobId))
           setUrlRunning(false)
+          if (urlJobIdRef.current === jobId) urlJobIdRef.current = null
           void refresh()
         })
     },
@@ -438,11 +463,12 @@ export default function PapersPage() {
       setUrlRunning(true)
       setUrlResult(null)
       setUrlProgress([{ index: 0, total: 1, url, phase: 'pending' }])
+      urlJobIdRef.current = jobId
       void queueRef.current
-        .enqueue(jobId, async () => {
+        .enqueue(jobId, async (signal) => {
           const [{ reimportUrlPaperInPlace }, deps] = await Promise.all([
             import('../../lib/paper/url/urlImport'),
-            loadUrlDeps(jobId),
+            loadUrlDeps(jobId, signal),
           ])
           const outcome = await reimportUrlPaperInPlace(paperId, deps, mergeProgress)
           if (outcome.kind === 'ready') {
@@ -459,6 +485,12 @@ export default function PapersPage() {
           }
         })
         .catch((e: unknown) => {
+          // 取消发生在 replaceFile 之前（urlImport 在那条线前再查一次 signal），原论文原封不动
+          if (isAbortError(e)) {
+            setUrlProgress([])
+            setUrlResult(null)
+            return
+          }
           const message = e instanceof Error ? e.message : '重新导入失败'
           setUrlResult({ outcome: { kind: 'failed', failure: { kind: 'unknown', message, at: Date.now() } } })
           setNotice(`重新导入失败：${message}`)
@@ -466,11 +498,22 @@ export default function PapersPage() {
         .finally(() => {
           setJobs((prev) => prev.filter((j) => j.id !== jobId))
           setUrlRunning(false)
+          if (urlJobIdRef.current === jobId) urlJobIdRef.current = null
           void refresh()
         })
     },
     [loadUrlDeps, mergeProgress, navigate, refresh],
   )
+
+  /**
+   * 「取消导入」：abort 这一个任务的队列信号。队列对运行中的任务只发信号、由 run 自行响应
+   * （见 ingest.ts 的 cancel），排队中的直接出队——两种情形都不会牵连队列里的其它任务。
+   * 收尾（清进度、不报失败）在 runUrlImport / runReimport 的 catch 里，取消与失败共用一条出口。
+   */
+  const cancelUrlJob = useCallback(() => {
+    const id = urlJobIdRef.current
+    if (id) queueRef.current.cancel(id)
+  }, [])
 
   /**
    * `?reimport=<paperId>`（工作台头部与空心态面板的入口，§1.4/§2.4）：找到这篇 URL 论文
@@ -743,6 +786,7 @@ export default function PapersPage() {
               if (urlReimport) runReimport(urlReimport.paperId, urls[0] ?? urlInitialUrl ?? '')
               else runUrlImport(urls, { presentation: o?.presentation ?? 'snapshot' })
             }}
+            onCancel={cancelUrlJob}
             running={urlRunning}
             progress={urlProgress}
             result={urlResult}

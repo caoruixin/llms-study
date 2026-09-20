@@ -16,6 +16,7 @@ import { fetchUrlRoutes } from './routes/fetchUrl.js'
 import { filesRoutes } from './routes/files.js'
 import { healthRoutes } from './routes/health.js'
 import { llmKeysRoutes } from './routes/llmKeys.js'
+import { renderUrlRoutes } from './routes/renderUrl.js'
 import { syncRoutes } from './routes/sync.js'
 import { voiceRoutes } from './routes/voice.js'
 import type { AppDeps, AppEnv } from './types.js'
@@ -24,7 +25,7 @@ export function createApp(deps: AppDeps) {
   const root = new Hono<AppEnv>()
   root.use('*', originCheck(deps.config))
 
-  // ---- /api/app/*:账号/同步/文件/URL 抓取/语音 ----
+  // ---- /api/app/*:账号/同步/文件/URL 抓取/服务端渲染兜底/语音 ----
   const api = new Hono<AppEnv>()
   api.route('/', healthRoutes())
   api.route('/auth', authRoutes(deps))
@@ -33,6 +34,7 @@ export function createApp(deps: AppDeps) {
   api.route('/sync', syncRoutes(deps))
   api.route('/files', filesRoutes(deps))
   api.route('/fetch-url', fetchUrlRoutes(deps))
+  api.route('/render-url', renderUrlRoutes(deps))
   api.route('/voice', voiceRoutes(deps))
   root.route(APP_API_PREFIX, api)
 

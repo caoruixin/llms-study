@@ -1,0 +1,93 @@
+# llms-study 渲染服务(无头 Chromium,网页原貌导入的 Tier 3 兜底;可选功能)
+# 安装与自检步骤见 deploy/provision.md 第 10 节。装好它**不等于启用**:
+# 总闸是 API 侧 /etc/llms-study/api.env 里的 RENDER_SERVICE_SOCKET,删掉那一行 + 重启 API 即刻关闭。
+#
+# 为什么是独立 unit、独立用户,而不是 API 的一个子进程:
+# - 独立 cgroup:API 的 unit 是 MemoryMax=512M,Chromium 作为它的子进程会共用那个 cgroup——
+#   一个吃内存的网页就能让登录/同步/LLM 网关一起被 OOM 杀掉。放在这里,最坏只是本 unit 重启。
+# - 独立用户(llmrender):这个进程执行的是**不可信网页里的任意脚本**。API 的环境里有 LLM 主密钥
+#   (LLM_KEY_MASTER),SQLite 库对 llmapp 可读;llmrender 两样都碰不到。
+#   所以 EnvironmentFile 是它自己的 render.env(**无任何机密**),绝不能指向 api.env。
+# - 两者之间只有一个 unix socket(0660,组 llmrender);API 通过 SupplementaryGroups=llmrender 入组。
+[Unit]
+Description=llms-study render service (headless Chromium, URL import Tier 3)
+After=network.target
+# crash-only:关不掉浏览器就直接 exit(1) 让 systemd 重启(见 server/src/render/browser.ts)。
+# 但真进了崩溃循环(Chrome 被卸载、沙箱起不来)就别无限重启了:5 分钟内 10 次 → unit 进 failed,
+# socket 消失,API 如实回 503 render-unavailable,前端回落到"该页面无法导入"的如实报错。
+# 恢复:修好原因后 systemctl reset-failed llms-study-render && systemctl start llms-study-render
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=llmrender
+Group=llmrender
+WorkingDirectory=/opt/llms-study-api
+# 无机密:只有 RENDER_SOCKET_PATH 与 RENDER_CHROME_PATH 两行。严禁写 RENDER_ALLOW_FORBIDDEN_DEV
+# (那是本机开发用的 SSRF 逃生口;进程检测到 systemd 环境下开着它会直接拒绝启动)
+EnvironmentFile=/etc/llms-study/render.env
+# 与 API 同一份构建产物(scripts/deploy.sh --server 一并发布),只是入口不同
+ExecStart=/usr/bin/node /opt/llms-study-api/dist/server/src/render/index.js
+Restart=always
+RestartSec=2
+# 停止/重启时连同 cgroup 里的全部 Chromium 子进程(zygote、渲染进程、GPU、crashpad…)一起杀:
+# 这是"进程内不追杀僵尸、exit 了事"这个设计成立的前提
+KillMode=control-group
+# 渲染是后台重活,别和 API 抢 CPU
+Nice=10
+
+# ---- socket 与可写目录 ----
+# /run/llms-study-render/,0750 llmrender:llmrender,unit 停止时自动清理;socket = render.sock
+RuntimeDirectory=llms-study-render
+RuntimeDirectoryMode=0750
+# socket 从 listen 那一刻起就不对 other 开放(代码随后再 chmod 到 0660)
+UMask=0007
+# Chromium 除了 --user-data-dir(playwright 放在私有 /tmp 下,用完即删)之外,还会往 $HOME 下的
+# .config/.cache/.pki 写东西;ProtectSystem=strict + ProtectHome 之下那些路径都不可写,
+# 所以把 HOME 指到本 unit 的 StateDirectory(/var/lib/llms-study-render,0700)
+StateDirectory=llms-study-render
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/llms-study-render
+Environment=XDG_CONFIG_HOME=/var/lib/llms-study-render/.config
+Environment=XDG_CACHE_HOME=/var/lib/llms-study-render/.cache
+
+# ---- 资源上限(需要 cgroup v2;第 10 节预检会确认)----
+# 一个 Chromium + 一个 node。MemoryHigh 先施加回收压力,MemoryMax 是硬顶;
+# 不给 swap:渲染进程一旦开始换页,30s 的渲染预算必然超时,还拖慢整机——不如干脆被杀
+MemoryHigh=640M
+MemoryMax=768M
+MemorySwapMax=0
+# cgroup 里任一进程被内核 OOM 杀掉 → 整个 unit 停掉再由 Restart=always 拉起(systemd 默认行为,显式写出)。
+# 不选 continue:被杀的可能是渲染进程也可能是 node 自己,统一"整窝重来"状态最干净
+OOMPolicy=stop
+# Chromium 一个页面几十个线程,256 足够;上限防的是页面里的 fork/worker 炸弹
+TasksMax=256
+
+# ---- 最小权限 ----
+# NoNewPrivileges 使 setuid 的 chrome-sandbox 失效,Chromium 因此只能用**非特权 user namespace**
+# 搭沙箱(第 10 节预检确认 user.max_user_namespaces > 0)。搭不起来它会拒绝启动——
+# 我们**绝不**用 --no-sandbox 绕过(server/test/renderBrowser.test.ts 钉着)。
+# 出于同样原因,这里**不要**加 RestrictNamespaces= / SystemCallFilter= / PrivateUsers=:
+# 它们会分别掐掉沙箱要用的 namespace 创建、seccomp 安装与 uid 映射。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# ---- 内核级 SSRF 兜底(cgroup/BPF 防火墙,对本 unit 内全部进程的 IPv4/IPv6 收发生效)----
+# 应用层已有两道:每个请求都经 safeFetchHop 校验并钉死 IP;拦截不到的流量撞死在 127.0.0.1:9 的死代理上。
+# 这一层防的是"那两道出了 bug / Chromium 被打穿":内网、链路本地、CGNAT(含阿里云元数据
+# 100.100.100.200)在内核里就发不出去。unix socket 不受影响(不是 IP 流量)。
+IPAddressDeny=127.0.0.0/8 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16
+IPAddressDeny=::1/128 fc00::/7 fe80::/10
+# >>>>>> 占位,装机时必须按 `cat /etc/resolv.conf` 的实际结果改 <<<<<<
+# IPAddressAllow 优先于 IPAddressDeny,所以这里**只能**写本机的 DNS 解析器,一个多余的地址都不要:
+# - 阿里云 ECS 的内网 DNS 通常是 100.100.2.136 / 100.100.2.138,恰好落在上面拒绝的 CGNAT 段里,
+#   不放行则所有域名都解析失败(以预检结果为准,不要照抄);
+# - 若 resolv.conf 指向 systemd-resolved 的 127.0.0.53,则改为放行 127.0.0.53;
+# - **元数据地址 100.100.100.200 必须保持被拒**——别为了省事放行整个 100.100.0.0/16。
+IPAddressAllow=100.100.2.136 100.100.2.138
+
+[Install]
+WantedBy=multi-user.target

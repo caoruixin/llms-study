@@ -50,6 +50,12 @@ export interface RenderedCapture {
   hidden: number
   fixed: number
   /**
+   * 捕获期间加载失败的外链 `<script src>` 个数（代理 v2 起回报，老代理/缺失/非法值一律按 0）。
+   * 不透明源沙箱里 `type="module" crossorigin` 的入口脚本拿不到 CORS 头就整个被拦——
+   * 正文为空且这个数 > 0，调用方就能如实说「脚本被跨源策略拦了」，而不是笼统的「没抓到正文」。
+   */
+  blockedScripts: number
+  /**
    * 代理脚本版本，原样进快照头 `capture.agentVersion`（buildSnapshot 只把它当可选字段，
    * 但写死 1 会让将来改了代理的快照说谎，所以这里如实回传）。
    */
@@ -171,6 +177,8 @@ function runCapture(
         viewportWidth: message.viewportWidth,
         hidden: message.hidden,
         fixed: message.fixed,
+        // 消息来自不可信的沙箱：字段缺失（v1 代理）或不是有限数都当 0，不让 NaN/字符串混进下游的比较
+        blockedScripts: Number.isFinite(message.blockedScripts) ? message.blockedScripts : 0,
         agentVersion: Number.isFinite(message.agentVersion) ? message.agentVersion : CAPTURE_AGENT_VERSION,
       }
     })

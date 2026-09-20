@@ -12,6 +12,7 @@ import {
 } from '../ingest'
 import type { PaperRepository, ReplaceFileInput } from '../repo/paperRepo'
 import type { IngestFailure, PaperRecord, PaperSource, UrlSourceEntry } from '../types'
+import { abortError, isAbortError, throwIfAborted } from './abort'
 import type { BuildSnapshotDeps, BuildSnapshotResult, SnapshotPhase } from './buildSnapshot'
 import { decodeHtmlBytes } from './extractArticle'
 import { URL_BUNDLE_MIME, URL_BUNDLE_VERSION, serializeUrlBundle, type UrlBundle } from './urlBundle'
@@ -39,6 +40,7 @@ export type UrlProgressPhase =
   | 'fetching'
   | 'extracting'
   | 'rendering'
+  | 'remote'
   | 'assets'
   | 'packing'
   | 'done'
@@ -97,6 +99,12 @@ export interface UrlImportDeps {
   ensureStorage?: (bytes: number) => Promise<{ ok: boolean; message?: string }>
   /** 原地重导入用：替换源文件（步骤 4 接 paperRepo.replaceFile）；缺省时 reimportUrlPaperInPlace 直接失败 */
   replaceFile?: (paperId: string, input: ReplaceFileInput) => Promise<void>
+  /**
+   * 用户主动取消（弹窗的「取消导入」→ 串行队列的 AbortSignal）。注入方负责把它同时接到
+   * fetchUrl / buildSnapshot 上——本模块只在阶段之间补查一次，确保「取消 = 什么都没发生」：
+   * 已建出的论文行会被删掉，AbortError 原样抛出而**不**落成 IngestFailure。
+   */
+  signal?: AbortSignal
 }
 
 const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d] // '%PDF-'
@@ -139,16 +147,38 @@ function summarizeHostnames(urls: readonly string[]): string {
 /** buildSnapshot 的阶段 → 弹窗进度阶段（sanitizing 对用户就是「打包」的一部分） */
 const SNAPSHOT_PHASE: Record<SnapshotPhase, UrlProgressPhase> = {
   rendering: 'rendering',
+  remote: 'remote',
   assets: 'assets',
   sanitizing: 'packing',
   packing: 'packing',
 }
 
-/** 未知异常 → IngestFailure：只有 IngestError 携带确定 kind，其余一律 unknown */
+/** 未知异常 → IngestFailure：只有 IngestError 携带确定 kind（与可选 hint），其余一律 unknown */
 function toFailure(e: unknown, at: number): IngestFailure {
-  if (e instanceof IngestError) return { kind: e.kind, message: e.message, at }
+  if (e instanceof IngestError) return { kind: e.kind, message: e.message, at, ...(e.hint ? { hint: e.hint } : {}) }
   const message = e instanceof Error ? e.message : String(e)
   return { kind: 'unknown', message: message || '导入失败（未知错误）', at }
+}
+
+const ABORT_MESSAGE = 'URL 导入已取消'
+
+/**
+ * 取消不是失败：AbortError 必须原样冒到队列外，让调用方静默收尾。
+ * 一旦被 toFailure 归一成 IngestFailure，弹窗就会弹出「导入失败」——用户明明是自己按的取消。
+ */
+function rethrowIfAborted(e: unknown): void {
+  if (isAbortError(e)) throw e
+}
+
+/**
+ * ingestPrepared 跑完之后才收到取消：论文行已经建出来了，删掉再抛 AbortError。
+ * 否则「取消」会在库里留下一篇用户以为根本没导入的论文（duplicate 命中的是既有论文，不能碰）。
+ */
+async function discardIfAborted(outcome: ImportOutcome, deps: UrlImportDeps): Promise<void> {
+  if (!deps.signal?.aborted) return
+  const created = outcome.kind === 'duplicate' ? undefined : outcome.paper
+  if (created) await deps.repo.deletePaper(created.id).catch(() => undefined)
+  throw abortError(ABORT_MESSAGE, deps.signal)
 }
 
 const ingestDepsOf = (deps: UrlImportDeps): IngestDeps => ({
@@ -222,11 +252,13 @@ async function importSnapshot(
     return { kind: 'failed', failure }
   }
 
+  throwIfAborted(deps.signal, ABORT_MESSAGE)
   report('fetching')
   let fetched: FetchedUrlResult
   try {
     fetched = await deps.fetchUrl(url)
   } catch (e) {
+    rethrowIfAborted(e)
     return fail(e)
   }
 
@@ -245,8 +277,12 @@ async function importSnapshot(
   try {
     built = await fetchAndBuildSnapshot(url, deps, build, (phase, detail) => report(phase, { detail }), fetched)
   } catch (e) {
+    rethrowIfAborted(e)
     return fail(e)
   }
+
+  // 快照构建是全程最慢的一段（10–30s），取消多半落在这里：落库前再查一次，别白建一条论文行
+  throwIfAborted(deps.signal, ABORT_MESSAGE)
 
   const { bytes, header } = built.result
   const outcome = await ingestPrepared(
@@ -261,6 +297,7 @@ async function importSnapshot(
     },
     ingestDepsOf(deps),
   )
+  await discardIfAborted(outcome, deps)
   if (outcome.kind === 'failed') report('failed', { error: outcome.failure.message })
   else report('done')
   return outcome
@@ -286,6 +323,7 @@ async function importPdfFromUrl(
     },
     ingestDepsOf(deps),
   )
+  await discardIfAborted(outcome, deps)
   if (outcome.kind === 'ready' && outcome.paper) {
     // 导入成功后补写 source：PDF 直链也留一条抓取记录，便于溯源「这篇论文是从哪个 URL 来的」
     const source: PaperSource = {
@@ -356,12 +394,14 @@ export async function importFromUrls(
 
   for (let i = 0; i < total; i++) {
     const url = urls[i]
+    throwIfAborted(deps.signal, ABORT_MESSAGE)
     onUrlProgress?.({ index: i, total, url, phase: 'fetching' })
 
     let fetched: FetchedUrlResult
     try {
       fetched = await deps.fetchUrl(url)
     } catch (e) {
+      rethrowIfAborted(e)
       const message = e instanceof Error ? e.message : String(e)
       entries.push({ url, ok: false, error: message, fetchedAt: now() })
       onUrlProgress?.({ index: i, total, url, phase: 'failed', error: message })
@@ -388,11 +428,14 @@ export async function importFromUrls(
       entries.push({ url, finalUrl: fetched.finalUrl, title, ok: true, fetchedAt: now() })
       onUrlProgress?.({ index: i, total, url, phase: 'done' })
     } catch (e) {
+      rethrowIfAborted(e)
       const message = e instanceof Error ? e.message : String(e)
       entries.push({ url, finalUrl: fetched.finalUrl, ok: false, error: message, fetchedAt: now() })
       onUrlProgress?.({ index: i, total, url, phase: 'failed', error: message })
     }
   }
+
+  throwIfAborted(deps.signal, ABORT_MESSAGE)
 
   if (sections.length === 0) {
     // 全失败不落库：不留一条「标题都没有」的空论文
@@ -412,7 +455,7 @@ export async function importFromUrls(
   const bytes = serializeUrlBundle(bundle)
   const source: PaperSource = { type: 'url', entries }
 
-  return ingestPrepared(
+  const outcome = await ingestPrepared(
     {
       title: sections[0]?.title || summarizeHostnames(sections.map((s) => s.finalUrl || s.url)),
       fileName: summarizeHostnames(sections.map((s) => s.finalUrl || s.url)),
@@ -424,6 +467,8 @@ export async function importFromUrls(
     },
     ingestDepsOf(deps),
   )
+  await discardIfAborted(outcome, deps)
+  return outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -467,11 +512,13 @@ export async function reimportUrlPaperInPlace(
   const report = (phase: UrlProgressPhase, detail?: { done: number; total: number }, error?: string) =>
     onUrlProgress?.({ index: 0, total: 1, url, phase, ...(detail ? { detail } : {}), ...(error ? { error } : {}) })
 
+  throwIfAborted(deps.signal, ABORT_MESSAGE)
   report('fetching')
   let fetched: FetchedUrlResult
   try {
     fetched = await deps.fetchUrl(url)
   } catch (e) {
+    rethrowIfAborted(e)
     const failure = toFailure(e, now())
     report('failed', undefined, failure.message)
     return { kind: 'failed', paper, failure }
@@ -486,10 +533,14 @@ export async function reimportUrlPaperInPlace(
   try {
     built = await fetchAndBuildSnapshot(url, deps, deps.buildSnapshot, report, fetched)
   } catch (e) {
+    rethrowIfAborted(e)
     const failure = toFailure(e, now())
     report('failed', undefined, failure.message)
     return { kind: 'failed', paper, failure }
   }
+
+  // replaceFile 之前的最后一道关：取消发生在这条线之前，原论文一个字节都不会被动过
+  throwIfAborted(deps.signal, ABORT_MESSAGE)
 
   const { bytes, header } = built.result
   try {
@@ -505,6 +556,7 @@ export async function reimportUrlPaperInPlace(
       fileName: summarizeHostnames([fetched.finalUrl || url]),
     })
   } catch (e) {
+    rethrowIfAborted(e)
     const failure = toFailure(e, now())
     report('failed', undefined, failure.message)
     return { kind: 'failed', paper, failure }

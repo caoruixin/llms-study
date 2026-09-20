@@ -94,3 +94,43 @@ export async function fetchUrl(url: string, opts: FetchUrlOptions = {}): Promise
   const finalUrl = finalUrlHeader ? decodeURI(finalUrlHeader) : url
   return { bytes, contentType, finalUrl }
 }
+
+export interface BusyRetryOptions {
+  /** 含首次在内最多试几次 */
+  maxAttempts?: number
+  /** 每次重试前等多久（第 n 次重试等 n 倍）；服务端给的 Retry-After 更短就用更短的 */
+  stepMs?: number
+  /** 等待实现（测试注入） */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * 正文抓取：服务端说「现在不行、稍后再来」（429 + Retry-After）时短暂等一下再试，而不是让整次导入失败。
+ *
+ * 起因是「取消导入」：用户在「抓取中」点取消、马上再导一篇，page 通道每用户并发只有 1，
+ * 上一次的名额还没来得及归还，新请求就会被 429「已有抓取任务进行中」拒掉。服务端现在会在客户端
+ * 断开时立刻中止上游抓取并归还名额（直连 API 实测：断开后 50ms 名额已空），但「断开 → 服务端察觉」
+ * 取决于中间的反代肯不肯把断开传下去——实测 vite 的 dev 代理就不传，名额要等上游抓完才还。
+ * 这里把这段窗口兜住：默认 4 次、累计最多等约 9s。只认 429 且带 Retry-After 的拒绝；
+ * 其余错误、以及主动取消，原样抛出。
+ * 资源抓取（kind:'asset'）不走这里——fetchAssets 自己有按 Retry-After 排队的整套退避。
+ */
+export async function fetchUrlWithBusyRetry(
+  url: string,
+  opts: FetchUrlOptions = {},
+  retry: BusyRetryOptions = {},
+): Promise<FetchedUrl> {
+  const maxAttempts = retry.maxAttempts ?? 4
+  const stepMs = retry.stepMs ?? 1500
+  const sleep = retry.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fetchUrl(url, opts)
+    } catch (e) {
+      const busy = e instanceof ApiRequestError && e.status === 429 && e.retryAfterMs !== undefined
+      if (!busy || attempt >= maxAttempts) throw e
+      await sleep(Math.min(e.retryAfterMs ?? stepMs, stepMs * attempt))
+      // 等待期间用户取消了：别再发下一次请求，交给 fetch 自己抛 AbortError 即可（signal 已 aborted）
+    }
+  }
+}

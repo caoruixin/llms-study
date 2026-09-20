@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { MAX_URLS_PER_IMPORT } from '../../../shared/apiRoutes'
 import type { ImportOutcome } from '../../lib/paper/ingest'
+import type { IngestFailureHint } from '../../lib/paper/types'
 import { parseUrlInput } from '../../lib/paper/url/urlValidate'
 import type { UrlPresentation, UrlProgressEvent } from '../../lib/paper/url/urlImport'
 import { isWeixinArticleUrl } from '../../lib/paper/url/weixin'
@@ -12,7 +13,9 @@ import { isWeixinArticleUrl } from '../../lib/paper/url/weixin'
  * 提交后本弹窗只是「进度视窗」——真正抓取任务跑在 PapersPage 持有的串行队列里（与文件
  * 导入共用同一个队列，同一时刻只解析一个文档）。关闭弹窗不会取消任务：与文件导入的
  * 后台任务语义一致（顶部 jobs 面板始终能看到进度），重新点开「按 URL 导入」还能看到
- * 同一个仍在运行的任务的最新进度。去重命中（outcome.kind === 'duplicate'）由 PapersPage
+ * 同一个仍在运行的任务的最新进度。要放弃任务得显式按「取消导入」（onCancel）——
+ * 「关闭」与「取消」是两件事，正因为关闭不取消，取消才必须有自己的按钮。
+ * 去重命中（outcome.kind === 'duplicate'）由 PapersPage
  * 直接关闭本弹窗、转交给页面既有的 pendingDuplicate 面板处理，本组件不需要认识这个分支。
  *
  * 重导入模式（reimport）：链接固定为该论文的来源 URL、只走网页原貌，提交后由 PapersPage
@@ -24,6 +27,7 @@ const PHASE_LABEL: Record<UrlProgressEvent['phase'], string> = {
   fetching: '抓取中',
   extracting: '抽取正文',
   rendering: '渲染页面',
+  remote: '服务器渲染',
   assets: '抓取资源',
   packing: '打包',
   done: '完成',
@@ -31,7 +35,7 @@ const PHASE_LABEL: Record<UrlProgressEvent['phase'], string> = {
 }
 
 /** 只有原貌导入才会经过的阶段：用于在弹窗重开（状态丢失）后仍能判断上一次是不是原貌尝试 */
-const SNAPSHOT_PHASES = new Set<UrlProgressEvent['phase']>(['rendering', 'assets', 'packing'])
+const SNAPSHOT_PHASES = new Set<UrlProgressEvent['phase']>(['rendering', 'remote', 'assets', 'packing'])
 
 function phaseText(p: UrlProgressEvent): string {
   const label = PHASE_LABEL[p.phase]
@@ -58,10 +62,30 @@ export interface UrlImportSubmitOptions {
   presentation: UrlPresentation
 }
 
+/**
+ * 失败后要不要给出「改用阅读模式重试」。抽成纯函数是为了能被单测钉住：
+ * 少判一个条件，用户看到的就是一个「按下去必然再失败一次」的按钮（缺陷 B）。
+ * 判据全部结构化——`hint` 由抛错方给出，绝不匹配 failure.message 的中文文案。
+ */
+export function canOfferReaderRetry(input: {
+  outcome: ImportOutcome | undefined
+  /** 上一次提交走的是网页原貌（阅读模式失败了再劝用阅读模式没有意义） */
+  wasSnapshot: boolean
+  progressCount: number
+  /** 重导入模式锁死原貌，没有「换一种呈现方式」可言 */
+  reimport: boolean
+}): boolean {
+  if (input.reimport || !input.wasSnapshot || input.progressCount === 0) return false
+  if (input.outcome?.kind !== 'failed') return false
+  return input.outcome.failure.hint !== 'reader-wont-help'
+}
+
 interface Props {
   onClose: () => void
   /** opts 缺省视同 snapshot（旧调用方只传 urls） */
   onSubmit: (urls: string[], opts?: UrlImportSubmitOptions) => void
+  /** 放弃仍在跑的任务（abort 队列信号）；与 onClose 互不替代，见头注释 */
+  onCancel: () => void
   /** 队列任务是否仍在执行（与「已提交」不同：结果 result 出来后 running 会变 false） */
   running: boolean
   progress: UrlProgressEvent[]
@@ -73,11 +97,17 @@ interface Props {
 }
 
 const PRESENTATION_HELP: Record<UrlPresentation, string> = {
-  snapshot: '保存整页样式与图片，与原网页几乎一致；仅支持单个链接，约 10–30 秒。视频不保留；需要交互才出现的内容只保留初始状态。',
+  snapshot:
+    '保存整页样式与图片，与原网页几乎一致；仅支持单个链接，约 10–30 秒。视频不保留；需要交互才出现的内容只保留初始状态。正文完全由脚本生成的页面，以及 shadow DOM 或内嵌 iframe 里的内容，可能抓不到。',
   reader: '只抽取正文文字与图片，排版由本站统一；多个链接会按顺序合并为一篇。',
 }
 
-export default function UrlImportDialog({ onClose, onSubmit, running, progress, result, initialUrl, reimport }: Props) {
+/** 结构化提示 → 失败框里补的那一行（别靠匹配 failure.message 文案，见 types.ts 的 IngestFailureHint） */
+const FAILURE_HINT_TEXT: Record<IngestFailureHint, string> = {
+  'reader-wont-help': '这个页面抓回来的 HTML 里本来就没有正文，阅读模式同样不执行页面脚本，重试也拿不到内容。',
+}
+
+export default function UrlImportDialog({ onClose, onCancel, onSubmit, running, progress, result, initialUrl, reimport }: Props) {
   const [text, setText] = useState(initialUrl ?? '')
   const [presentation, setPresentation] = useState<UrlPresentation>('snapshot')
   /** 上一次提交用的呈现方式（弹窗未重开时可用；重开后退回从进度阶段推断） */
@@ -96,7 +126,13 @@ export default function UrlImportDialog({ onClose, onSubmit, running, progress, 
   const note = progress.find((p) => p.note)?.note
 
   const wasSnapshot = submitted === 'snapshot' || (submitted === null && progress.some((p) => SNAPSHOT_PHASES.has(p.phase)))
-  const canRetryAsReader = !reimport && result?.outcome.kind === 'failed' && wasSnapshot && progress.length > 0
+  const canRetryAsReader = canOfferReaderRetry({
+    outcome: result?.outcome,
+    wasSnapshot,
+    progressCount: progress.length,
+    reimport: Boolean(reimport),
+  })
+  const failureHint = result?.outcome.kind === 'failed' ? result.outcome.failure.hint : undefined
 
   const submit = (opts: UrlImportSubmitOptions) => {
     setSubmitted(opts.presentation)
@@ -225,10 +261,23 @@ export default function UrlImportDialog({ onClose, onSubmit, running, progress, 
               </div>
             )}
 
+            {running && (
+              <div className="mt-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={onCancel}
+                  className="rounded-lg border border-line bg-panel px-4 py-1.5 text-sm text-fg transition-colors hover:bg-panel-2"
+                >
+                  取消导入
+                </button>
+              </div>
+            )}
+
             {result && result.outcome.kind === 'failed' && (
               <div className="mt-4 rounded-lg border border-bad/40 bg-panel-2 p-3">
                 <p className="mb-2 text-sm font-medium text-bad">{reimport ? '重新导入失败' : '导入失败'}</p>
                 <p className="text-xs text-dim">{result.outcome.failure.message}</p>
+                {failureHint && <p className="mt-1.5 text-xs text-dim">{FAILURE_HINT_TEXT[failureHint]}</p>}
               </div>
             )}
 

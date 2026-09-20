@@ -3,6 +3,7 @@ import { MAX_TEXT_CHARS, validateFile } from './validate'
 import type { PaperRepository } from './repo/paperRepo'
 import type {
   IngestFailure,
+  IngestFailureHint,
   IngestFailureKind,
   IngestStage,
   NormalizedBlock,
@@ -12,13 +13,22 @@ import type {
   PaperSource,
 } from './types'
 
+/** IngestError 的可选附加信息：第三个参数整体可省，老的两参调用点一个字都不用改 */
+export interface IngestErrorOptions {
+  hint?: IngestFailureHint
+}
+
 /** 全链路统一的分类错误：解析器 / 仓储 / 编排层都抛它，编排层据此写 IngestFailure */
 export class IngestError extends Error {
   readonly kind: IngestFailureKind
-  constructor(kind: IngestFailureKind, message: string) {
+  /** 给 UI 的结构化提示，原样搬进 IngestFailure.hint（见 types.ts 的 IngestFailureHint） */
+  readonly hint?: IngestFailureHint
+  constructor(kind: IngestFailureKind, message: string, opts: IngestErrorOptions = {}) {
     super(message)
     this.name = 'IngestError'
     this.kind = kind
+    // 只在真给了提示时才落字段：没有提示的错误对象形状与旧版完全一致
+    if (opts.hint) this.hint = opts.hint
   }
 }
 
@@ -204,9 +214,9 @@ export type ImportOutcome =
   | { kind: 'ready'; paper: PaperRecord }
   | { kind: 'failed'; paper?: PaperRecord; failure: IngestFailure }
 
-/** 未知异常兜底分类：只有 IngestError 携带确定 kind，其余一律 unknown（可重试） */
+/** 未知异常兜底分类：只有 IngestError 携带确定 kind（与可选 hint），其余一律 unknown（可重试） */
 function toFailure(e: unknown, at: number): IngestFailure {
-  if (e instanceof IngestError) return { kind: e.kind, message: e.message, at }
+  if (e instanceof IngestError) return { kind: e.kind, message: e.message, at, ...(e.hint ? { hint: e.hint } : {}) }
   const message = e instanceof Error ? e.message : String(e)
   return { kind: 'unknown', message: message || '导入失败（未知错误）', at }
 }

@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options { "settings": { "disableCSSFileLoading": true, "disableJavaScriptFileLoading": true, "disableJavaScriptEvaluation": true } }
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildCaptureSrcdoc,
   captureAgentMain,
@@ -8,19 +8,18 @@ import {
   CAPTURE_CSP,
   DEFAULT_CAPTURE_CONFIG,
   FIXED_ATTR,
-  HIDDEN_ATTR,
-  PRE_ATTR,
   SHEET_ATTR,
   type CaptureAgentConfig,
   type CaptureAgentMessage,
 } from './captureAgent'
-import { stampBlocks } from './stampBlocks'
+// captureAgent.ts 是零 import 文件（要原样编进 Node 服务端），不再转出这两个常量：直接从定义处取
+import { HIDDEN_ATTR, PRE_ATTR, stampBlocks } from './stampBlocks'
 
 /**
  * captureAgent 的三条契约在这里锁死：
  * ① `captureAgentMain` 自包含（要被 toString() 注进 srcdoc，闭包/import 一律不行）；
  * ② `buildCaptureSrcdoc` 的注入顺序（charset → CSP → base → 代理脚本，且在 `<head>` 最前）；
- * ③ `serialize()/annotate()/run()` 的行为。
+ * ③ `serialize()/annotate()/run()/collect()` 的行为，含 v2 的内容感知静默与 blockedScripts 信号。
  *
  * 全部跑在 happy-dom：用 `document.implementation.createHTMLDocument()` 造被捕获的文档
  * （不接到主文档上，免得 happy-dom 真的去拉 link/img），窗口用手写的假窗口，
@@ -59,14 +58,30 @@ const NORMAL_STYLE: Required<FakeStyle> = {
 interface Posted {
   msg: CaptureAgentMessage
   origin: string
+  /** 发出时刻（假定时器下 Date 也是假的，时序断言靠它） */
+  at: number
+}
+
+interface FakeWin {
+  win: Window
+  posted: Posted[]
+  /** 代理挂的 window error 监听器，连同它登记的阶段 */
+  errorListeners: Array<{ fn: (event: unknown) => void; capture: boolean }>
+  /**
+   * 模拟一次资源加载失败。这类 error **不冒泡**，window 上只有捕获阶段的监听器看得到——
+   * 所以这里只派发给 `capture: true` 的监听器：代理要是忘了第三个参数，相关用例会直接红。
+   */
+  fireError: (target: unknown) => void
 }
 
 /** 假窗口：只提供代理真正用到的那几个成员，计算样式与 postMessage 完全可控 */
 function fakeWin(
   doc: Document | null,
   styleFor: (el: Element) => FakeStyle = () => ({}),
-): { win: Window; posted: Posted[] } {
+  over: Record<string, unknown> = {},
+): FakeWin {
   const posted: Posted[] = []
+  const errorListeners: FakeWin['errorListeners'] = []
   const win = {
     document: doc,
     innerWidth: 1280,
@@ -74,7 +89,7 @@ function fakeWin(
     location: { href: 'about:srcdoc' },
     parent: {
       postMessage: (msg: CaptureAgentMessage, origin: string) => {
-        posted.push({ msg, origin })
+        posted.push({ msg, origin, at: Date.now() })
       },
     },
     getComputedStyle: (el: Element) => ({ ...NORMAL_STYLE, ...styleFor(el) }),
@@ -82,13 +97,20 @@ function fakeWin(
     clearTimeout: (id: number) => clearTimeout(id),
     requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0),
     // 被捕获文档是 createHTMLDocument（readyState 恒为 interactive），load 由假窗口代发
-    addEventListener: (type: string, fn: () => void) => {
+    addEventListener: (type: string, fn: (event?: unknown) => void, opts?: boolean | { capture?: boolean }) => {
       if (type === 'load') setTimeout(fn, 0)
+      if (type === 'error') {
+        errorListeners.push({ fn, capture: opts === true || (typeof opts === 'object' && opts?.capture === true) })
+      }
     },
     scrollTo: () => {},
     MutationObserver: globalThis.MutationObserver,
+    ...over,
   }
-  return { win: win as unknown as Window, posted }
+  const fireError = (target: unknown): void => {
+    for (const listener of errorListeners) if (listener.capture) listener.fn({ type: 'error', target })
+  }
+  return { win: win as unknown as Window, posted, errorListeners, fireError }
 }
 
 async function waitPost(posted: Posted[], budgetMs = 3000): Promise<Posted> {
@@ -132,6 +154,48 @@ describe('captureAgentMain 自包含性', () => {
     expect(PRE_ATTR).toBe('data-pc-pre')
     expect(SHEET_ATTR).toBe('data-pc-sheet')
     expect(src).toMatch(new RegExp(`agentVersion:\\s*${CAPTURE_AGENT_VERSION}\\b`))
+  })
+
+  it('函数体里**每一处** agentVersion 字面量都等于导出常量（ok / 失败两条消息，漏改一处就红）', () => {
+    const literals = Array.from(src.matchAll(/agentVersion:\s*([^,\s}]+)/g)).map((m) => m[1])
+    expect(literals.length).toBeGreaterThanOrEqual(2)
+    expect(literals).toEqual(literals.map(() => String(CAPTURE_AGENT_VERSION)))
+    expect(CAPTURE_AGENT_VERSION).toBe(2)
+  })
+
+  it('本文件零 import：序列化后的源码里没有被改写的导入绑定', () => {
+    // vitest/vite-node 会把 import 绑定改写成 __vi_import_N__.xxx；函数体里出现它就说明又引了模块作用域
+    expect(src).not.toMatch(/__vi_import_\d+__/)
+    expect(src).not.toContain('__vite_ssr_import')
+  })
+
+  it('不直接引用 `window`：宿主窗口只经 `win || globalThis` 取得（服务端编译没有 DOM lib）', () => {
+    expect(src).toContain('globalThis')
+    expect(src).not.toMatch(/\|\|\s*window\b/)
+  })
+
+  it('序列化后的源码脱离模块也能跑：`(src)(cfg).collect()` 正是服务端 page.evaluate 的调用形态', async () => {
+    // 不传 win → 落到 globalThis，也就是 happy-dom 的顶层窗口（parent === window）。
+    // 函数体里只要还有一个模块作用域的引用，这里就是 ReferenceError。
+    expect(window.parent).toBe(window)
+    const saved = document.body.innerHTML
+    const spy = vi.spyOn(window, 'postMessage').mockImplementation(() => {})
+    try {
+      document.body.innerHTML = `<main><p>${'独立运行的正文。'.repeat(40)}</p></main>`
+      const cfg = cfgOf({ quietMs: 5, maxAfterLoadMs: 20, emptyWaitCapMs: 20, sweep: false })
+      const expr = '(' + src + ')(' + JSON.stringify(cfg) + ').collect()'
+      const msg = (await new Function('return ' + expr)()) as CaptureAgentMessage
+      expect(msg.ok).toBe(true)
+      if (!msg.ok) throw new Error('unreachable')
+      expect(msg.agentVersion).toBe(CAPTURE_AGENT_VERSION)
+      expect(msg.blockedScripts).toBe(0)
+      expect(msg.html).toContain('独立运行的正文。')
+      // 顶层页面里 parent 就是自己：collect() 绝不能再把整份 HTML postMessage 出去
+      expect(spy).not.toHaveBeenCalled()
+    } finally {
+      spy.mockRestore()
+      document.body.innerHTML = saved
+    }
   })
 
   it('函数体里没有 `</script`（否则注入时会提前闭合脚本标签）', () => {
@@ -458,11 +522,17 @@ describe('annotate()', () => {
   })
 })
 
+/**
+ * 真定时器用例的提速配置。这些夹具文档只有几个字（远不到 minTextChars），v2 起会被当成「空页面」
+ * 一直等到 emptyWaitCapMs——所以它必须跟 maxAfterLoadMs 一起压小，否则每个用例白等 10s。
+ */
+const FAST = { quietMs: 5, maxAfterLoadMs: 20, emptyWaitCapMs: 20 } as const
+
 describe('run()', () => {
   it('走完整流程后只发一条 ok 消息，带标注计数与视口宽度', async () => {
     const doc = makeDoc('<div id="ghost">影子</div><p>正文</p>')
     const { win, posted } = fakeWin(doc, (el) => (el.id === 'ghost' ? { display: 'none' } : {}))
-    captureAgentMain(cfgOf({ quietMs: 5, maxAfterLoadMs: 20, sweep: false }), win).run()
+    captureAgentMain(cfgOf({ ...FAST, sweep: false }), win).run()
 
     const first = await waitPost(posted)
     expect(first.origin).toBe('https://app.example')
@@ -489,7 +559,7 @@ describe('run()', () => {
         '<img id="i3" src="https://cdn.example/keep.png" data-src="https://cdn.example/nope.png">',
     )
     const { win, posted } = fakeWin(doc)
-    captureAgentMain(cfgOf({ quietMs: 5, maxAfterLoadMs: 20, sweep: true }), win).run()
+    captureAgentMain(cfgOf({ ...FAST, sweep: true }), win).run()
     const msg = (await waitPost(posted)).msg
     if (!msg.ok) throw new Error('capture failed: ' + msg.reason)
     const out = parse(msg.html)
@@ -503,7 +573,7 @@ describe('run()', () => {
   it('超出 maxHtmlBytes → ok:false / too-large', async () => {
     const doc = makeDoc('<p>' + 'x'.repeat(200) + '</p>')
     const { win, posted } = fakeWin(doc)
-    captureAgentMain(cfgOf({ quietMs: 5, maxAfterLoadMs: 20, sweep: false, maxHtmlBytes: 32 }), win).run()
+    captureAgentMain(cfgOf({ ...FAST, sweep: false, maxHtmlBytes: 32 }), win).run()
     const msg = (await waitPost(posted)).msg
     expect(msg.ok).toBe(false)
     if (msg.ok) throw new Error('unreachable')
@@ -525,11 +595,390 @@ describe('run()', () => {
 
   it('流程里任何抛错都变成 ok:false + reason', async () => {
     const { win, posted } = fakeWin(null)
-    captureAgentMain(cfgOf({ quietMs: 5, maxAfterLoadMs: 20, sweep: false }), win).run()
+    captureAgentMain(cfgOf({ ...FAST, sweep: false }), win).run()
     const msg = (await waitPost(posted)).msg
     expect(msg.ok).toBe(false)
     if (msg.ok) throw new Error('unreachable')
     expect(msg.reason.length).toBeGreaterThan(0)
     expect(msg.reason).not.toBe('too-large')
+  })
+})
+
+/**
+ * v2：内容感知的静默判定 + blockedScripts 信号 + collect()。
+ *
+ * 全部用假定时器并断言**精确时刻**：这一组用例守的是时序，真定时器下只能写「大概」。
+ * 假窗口的 load 由 `setTimeout(fn, 0)` 代发，所以静默判定从 t=0 起算，
+ * 用默认配置的真实数值（700 / 6000 / 10000 / 20000）直接对。
+ *
+ * `FRAMES`：quiesce 收工后还有 twoFrames()，假窗口的 rAF 是 0ms 定时器，而假定时器会把
+ * **tick 期间**新建的 0ms 定时器排到 +1ms（@sinonjs/fake-timers 的 duringTick 规则），
+ * 两帧就是 +2ms。它与 v1/v2 无关（v1 同样是 702），断言时单独加上，免得看起来像是代理多等了 2ms。
+ */
+describe('run() 的静默判定（v2：内容感知）', () => {
+  /** 330 字，稳过 minTextChars=200 */
+  const LONG = '这是一段足够长的正文。'.repeat(30)
+  const T = { sweep: false } as const
+  const FRAMES = 2
+  let t0 = 0
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    t0 = Date.now()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** 把假时钟拨到「开跑后第 ms 毫秒」 */
+  const advanceTo = async (ms: number): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(ms - (Date.now() - t0))
+  }
+
+  const okOf = (posted: Posted[]): Extract<CaptureAgentMessage, { ok: true }> => {
+    expect(posted).toHaveLength(1)
+    const msg = posted[0].msg
+    if (!msg.ok) throw new Error('capture failed: ' + msg.reason)
+    return msg
+  }
+
+  /**
+   * 断言 quiesce 恰在 `stopAt` 收工：此前一毫秒还没有消息，两帧之后消息发出，
+   * 且发出时刻精确等于 stopAt + FRAMES（早收工或晚收工都会让这个等式不成立）。
+   */
+  const expectStopAt = async (posted: Posted[], stopAt: number): Promise<Extract<CaptureAgentMessage, { ok: true }>> => {
+    await advanceTo(stopAt + FRAMES - 1)
+    expect(posted).toHaveLength(0)
+    await advanceTo(stopAt + FRAMES)
+    const msg = okOf(posted)
+    expect(posted[0].at - t0).toBe(stopAt + FRAMES)
+    return msg
+  }
+
+  it('默认配置钉住：minTextChars=200 / emptyWaitCapMs=10000，且随 cfg 一起注进 srcdoc', () => {
+    expect(DEFAULT_CAPTURE_CONFIG.minTextChars).toBe(200)
+    expect(DEFAULT_CAPTURE_CONFIG.emptyWaitCapMs).toBe(10000)
+    // 回归红线依赖这三个旧值不动
+    expect(DEFAULT_CAPTURE_CONFIG.quietMs).toBe(700)
+    expect(DEFAULT_CAPTURE_CONFIG.maxAfterLoadMs).toBe(6000)
+    expect(DEFAULT_CAPTURE_CONFIG.hardTimeoutMs).toBe(20000)
+    const out = buildCaptureSrcdoc('<html><head></head><body></body></html>', BASE, cfgOf())
+    expect(out).toContain('"minTextChars":200')
+    expect(out).toContain('"emptyWaitCapMs":10000')
+  })
+
+  describe('回归红线：已有正文的页面与 v1 时序完全一致', () => {
+    it('一开始就有正文 → 第一个静默 tick（quietMs）收工，一毫秒不多', async () => {
+      const { win, posted } = fakeWin(makeDoc(`<article><p>${LONG}</p></article>`))
+      captureAgentMain(cfgOf(T), win).run()
+      const msg = await expectStopAt(posted, 700)
+      expect(msg.blockedScripts).toBe(0)
+    })
+
+    it('静默窗口内的 DOM 变更照旧重新计时：t=500 变更 → t=1200 收工', async () => {
+      const doc = makeDoc(`<article><p id="p">${LONG}</p></article>`)
+      const { win, posted } = fakeWin(doc)
+      captureAgentMain(cfgOf(T), win).run()
+      await advanceTo(500)
+      doc.getElementById('p')!.setAttribute('data-late', '1')
+      await expectStopAt(posted, 1200)
+    })
+
+    it('永不静默的有正文页面照旧在 maxAfterLoadMs 封顶，不会被顺延到 emptyWaitCapMs', async () => {
+      const doc = makeDoc(`<article><p id="p">${LONG}</p></article>`)
+      const { win, posted } = fakeWin(doc)
+      let n = 0
+      const ticker = setInterval(() => doc.getElementById('p')!.setAttribute('data-n', String(n++)), 300)
+      try {
+        captureAgentMain(cfgOf(T), win).run()
+        await expectStopAt(posted, 6000)
+      } finally {
+        clearInterval(ticker)
+      }
+    })
+  })
+
+  describe('空页面（缺陷 G：JS 包还在下载的页面同样没有 DOM 变更）', () => {
+    it('空 body 不在第一个静默 tick 收工，而是等满 emptyWaitCapMs', async () => {
+      const { win, posted } = fakeWin(makeDoc('<div id="root"></div>'))
+      captureAgentMain(cfgOf(T), win).run()
+      await advanceTo(700 + FRAMES)
+      expect(posted).toHaveLength(0)
+      // 旧的 maxAfterLoadMs 封顶也拦不住它
+      await advanceTo(6000 + FRAMES)
+      expect(posted).toHaveLength(0)
+      const msg = await expectStopAt(posted, 10000)
+      expect(msg.blockedScripts).toBe(0)
+      expect(msg.html).toContain('<div id="root"></div>')
+    })
+
+    it('一直在变、却始终没有正文的页面（转圈动画）：同样封顶在 emptyWaitCapMs', async () => {
+      const doc = makeDoc('<div id="root"><i id="spin"></i></div>')
+      const { win, posted } = fakeWin(doc)
+      let n = 0
+      const ticker = setInterval(() => doc.getElementById('spin')!.setAttribute('data-n', String(n++)), 300)
+      try {
+        captureAgentMain(cfgOf(T), win).run()
+        await expectStopAt(posted, 10000)
+      } finally {
+        clearInterval(ticker)
+      }
+    })
+
+    it('正文晚到（已经空转了好几个静默窗口）→ 出现后一个 quietMs 内收工，远早于上限', async () => {
+      const doc = makeDoc('<div id="root"></div>')
+      const { win, posted } = fakeWin(doc)
+      captureAgentMain(cfgOf(T), win).run()
+      // 700 / 1400 / 2100 三个静默 tick 都因为没有正文而放过
+      await advanceTo(2500)
+      expect(posted).toHaveLength(0)
+      doc.getElementById('root')!.innerHTML = `<article><p>${LONG}</p></article>`
+      // 这次变更让静默重新计时：2500 + 700
+      const msg = await expectStopAt(posted, 3200)
+      expect(msg.html).toContain('这是一段足够长的正文。')
+    })
+
+    it('宿主没有 MutationObserver 也不会错过晚到的正文：重上弦的静默定时器本身就是轮询', async () => {
+      const doc = makeDoc('<div id="root"></div>')
+      const { win, posted } = fakeWin(doc, () => ({}), { MutationObserver: undefined })
+      captureAgentMain(cfgOf(T), win).run()
+      await advanceTo(2500)
+      doc.getElementById('root')!.innerHTML = `<article><p>${LONG}</p></article>`
+      // 没有观察者来重新计时 → 下一个既定 tick（2800）直接看见正文
+      await expectStopAt(posted, 2800)
+    })
+
+    it('script / style / noscript / template 里的字与纯空白都不算正文', async () => {
+      const junk = 'x'.repeat(400)
+      const doc = makeDoc(
+        `<div id="root">   \n\t  </div><script>var a = "${junk}"</script><style>.a::after{content:"${junk}"}</style>` +
+          `<noscript>${junk}</noscript><template><p>${junk}</p></template>`,
+      )
+      const { win, posted } = fakeWin(doc)
+      captureAgentMain(cfgOf(T), win).run()
+      await expectStopAt(posted, 10000)
+    })
+
+    it('门槛按累计算：分散在许多节点里的短文本加起来够数就算有正文', async () => {
+      const items = Array.from({ length: 50 }, (_, i) => `<li><span> 条目${i} </span></li>`).join('')
+      const { win, posted } = fakeWin(makeDoc(`<ul>${items}</ul>`))
+      captureAgentMain(cfgOf({ ...T, minTextChars: 100 }), win).run()
+      await expectStopAt(posted, 700)
+    })
+
+    it('差一个字也不算：199 字照样等满上限', async () => {
+      const short = fakeWin(makeDoc(`<p>${'字'.repeat(199)}</p>`))
+      captureAgentMain(cfgOf(T), short.win).run()
+      await expectStopAt(short.posted, 10000)
+    })
+
+    it('恰好 200 字（跨节点累计、两端空白不计）→ 第一个静默 tick 收工', async () => {
+      const enough = fakeWin(makeDoc(`<p>${'字'.repeat(120)}</p><p>  ${'字'.repeat(80)}  </p>`))
+      captureAgentMain(cfgOf(T), enough.win).run()
+      await expectStopAt(enough.posted, 700)
+    })
+
+    it('minTextChars=0 关掉内容感知 → 空页面也在第一个静默 tick 收工（v1 行为）', async () => {
+      const { win, posted } = fakeWin(makeDoc('<div id="root"></div>'))
+      captureAgentMain(cfgOf({ ...T, minTextChars: 0 }), win).run()
+      await expectStopAt(posted, 700)
+    })
+
+    it('maxAfterLoadMs 比 emptyWaitCapMs 还大时：过了 emptyWaitCapMs 的第一个静默 tick 收工', async () => {
+      const { win, posted } = fakeWin(makeDoc('<div id="root"></div>'))
+      captureAgentMain(cfgOf({ ...T, maxAfterLoadMs: 15000, emptyWaitCapMs: 3000 }), win).run()
+      // tick 在 700 的整数倍上：2800 还没到上限，3500 是第一个越过 3000 的
+      await expectStopAt(posted, 3500)
+    })
+  })
+
+  describe('blockedScripts：外链脚本加载失败的实测信号', () => {
+    /**
+     * 充当 error 事件 target 的外链脚本元素。**不接进文档**：happy-dom 对接入文档的 `<script src>`
+     * 会真的尝试加载，然后在 stderr 里刷一屏「JavaScript file loading is disabled」。
+     * 代理只看 `event.target` 的标签名与 src，元素在不在树上无所谓。
+     */
+    const scriptEl = (doc: Document, attrs: Record<string, string>): Element => {
+      const el = doc.createElement('script')
+      for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value)
+      return el
+    }
+
+    it('error 监听器在**构造时**就以捕获阶段挂上（先于站点任何脚本，不等 run）', () => {
+      const h = fakeWin(makeDoc('<div id="root"></div>'))
+      captureAgentMain(cfgOf(T), h.win)
+      expect(h.errorListeners).toHaveLength(1)
+      expect(h.errorListeners[0].capture).toBe(true)
+    })
+
+    it('被拦的 `<script src>` → 空 body 也在第一个静默 tick 收工，并回报 blockedScripts: 1', async () => {
+      // z.ai 博客的形态：纯客户端渲染的空壳 + 走 CORS 的 module 入口
+      const doc = makeDoc('<div id="root"></div>')
+      const h = fakeWin(doc)
+      const agent = captureAgentMain(cfgOf(T), h.win)
+      // 脚本失败发生在 run() 之前（解析 head 时）也得算进去
+      h.fireError(scriptEl(doc, { type: 'module', crossorigin: '', src: '/blog/assets/index.js' }))
+      agent.run()
+      const msg = await expectStopAt(h.posted, 700)
+      expect(msg.blockedScripts).toBe(1)
+      expect(msg.html).toContain('<div id="root"></div>')
+    })
+
+    it('等待途中才失败的脚本：下一个静默 tick 就走，不再耗到上限', async () => {
+      const doc = makeDoc('<div id="root"></div>')
+      const h = fakeWin(doc)
+      captureAgentMain(cfgOf(T), h.win).run()
+      await advanceTo(1500)
+      expect(h.posted).toHaveLength(0)
+      h.fireError(scriptEl(doc, { src: 'https://cdn.example/app.js' }))
+      h.fireError(scriptEl(doc, { src: 'https://cdn.example/vendor.js' }))
+      const msg = await expectStopAt(h.posted, 2100)
+      expect(msg.blockedScripts).toBe(2)
+    })
+
+    it('非脚本目标、内联脚本、window 自身的 error 都不计数 → 空页面照旧等满上限', async () => {
+      const doc = makeDoc('<div id="root"></div><img id="pic" src="https://cdn.example/a.png">')
+      const h = fakeWin(doc)
+      captureAgentMain(cfgOf(T), h.win).run()
+      h.fireError(doc.getElementById('pic'))
+      h.fireError(doc.createElement('link'))
+      // 没有 src（内联脚本）或 src 为空：不是「外链脚本加载失败」
+      h.fireError(scriptEl(doc, { id: 'inline' }))
+      h.fireError(scriptEl(doc, { src: '' }))
+      h.fireError(h.win)
+      h.fireError(null)
+      h.fireError(undefined)
+      const msg = await expectStopAt(h.posted, 10000)
+      expect(msg.blockedScripts).toBe(0)
+    })
+
+    it('失败消息同样带 blockedScripts', async () => {
+      const doc = makeDoc(`<p>${LONG}</p>`)
+      const h = fakeWin(doc)
+      const agent = captureAgentMain(cfgOf({ ...T, maxHtmlBytes: 32 }), h.win)
+      h.fireError(scriptEl(doc, { src: 'https://cdn.example/app.js' }))
+      agent.run()
+      await advanceTo(700 + FRAMES)
+      expect(h.posted).toHaveLength(1)
+      expect(h.posted[0].msg).toEqual({
+        type: 'pc-capture',
+        ok: false,
+        reason: 'too-large',
+        blockedScripts: 1,
+        agentVersion: CAPTURE_AGENT_VERSION,
+      })
+    })
+
+    it('宿主的 addEventListener 抛错也不影响构造与捕获', async () => {
+      const h = fakeWin(makeDoc(`<p>${LONG}</p>`), () => ({}), {
+        addEventListener: (type: string, fn: () => void) => {
+          if (type === 'error') throw new Error('nope')
+          if (type === 'load') setTimeout(fn, 0)
+        },
+      })
+      captureAgentMain(cfgOf(T), h.win).run()
+      const msg = await expectStopAt(h.posted, 700)
+      expect(msg.blockedScripts).toBe(0)
+    })
+  })
+
+  describe('硬超时压过一切', () => {
+    it('空页面的等待上限比硬超时还长 → 硬超时到点就发（不经两帧，直接 finish）', async () => {
+      const { win, posted } = fakeWin(makeDoc('<div id="root"></div>'))
+      captureAgentMain(cfgOf({ ...T, maxAfterLoadMs: 60000, emptyWaitCapMs: 60000 }), win).run()
+      await advanceTo(19999)
+      expect(posted).toHaveLength(0)
+      await advanceTo(20000)
+      okOf(posted)
+      expect(posted[0].at - t0).toBe(20000)
+      // 之后 quiesce 的定时器陆续到点，也不会再发第二条
+      await advanceTo(180000)
+      expect(posted).toHaveLength(1)
+    })
+
+    it('硬超时短于 emptyWaitCapMs 时同理（3s 硬超时 vs 10s 空页面上限）', async () => {
+      const { win, posted } = fakeWin(makeDoc('<div id="root"></div>'))
+      captureAgentMain(cfgOf({ ...T, hardTimeoutMs: 3000 }), win).run()
+      await advanceTo(2999)
+      expect(posted).toHaveLength(0)
+      await advanceTo(3000)
+      okOf(posted)
+      expect(posted[0].at - t0).toBe(3000)
+      await advanceTo(60000)
+      expect(posted).toHaveLength(1)
+    })
+  })
+
+  describe('collect()', () => {
+    it('resolve 一次 ok 消息，且**从不** postMessage；之后硬超时到点也不会补发', async () => {
+      const { win, posted } = fakeWin(makeDoc(`<article><p>${LONG}</p></article>`))
+      const sink = vi.fn()
+      const promise = captureAgentMain(cfgOf(T), win)
+        .collect()
+        .then((msg) => {
+          sink(msg)
+          return msg
+        })
+      await advanceTo(700 + FRAMES - 1)
+      expect(sink).not.toHaveBeenCalled()
+      await advanceTo(700 + FRAMES)
+      const msg = await promise
+      expect(msg.ok).toBe(true)
+      if (!msg.ok) throw new Error('unreachable')
+      expect(msg.type).toBe('pc-capture')
+      expect(msg.agentVersion).toBe(CAPTURE_AGENT_VERSION)
+      expect(msg.blockedScripts).toBe(0)
+      expect(msg.title).toBe('快照标题')
+      expect(msg.html).toContain('这是一段足够长的正文。')
+      await advanceTo(180000)
+      expect(sink).toHaveBeenCalledTimes(1)
+      expect(posted).toHaveLength(0)
+    })
+
+    it('顶层页面（parent === window）里单独调用：消息只从 Promise 出来，window.postMessage 没被碰过', async () => {
+      const selfPost = vi.fn()
+      const h = fakeWin(makeDoc(`<article><p>${LONG}</p></article>`), () => ({}), { postMessage: selfPost })
+      ;(h.win as unknown as { parent: unknown }).parent = h.win
+      const promise = captureAgentMain(cfgOf(T), h.win).collect()
+      await advanceTo(700 + FRAMES)
+      expect((await promise).ok).toBe(true)
+      expect(selfPost).not.toHaveBeenCalled()
+    })
+
+    it('失败也走 resolve（ok:false），不 reject、不 postMessage', async () => {
+      const { win, posted } = fakeWin(null)
+      const promise = captureAgentMain(cfgOf(T), win).collect()
+      await advanceTo(10)
+      const msg = await promise
+      expect(msg.ok).toBe(false)
+      if (msg.ok) throw new Error('unreachable')
+      expect(msg.reason.length).toBeGreaterThan(0)
+      expect(msg.blockedScripts).toBe(0)
+      expect(posted).toHaveLength(0)
+    })
+
+    it('重复 collect() 拿到同一条消息，流程只跑一遍（晚到的那次直接拿现成结果）', async () => {
+      const { win, posted } = fakeWin(makeDoc(`<article><p>${LONG}</p></article>`))
+      const agent = captureAgentMain(cfgOf(T), win)
+      const first = agent.collect()
+      const second = agent.collect()
+      await advanceTo(700 + FRAMES)
+      const a = await first
+      expect(await second).toBe(a)
+      expect(await agent.collect()).toBe(a)
+      expect(posted).toHaveLength(0)
+    })
+
+    it('不用 collect() 时 run() 照旧向 parent 发且只发一条', async () => {
+      const { win, posted } = fakeWin(makeDoc(`<article><p>${LONG}</p></article>`))
+      const agent = captureAgentMain(cfgOf(T), win)
+      agent.run()
+      // 重入无害：第二次 run() 不会再起一套流程
+      agent.run()
+      await expectStopAt(posted, 700)
+      expect(posted[0].origin).toBe('https://app.example')
+      await advanceTo(180000)
+      expect(posted).toHaveLength(1)
+    })
   })
 })

@@ -55,11 +55,16 @@ deploy_server() {
   # 只传 dist + lockfile;原生模块(better-sqlite3/@node-rs)必须在目标机 npm ci 重建
   # COPYFILE_DISABLE=1:macOS bsdtar 否则会打进 AppleDouble(._xxx),曾把 ._001_init.sql 混进迁移目录
   COPYFILE_DISABLE=1 tar -C server -czf - dist package.json package-lock.json | ssh "$HOST" "tar -xzf - -C ${APIROOT}-new"
-  ssh "$HOST" "cd ${APIROOT}-new && npm ci --omit=dev --no-audit --no-fund"
+  # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1:渲染服务依赖 playwright-core,但线上用的是 dnf 装的 Chrome
+  # (RENDER_CHROME_PATH 显式指定),绝不让 npm 在服务器上顺手下一个几百 MB 的浏览器
+  ssh "$HOST" "cd ${APIROOT}-new && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --omit=dev --no-audit --no-fund"
   ssh "$HOST" "if [ -d ${APIROOT} ]; then mv ${APIROOT} ${APIROOT}.bak-${STAMP}; fi \
     && mv ${APIROOT}-new ${APIROOT} \
     && ls -dt ${APIROOT}.bak-* 2>/dev/null | tail -n +3 | xargs -r rm -rf \
     && systemctl restart llms-study-api"
+  # 渲染服务(可选,deploy/provision.md 第 10 节)与 API 是同一份构建产物,代码换了它也要重启才生效。
+  # try-restart 只重启**正在运行**的 unit:没装、已停用都是 no-op,不会让部署因此失败
+  ssh "$HOST" "systemctl try-restart llms-study-render 2>/dev/null || true"
 
   sleep 2
   if curl -sf https://llm-pro.cn/api/app/health >/dev/null; then

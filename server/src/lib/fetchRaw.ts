@@ -66,6 +66,8 @@ export interface FetchTransportRequest {
   headers: Record<string, string>
   maxBytes: number
   timeoutMs: number
+  /** 调用方放弃了(客户端断开):立刻掐断这条上游连接,见 SafeFetchOptions.signal */
+  signal?: AbortSignal
 }
 
 export interface FetchTransportResponse {
@@ -97,6 +99,14 @@ export interface SafeFetchOptions {
    * 字面 IP 的 URL 仍在 validateTargetUrl 被拒,其余防线(端口/重定向/限额)全部保留。
    */
   allowForbiddenAddresses?: boolean
+  /**
+   * 调用方放弃信号(路由传 `c.req.raw.signal`:客户端断开即 abort)。
+   *
+   * 没有它,客户端走了我们还会把上游抓完(最长 20s),**这段时间里该用户的并发名额一直被占着**:
+   * 前端「取消导入」之后立刻再导一篇,page 通道并发是 1,新请求直接 429「已有抓取任务进行中」,
+   * 整次导入失败——取消按钮上线后实测复现。abort 后以 FetchFailedError 收场,名额随路由的 finally 归还。
+   */
+  signal?: AbortSignal
 }
 
 export interface SafeFetchResult {
@@ -105,6 +115,37 @@ export interface SafeFetchResult {
   /** 重定向后的最终 URL:客户端做相对链接绝对化的基准 */
   finalUrl: string
 }
+
+/**
+ * 单跳选项:没有 maxRedirects(单跳不跟随,谈不上"最多几跳")。
+ * timeoutMs 在这里是**本跳**的预算;safeFetchUrl 逐跳传入总预算的剩余量,≤0 即已超时。
+ */
+export type SafeFetchHopOptions = Omit<SafeFetchOptions, 'maxRedirects'>
+
+export interface SafeFetchHopRedirect {
+  kind: 'redirect'
+  status: number
+  /**
+   * 已按本跳 URL 绝对化的跳转目标。**尚未校验**:跟不跟由调用方定,
+   * 要跟就把它原样交给下一次 safeFetchHop——校验只在"真要请求它"的那一跳做,不留第二处
+   */
+  location: string
+  /** 本跳实际请求的 URL(规范化后) */
+  url: string
+}
+
+export interface SafeFetchHopResponse {
+  kind: 'response'
+  /** 任何非重定向状态,含 4xx/5xx:算不算失败是调用方的语义,不是这条通道的 */
+  status: number
+  /** 已解压,同受 maxBytes 约束 */
+  bytes: Buffer
+  contentType: string | null
+  /** 本跳实际请求的 URL(规范化后) */
+  url: string
+}
+
+export type SafeFetchHopResult = SafeFetchHopRedirect | SafeFetchHopResponse
 
 /**
  * 出站头:最小集。不带任何 cookie/authorization/referer——
@@ -163,9 +204,11 @@ export function nodeTransport(req: FetchTransportRequest): Promise<FetchTranspor
 
     let settled = false
     let timer: NodeJS.Timeout | undefined
+    const onAbort = (): void => fail(new FetchFailedError('抓取已取消'))
     const finish = (): void => {
       settled = true
       if (timer) clearTimeout(timer)
+      req.signal?.removeEventListener('abort', onAbort)
     }
     const fail = (e: Error): void => {
       if (settled) return
@@ -180,6 +223,11 @@ export function nodeTransport(req: FetchTransportRequest): Promise<FetchTranspor
     }
     // 手动总计时:socket timeout 只管"空闲",挡不住"每秒吐一个字节"的慢速拖延
     timer = setTimeout(() => fail(new FetchFailedError('抓取超时')), req.timeoutMs)
+    // 调用方放弃:掐断上游(fail 里 request.destroy()),别替一个已经走掉的客户端把 20MB 读完
+    if (req.signal) {
+      if (req.signal.aborted) onAbort()
+      else req.signal.addEventListener('abort', onAbort, { once: true })
+    }
 
     request.on('timeout', () => fail(new FetchFailedError('抓取超时')))
     request.on('error', (e) => fail(new FetchFailedError(`连接失败:${errMsg(e)}`)))
@@ -252,6 +300,104 @@ function decompress(bytes: Buffer, encoding: string | undefined, maxBytes: numbe
 }
 
 /**
+ * 安全地发出**恰好一个**请求:全套校验 + 钉死 IP 建连 + 双闸限量,重定向不跟随、状态不裁决。
+ *
+ * 为什么单独导出:无头浏览器渲染要把浏览器的每个请求都从这条通道兑现,而 30x 必须原样
+ * 交还浏览器、由它自己重发下一跳——URL 身份逐跳精确,模块的相对 import 才解析得对;
+ * 替它跟完再交最终字节,浏览器以为的"当前 URL"就和真实来源脱钩了。404/500 同理要当作
+ * 响应透传,而不是抛错。safeFetchUrl 只是在它之上加"跟随 + 非 2xx 即失败"这层语义,
+ * 所以两个调用方共用同一条防线,不存在"浏览器那条路少验一步"的可能。
+ */
+export async function safeFetchHop(
+  rawUrl: string,
+  opts: SafeFetchHopOptions = {},
+): Promise<SafeFetchHopResult> {
+  const maxBytes = opts.maxBytes ?? FETCH_URL_MAX_BYTES
+  const timeoutMs = opts.timeoutMs ?? FETCH_URL_TIMEOUT_MS
+  const transport = opts.transport ?? nodeTransport
+  const lookup = opts.lookup ?? defaultLookup
+  // accept 之外的出站头恒定:身份相关的头(cookie/authorization/referer)永远不出现
+  const headers = opts.accept ? { ...OUTBOUND_HEADERS, accept: opts.accept } : OUTBOUND_HEADERS
+
+  // 每跳都重跑全套校验:重定向目标是上游说了算的,和用户最初输入的 URL 一样不可信。
+  // 首跳的这次是纵深防御(路由已先校验过一遍,故这里统一按 denied 抛)
+  const checked = validateTargetUrl(rawUrl)
+  if (!checked.ok) throw new FetchDeniedError(checked.message)
+  const url = checked.url
+
+  // 排在 URL 校验之后:预算耗尽的那一跳若指向禁区,仍要报 denied 而不是超时
+  if (timeoutMs <= 0) throw new FetchFailedError('抓取超时')
+
+  // 解析出地址并逐个过禁区:任一结果落禁区就整体拒绝(不挑一个"看着安全的"用,
+  // 那样等于让攻击者用一条 A 记录多值就能试探)
+  let target: ResolvedAddress
+  const literal = parseIpLiteral(url.hostname)
+  if (literal) {
+    target = { address: literal.address, family: literal.family }
+  } else {
+    let resolved: ResolvedAddress[]
+    try {
+      resolved = await lookup(url.hostname)
+    } catch (e) {
+      throw new FetchFailedError(`域名解析失败:${errMsg(e)}`)
+    }
+    if (resolved.length === 0) throw new FetchFailedError('域名无法解析')
+    if (!opts.allowForbiddenAddresses) {
+      for (const r of resolved) {
+        if (isForbiddenAddress(r.address)) {
+          throw new FetchDeniedError('目标地址指向内网或保留地址')
+        }
+      }
+    }
+    target = resolved[0]
+  }
+
+  // DNS 那一段不可中断;解析回来再看一眼,调用方已经走了就别建连了
+  if (opts.signal?.aborted) throw new FetchFailedError('抓取已取消')
+
+  const res = await transport({
+    url,
+    address: target.address,
+    family: target.family,
+    port: url.port !== '' ? Number(url.port) : url.protocol === 'https:' ? 443 : 80,
+    headers,
+    maxBytes,
+    timeoutMs,
+    signal: opts.signal,
+  })
+
+  if (REDIRECT_STATUS.has(res.status)) {
+    const location = res.headers.location
+    if (!location) throw new FetchFailedError(`上游返回 ${res.status} 但缺少 Location`)
+    let absolute: string
+    try {
+      // 相对 Location 必须以当前跳的 URL 为基准解析
+      absolute = new URL(location, url).toString()
+    } catch {
+      throw new FetchFailedError('重定向目标不是合法 URL')
+    }
+    return { kind: 'redirect', status: res.status, location: absolute, url: url.toString() }
+  }
+
+  let bytes: Buffer
+  try {
+    bytes = decompress(res.bytes, res.headers['content-encoding'], maxBytes)
+  } catch (e) {
+    // 非 2xx 的 body 只是陪衬,状态码才是信息:解不开就交空 body,不让一个坏掉/超限的
+    // 错误页压缩体把"上游返回 404"顶替成解压错误(safeFetchUrl 原本就不看非 2xx 的 body)
+    if (res.status >= 200 && res.status < 300) throw e
+    bytes = Buffer.alloc(0)
+  }
+  return {
+    kind: 'response',
+    status: res.status,
+    bytes,
+    contentType: res.headers['content-type'] ?? null,
+    url: url.toString(),
+  }
+}
+
+/**
  * 安全抓取一个 URL:逐跳校验 + 钉死 IP 建连 + 双闸限量,返回原始字节。
  * 内容类型的放行判断留给调用方(路由)——这里只负责"安全地把字节取回来"。
  */
@@ -259,81 +405,24 @@ export async function safeFetchUrl(
   rawUrl: string,
   opts: SafeFetchOptions = {},
 ): Promise<SafeFetchResult> {
-  const maxBytes = opts.maxBytes ?? FETCH_URL_MAX_BYTES
   const timeoutMs = opts.timeoutMs ?? FETCH_URL_TIMEOUT_MS
   const maxRedirects = opts.maxRedirects ?? FETCH_URL_MAX_REDIRECTS
-  const transport = opts.transport ?? nodeTransport
-  const lookup = opts.lookup ?? defaultLookup
-  // accept 之外的出站头恒定:身份相关的头(cookie/authorization/referer)永远不出现
-  const headers = opts.accept ? { ...OUTBOUND_HEADERS, accept: opts.accept } : OUTBOUND_HEADERS
   // 总预算跨跳共享:否则 3 跳重定向能把 20s 变成 80s
   const deadline = Date.now() + timeoutMs
 
   let current = rawUrl
   for (let hop = 0; ; hop++) {
-    // 每跳都重跑全套校验:重定向目标是上游说了算的,和用户最初输入的 URL 一样不可信。
-    // 首跳的这次是纵深防御(路由已先校验过一遍,故这里统一按 denied 抛)
-    const checked = validateTargetUrl(current)
-    if (!checked.ok) throw new FetchDeniedError(checked.message)
-    const url = checked.url
-
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) throw new FetchFailedError('抓取超时')
-
-    // 解析出地址并逐个过禁区:任一结果落禁区就整体拒绝(不挑一个"看着安全的"用,
-    // 那样等于让攻击者用一条 A 记录多值就能试探)
-    let target: ResolvedAddress
-    const literal = parseIpLiteral(url.hostname)
-    if (literal) {
-      target = { address: literal.address, family: literal.family }
-    } else {
-      let resolved: ResolvedAddress[]
-      try {
-        resolved = await lookup(url.hostname)
-      } catch (e) {
-        throw new FetchFailedError(`域名解析失败:${errMsg(e)}`)
-      }
-      if (resolved.length === 0) throw new FetchFailedError('域名无法解析')
-      if (!opts.allowForbiddenAddresses) {
-        for (const r of resolved) {
-          if (isForbiddenAddress(r.address)) {
-            throw new FetchDeniedError('目标地址指向内网或保留地址')
-          }
-        }
-      }
-      target = resolved[0]
-    }
-
-    const res = await transport({
-      url,
-      address: target.address,
-      family: target.family,
-      port: url.port !== '' ? Number(url.port) : url.protocol === 'https:' ? 443 : 80,
-      headers,
-      maxBytes,
-      timeoutMs: remaining,
-    })
-
-    if (REDIRECT_STATUS.has(res.status)) {
-      const location = res.headers.location
-      if (!location) throw new FetchFailedError(`上游返回 ${res.status} 但缺少 Location`)
+    // 剩余预算原样下传、不在这里判超时:≤0 由 safeFetchHop 在 URL 校验之后抛
+    const res = await safeFetchHop(current, { ...opts, timeoutMs: deadline - Date.now() })
+    if (res.kind === 'redirect') {
       if (hop >= maxRedirects) throw new FetchFailedError(`重定向超过 ${maxRedirects} 跳`)
-      try {
-        // 相对 Location 必须以当前跳的 URL 为基准解析
-        current = new URL(location, url).toString()
-      } catch {
-        throw new FetchFailedError('重定向目标不是合法 URL')
-      }
+      current = res.location
       continue
     }
     if (res.status < 200 || res.status >= 300) {
       // 上游状态原样带进 message:用户排查"是不是要登录/被墙"时这是唯一有用的信息
       throw new FetchFailedError(`上游返回 ${res.status}`)
     }
-    return {
-      bytes: decompress(res.bytes, res.headers['content-encoding'], maxBytes),
-      contentType: res.headers['content-type'] ?? null,
-      finalUrl: url.toString(),
-    }
+    return { bytes: res.bytes, contentType: res.contentType, finalUrl: res.url }
   }
 }

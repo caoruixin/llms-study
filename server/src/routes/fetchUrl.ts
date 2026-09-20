@@ -297,6 +297,9 @@ export function fetchUrlRoutes(deps: AppDeps): Hono<AppEnv> {
           transport: tuning.transport,
           lookup: tuning.lookup,
           allowForbiddenAddresses: deps.config.fetchUrlAllowForbiddenDev,
+          // 客户端断开(前端取消导入/关页)即中止上游抓取,并发名额随下面的 finally 立刻归还;
+          // 否则用户取消后马上再导一篇会撞上自己上一次还没抓完的请求,被 429 拒掉
+          signal: c.req.raw.signal,
         })
       } catch (e) {
         if (e instanceof FetchDeniedError) return apiError(c, 403, 'fetch-denied', e.message)

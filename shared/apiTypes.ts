@@ -28,6 +28,7 @@ export type ApiErrorCode =
   | 'unsupported-content' // 415:抓到的内容类型不在 html/xhtml/plain/pdf 白名单内(语音上传容器不在白名单亦用此码)
   | 'voice-upstream-failed' // 502:语音上游转写/合成失败(含超时与全部 key 用尽)
   | 'voice-unavailable' // 503:本部署未配置语音 provider 或 key,功能整体不可用
+  | 'render-unavailable' // 503:本部署未启用服务端渲染兜底,或渲染服务不可达(前端据此回落到如实报错)
   | 'internal' // 500
 
 export interface ApiError {
@@ -239,6 +240,32 @@ export interface FilePutResponse {
 export interface FetchUrlBody {
   url: string
   kind?: 'page' | 'asset'
+}
+
+// ---- 服务端渲染兜底(网页原貌 Tier 3)----
+
+/** POST /api/app/render-url 请求体:一次一个 URL,传抓取落地后的 finalUrl(重定向已在 Tier 1 解析过) */
+export interface RenderUrlBody {
+  url: string
+}
+
+/**
+ * 成功响应:捕获代理(src/lib/paper/url/captureAgent.ts)在**真实页面**里产出的那条 ok 消息。
+ * 字段与客户端 Tier 2 的渲染捕获结果对齐——前端把它当作一次渲染捕获原样喂给原貌管线,
+ * 所以快照头里的 capture.mode 仍是 'rendered':解码端只认 rendered/static,
+ * 另起一种 mode 会让尚未更新的客户端解不开同步下来的快照。
+ * 失败沿用抓取那套错误码(fetch-denied / fetch-failed / fetch-too-large / rate-limited),
+ * 功能未启用或渲染服务不可达是 render-unavailable。
+ */
+export interface RenderUrlResponse {
+  html: string
+  title: string
+  finalUrl: string
+  viewportWidth: number
+  hidden: number
+  fixed: number
+  blockedScripts: number
+  agentVersion: number
 }
 
 // ---- 语音助手(Voice Copilot)----

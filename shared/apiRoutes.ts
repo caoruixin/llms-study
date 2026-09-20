@@ -150,6 +150,40 @@ export const FETCH_ASSET_FONT_MEDIA_TYPES: readonly string[] = [
   'application/vnd.ms-fontobject',
 ]
 
+// ---- 服务端渲染兜底(网页原貌 Tier 3)----
+//
+// 纯客户端渲染的页面,正文全在 JS 里;而它的 `<script type="module">` 永远走 CORS,在任何非本站的源下
+// 都会被浏览器拦掉——客户端那个沙箱 iframe(Tier 2)结构上就渲染不出来,静态捕获与阅读模式同样是 0 字。
+// Tier 3 由**独立的渲染服务**用无头 Chromium 在页面的真实源上打开它。一次渲染是几百 MB 内存、
+// 十几秒的重活,而且跑的是不可信页面,所以这一组限额远比抓取保守,且只在前两级都拿不到正文时才会用到。
+
+/**
+ * 单次渲染总时长上限 30s:API 侧与渲染服务侧各自强制一遍。
+ * 必须明显低于 nginx 对 /api/app/ 的默认 proxy_read_timeout(60s),否则超时由 nginx 以 504 收场,
+ * 前端拿不到我们自己的错误码。
+ */
+export const RENDER_URL_TIMEOUT_MS = 30_000
+/**
+ * 每用户渲染令牌桶:5 容量、每 60s 回一枚。
+ * 一次导入只渲染一次。最初定的是 3 容量 / 100s,验收时发现太紧:连着导同一个站的几篇 CSR 文章
+ * (每篇约 20s)到第 4 篇就被拒,而且被全站并发闸挡回的那次也照样扣一枚。真正保护机器的是下面
+ * 那道"全站同时只渲染 1 个";这只桶只需挡住单个账号把渲染器长期占满——持续速率仍是每分钟 1 次。
+ */
+export const RENDER_URL_RATE_CAPACITY = 5
+export const RENDER_URL_RATE_REFILL_MS = 60_000
+/** 全站同时只渲染 1 个页面:小机器上两个 Chromium 并行就可能被 cgroup OOM;满了直接 429,不排队 */
+export const RENDER_URL_MAX_CONCURRENT_GLOBAL = 1
+/** 一次渲染内页面可发起的子请求数上限:正常文章页几十个,超过多半是轮询/无限加载 */
+export const RENDER_URL_MAX_SUBREQUESTS = 200
+/** 一次渲染内全部子请求响应字节之和的上限(单个资源另受 FETCH_ASSET_MAX_BYTES 约束) */
+export const RENDER_URL_MAX_TOTAL_BYTES = 30 * 1024 * 1024
+/** 单个子请求超时:慢资源尽早放弃,别拖垮整次渲染的 30s 预算 */
+export const RENDER_URL_SUBREQUEST_TIMEOUT_MS = 10_000
+/** 渲染服务内同时在途的子请求数:与浏览器对单站点的连接并发同量级 */
+export const RENDER_URL_SUBREQUEST_CONCURRENCY = 6
+/** 渲染结果 JSON 响应体上限:捕获代理自己把 HTML 卡在 8MB,余量留给 JSON 转义 */
+export const RENDER_URL_MAX_RESPONSE_BYTES = 12 * 1024 * 1024
+
 // ---- 语音助手(Voice Copilot)----
 
 /**
