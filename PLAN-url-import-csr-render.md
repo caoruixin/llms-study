@@ -1,6 +1,6 @@
 # PLAN — URL import fails on client-rendered pages (z.ai blog): root cause, other bugs, fix
 
-## Status (2026-09-19 — DONE in production: code deployed, render service provisioned and ON, the original z.ai URL imports on llm-pro.cn. Nothing committed.)
+## Status (2026-09-19 — DONE in production: code deployed, render service provisioned and ON, the original z.ai URL imports on llm-pro.cn. Committed 2026-09-20 on branch `feat/agent-rl-and-url-import-render` (pushed; not yet merged to `main`): `f08f642` Agent RL, `f0fd671` this fix.)
 
 | Step | State | Evidence |
 |---|---|---|
