@@ -3,6 +3,16 @@
 本应用的扩展性来自一个核心设计：**所有内容都是 `src/data/` 下的类型化数据，组件只负责渲染**。
 新增一个模型/硬件/引擎/题目，绝大多数情况只是往数组里加一个对象，不用碰任何组件代码。
 
+## Agent RL 扩展约定
+
+- 内容、阶段、算法解释、六个配方、数据样例与来源集中在 `src/data/agentRl.ts`。厂商易变事实保留来源和核验日期，不把教学单价写成官方报价。
+- `src/lib/agentRl/` 的环境、采样、奖励、优势、更新、评测与计费都是纯函数。`types.ts` 是共享契约；UI 从同一 `Trajectory` 和账本取数，不自行生成学习曲线。
+- 环境真值只供工具与独立验收访问。Policy 只能读观察；新场景必须支持重置、终止和工单家族分区。默认 80/40/40 个训练/验证/测试工单，生产另用新 ID。
+- 初始策略的弱工具偏好明确展示；REINFORCE 使用历史基线，PPO 更新 Critic，GRPO 按同任务组归一化且精确计算小动作空间 KL。新增算法须提供可手算/数值梯度测试，并声明相对真实 LLM 的简化。
+- 模拟 UI 状态在 `src/components/agent-rl/rlStore.ts`；只持久化版本化配置、学习进度和视图。轨迹、权重、评测、价格及对照结果只在内存。改配置重开实验；暂停/离开页面停止自动推进。
+- 新计费项必须说明实际事件数、Token 估算假设和归属方；同一工作不能同时收 Token 与 GPU 时间。训练处理量与带损失输出量分开，零成功不做除法。
+- 验证：`npx vitest run src/lib/agentRl src/components/agent-rl/rlStore.test.ts`；`node scripts/agent-rl-repro.mjs`（可用 `--engine=chromium` 或 `--base=http://localhost:5173`）。后者经 UI 检查训练、评测、发布、回滚和手机布局，截图放 `output/playwright/agent-rl/`。
+
 ## 扩展点速查表
 
 | 想扩展什么 | 改哪个文件 | 类型约束 | 要碰组件吗 |

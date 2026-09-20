@@ -1,6 +1,15 @@
 // @vitest-environment happy-dom
-import { beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import type { NormalizedBlock } from '../types'
+
+/**
+ * captureStatic 包一层 spy（行为原样透传）：选路的「贵路径」= 多做一次静态捕获，健康页面必须一次都不做。
+ * 这件事从产物上看不出来，只能靠调用次数钉住。
+ */
+vi.mock('./captureStatic', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('./captureStatic')>()
+  return { ...mod, captureStatic: vi.fn(mod.captureStatic) }
+})
 
 /**
  * happy-dom 兼容性补丁：与 fidelitySanitize.test.ts / stampBlocks.test.ts 同源
@@ -25,20 +34,30 @@ type Mod = typeof import('./buildSnapshot')
 type Stamp = typeof import('./stampBlocks')
 type Snap = typeof import('./webSnapshot')
 let buildWebSnapshot: Mod['buildWebSnapshot']
+let chooseCapture: Mod['chooseCapture']
+let measure: Mod['measure']
 let hostText: Stamp['hostText']
+let stampBlocks: Stamp['stampBlocks']
 let STAMP_ATTR: string
 let decodeWebSnapshot: Snap['decodeWebSnapshot']
 let IngestError: typeof import('../ingest').IngestError
+let CAPTURE_AGENT_VERSION: number
+let captureStaticSpy: Mock<typeof import('./captureStatic').captureStatic>
 
 beforeAll(async () => {
-  ;({ buildWebSnapshot } = await import('./buildSnapshot'))
-  ;({ hostText, STAMP_ATTR } = await import('./stampBlocks'))
+  ;({ buildWebSnapshot, chooseCapture, measure } = await import('./buildSnapshot'))
+  ;({ hostText, stampBlocks, STAMP_ATTR } = await import('./stampBlocks'))
   ;({ decodeWebSnapshot } = await import('./webSnapshot'))
   ;({ IngestError } = await import('../ingest'))
+  ;({ CAPTURE_AGENT_VERSION } = await import('./captureAgent'))
+  captureStaticSpy = vi.mocked((await import('./captureStatic')).captureStatic)
 })
+
+beforeEach(() => captureStaticSpy.mockClear())
 
 const text = (s: string): ArrayBuffer => new TextEncoder().encode(s).buffer as ArrayBuffer
 const bin = (...n: number[]): ArrayBuffer => new Uint8Array(n).buffer as ArrayBuffer
+const abortErr = (): Error => Object.assign(new Error('aborted'), { name: 'AbortError' })
 
 const SITE = 'https://site.test'
 const PAGE = `${SITE}/blog/post`
@@ -302,5 +321,414 @@ describe('buildWebSnapshot：失败判定', () => {
     controller.abort()
     await expect(buildWebSnapshot({ url: PAGE, html: HTML, finalUrl: PAGE }, { ...deps, signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
     expect(calls).toEqual([])
+  })
+
+  it('Tier 2 进行中被取消 → AbortError 原样冒出，不回退静态、不抓任何资源', async () => {
+    const controller = new AbortController()
+    const { deps, calls } = fakeDeps({
+      signal: controller.signal,
+      captureRendered: async () => {
+        controller.abort()
+        throw abortErr()
+      },
+    })
+    await expect(buildWebSnapshot({ url: PAGE, html: HTML, finalUrl: PAGE }, deps)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(captureStaticSpy).not.toHaveBeenCalled()
+    expect(calls).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 渲染 vs 静态的公平对照（PLAN-url-import-csr-render.md §3 A2：缺陷 C / D / E / F）
+// ---------------------------------------------------------------------------
+
+type Rendered = Awaited<ReturnType<NonNullable<Parameters<Mod['buildWebSnapshot']>[1]['captureRendered']>>>
+
+const page =(body: string, title = '页面标题'): string => `<html><head><title>${title}</title></head><body>${body}</body></html>`
+/** 恰好 n 个字符的一段正文（单个 `<p>`，stampBlocks 口径下就是 n 字） */
+const para = (n: number, ch = '文'): string => `<p>${ch.repeat(n)}</p>`
+const paras = (count: number, each: number): string => Array.from({ length: count }, () => para(each)).join('')
+/** 隐藏的大菜单：静态 HTML 里只是个带内联样式的 div（没有计算样式可看），渲染产物里被捕获代理标了 data-pc-hidden */
+const megaMenu = (items: number, marked: boolean): string =>
+  `<div class="mega" style="display:none"${marked ? ' data-pc-hidden="1"' : ''}><ul>${`<li>${'菜'.repeat(100)}</li>`.repeat(items)}</ul></div>`
+/** 纯客户端渲染的空壳：抓回来的 HTML 与沙箱里渲染失败的产物都长这样 */
+const SHELL = page('<div id="root"></div>', '空壳')
+
+const renderedOf =
+  (html: string, extra: Partial<Rendered> = {}) =>
+  async (): Promise<Rendered> => ({ html, title: '渲染标题', finalUrl: PAGE, viewportWidth: 1280, agentVersion: 2, ...extra })
+
+const totalChars = (blocks: NormalizedBlock[]): number => blocks.reduce((n, b) => n + b.text.length, 0)
+
+describe('chooseCapture：渲染 vs 静态（纯函数）', () => {
+  it.each([
+    // 死区（缺陷 D）：渲染不到下限、静态够 → 静态，不看倍数
+    ['渲染 150 / 静态 250 → 静态', { rendered: 150, renderedRaw: 150, static: 250 }, 'static'],
+    ['下限边界：渲染 199 / 静态 200 → 静态', { rendered: 199, renderedRaw: 199, static: 200 }, 'static'],
+    ['下限边界：渲染 200 / 静态 200 → 渲染', { rendered: 200, renderedRaw: 200, static: 200 }, 'rendered'],
+    ['静态自己不到下限（199）→ 换了也白换，留渲染', { rendered: 0, renderedRaw: 0, static: 199 }, 'rendered'],
+    ['两边都不到下限 → 渲染', { rendered: 150, renderedRaw: 150, static: 150 }, 'rendered'],
+    // 倍数判据：恰好 2× 算退化，差 1 不算
+    ['静态恰好 2× → 静态', { rendered: 500, renderedRaw: 500, static: 1000 }, 'static'],
+    ['静态 2× 差 1 → 渲染', { rendered: 500, renderedRaw: 500, static: 999 }, 'rendered'],
+    // 缺陷 C：倍数看的是 renderedRaw（隐藏文本也计），不是可见字数
+    ['静态多出来的全是隐藏文本 → 渲染', { rendered: 600, renderedRaw: 5600, static: 5600 }, 'rendered'],
+    ['计入隐藏文本后静态仍 ≥ 2× → 静态', { rendered: 600, renderedRaw: 5600, static: 11200 }, 'static'],
+    // 缺陷 E 的形态：渲染只有导航 + 页脚
+    ['渲染 1,200 / 静态 50,000 → 静态', { rendered: 1200, renderedRaw: 1200, static: 50000 }, 'static'],
+    ['健康页面：两边相当 → 渲染', { rendered: 30000, renderedRaw: 80000, static: 81000 }, 'rendered'],
+  ] as const)('%s', (_name, chars, expected) => {
+    expect(chooseCapture(chars)).toBe(expected)
+  })
+})
+
+describe('measure：不改动被量的文档（缺陷 F）', () => {
+  it('量的是克隆：被量文档的序列化前后逐字节一致；ignoreHidden 也只撕克隆上的标记', () => {
+    const doc = reparse(
+      page(
+        '<div>  松散的   行内文字，长度要超过二十个字符才会被包成一个 run。 <p>块级   段落\n  带着多余空白</p> 尾巴上又一段足够长的松散行内文字，同样凑够二十个字符。</div>' +
+          `<div data-pc-hidden="1">${para(300, '藏')}</div>`,
+      ),
+    )
+    const before = doc.documentElement.outerHTML
+    const visible = measure(doc)
+    const raw = measure(doc, { ignoreHidden: true })
+    expect(doc.documentElement.outerHTML).toBe(before)
+    expect(visible).toBeGreaterThan(40)
+    expect(raw).toBe(visible + 300)
+
+    // 对照组：直接在原文档上 stampBlocks 确实会改动它（否则上面的断言形同虚设），且 measure 与它同一口径
+    const stamped = stampBlocks(doc)
+    expect(doc.documentElement.outerHTML).not.toBe(before)
+    expect(totalChars(stamped)).toBe(visible)
+  })
+})
+
+describe('buildWebSnapshot：渲染与静态的公平对照', () => {
+  let warn: ReturnType<typeof vi.spyOn>
+  beforeEach(() => {
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(() => warn.mockRestore())
+
+  it('死区（缺陷 D）：渲染 150 / 静态 250 → 改用静态，导入成功', async () => {
+    const { deps } = fakeDeps({ captureRendered: renderedOf(page(para(150))) })
+    const { header, renderFallback } = await buildWebSnapshot({ url: PAGE, html: page(para(250)), finalUrl: PAGE }, deps)
+    expect(header.capture).toEqual({ mode: 'static', katex: false, viewportWidth: 0, agentVersion: 0 })
+    expect(totalChars(header.blocks)).toBe(250)
+    expect(renderFallback).toBe('渲染捕获退化（渲染 150 字 < 静态 250 字），改用静态捕获')
+    // 没开 KaTeX：对照用的那份静态产物直接拿来用，不再捕获第二次
+    expect(captureStaticSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('缺陷 E：渲染只拿到页脚 1,200 字（过了可疑线）、静态 5 万字 → 廉价口径触发对照，改用静态', async () => {
+    const footer = `<footer>${para(1200, '脚')}</footer>`
+    const html = page(`${footer}<article><h1>正文标题</h1>${paras(50, 1000)}</article>`)
+    const { deps } = fakeDeps({ captureRendered: renderedOf(page(`${footer}<div id="app"></div>`)) })
+    const { header, renderFallback } = await buildWebSnapshot({ url: PAGE, html, finalUrl: PAGE }, deps)
+    const reason = '渲染捕获退化（渲染 1200 字 < 静态 51204 字），改用静态捕获'
+    expect(header.capture.mode).toBe('static')
+    expect(renderFallback).toBe(reason)
+    expect(totalChars(header.blocks)).toBe(51204)
+    // QA 回归脚本按这个前缀收日志
+    expect(warn).toHaveBeenCalledWith('[web-snapshot]', reason)
+  })
+
+  it('静态胜出且开了 KaTeX：对照用 katex:false 探测，胜出后才按调用方选项重做一次', async () => {
+    const { deps } = fakeDeps({ katex: true, captureRendered: renderedOf(SHELL) })
+    const { header } = await buildWebSnapshot({ url: PAGE, html: HTML, finalUrl: PAGE }, deps)
+    expect(header.capture.mode).toBe('static')
+    expect(captureStaticSpy.mock.calls.map(([input]) => input.katex)).toEqual([false, true])
+  })
+
+  it('健康页面（缺陷 C + 回归红线）：静态多出来的全是隐藏大菜单 → 保持 rendered，且一次静态捕获都不做', async () => {
+    const article = `<article><h1>正文标题</h1>${paras(3, 1000)}</article>`
+    const { deps } = fakeDeps({ captureRendered: renderedOf(page(megaMenu(500, true) + article)) })
+    const { header, renderFallback } = await buildWebSnapshot({ url: PAGE, html: page(megaMenu(500, false) + article), finalUrl: PAGE }, deps)
+    expect(header.capture).toEqual({ mode: 'rendered', katex: false, viewportWidth: 1280, agentVersion: 2 })
+    expect(renderFallback).toBeUndefined()
+    expect(header.title).toBe('渲染标题')
+    // 隐藏菜单不进块；正文一字不少
+    expect(totalChars(header.blocks)).toBe(3004)
+    expect(captureStaticSpy).not.toHaveBeenCalled()
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('缺陷 C：渲染字数可疑（600）而静态的 5,600 里有 5,000 是隐藏菜单 → 对照了，但不降级', async () => {
+    // 旧判据拿「跳过隐藏的渲染 600」比「不跳隐藏的静态 5,600」，≥ 2× → 误判退化
+    const { deps } = fakeDeps({ captureRendered: renderedOf(page(megaMenu(50, true) + para(600))) })
+    const { header, renderFallback } = await buildWebSnapshot({ url: PAGE, html: page(megaMenu(50, false) + para(600)), finalUrl: PAGE }, deps)
+    expect(header.capture.mode).toBe('rendered')
+    expect(renderFallback).toBeUndefined()
+    expect(totalChars(header.blocks)).toBe(600)
+    expect(captureStaticSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('缺陷 C × E：廉价口径触发了对照（静态多一大块 nav），完整口径下两边相当 → 仍保持 rendered', async () => {
+    // nav 不进块但计入廉价口径：静态 11.3 万 vs 渲染 5.3 万 → 触发；stampBlocks 口径下静态 53,004 vs renderedRaw 53,004
+    const article = `<article><h1>正文标题</h1>${paras(3, 1000)}</article>`
+    const html = page(`<nav>${para(60000, '导')}</nav>${megaMenu(500, false)}${article}`)
+    const { deps } = fakeDeps({ captureRendered: renderedOf(page(`<nav>${para(10, '导')}</nav>${megaMenu(500, true)}${article}`)) })
+    const { header, renderFallback } = await buildWebSnapshot({ url: PAGE, html, finalUrl: PAGE }, deps)
+    expect(header.capture.mode).toBe('rendered')
+    expect(renderFallback).toBeUndefined()
+    expect(captureStaticSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('注入方没报 agentVersion → 按当前代理版本记，不再写死 1', async () => {
+    const { deps } = fakeDeps({ captureRendered: renderedOf(page(paras(2, 1000)), { agentVersion: undefined }) })
+    const { header } = await buildWebSnapshot({ url: PAGE, html: page(paras(2, 1000)), finalUrl: PAGE }, deps)
+    expect(header.capture.agentVersion).toBe(CAPTURE_AGENT_VERSION)
+  })
+
+  /**
+   * 代理 v2 为白纸陪等 10s，只在 HTML 是空壳时才值得。全库回归实测：minimax.io 渲染 0 字、静态 10,432 字，
+   * 结果一样却从 18s 拖到 29s——HTML 自己有正文时，渲染出白纸等多久都没用，静态必定兜得住。
+   */
+  describe('内容感知等待只给空壳页面', () => {
+    const seenOpts = (): { opts: unknown[]; capture: NonNullable<Parameters<Mod['buildWebSnapshot']>[1]['captureRendered']> } => {
+      const opts: unknown[] = []
+      return {
+        opts,
+        capture: async (_input, o) => {
+          opts.push(o)
+          return { html: SHELL, title: '渲染标题', finalUrl: PAGE, viewportWidth: 1280, agentVersion: 2, blockedScripts: 0 }
+        },
+      }
+    }
+
+    it('抓回的 HTML 自己有正文（SSR）→ 关掉内容感知（minTextChars: 0），不为沙箱弄坏的白纸陪等', async () => {
+      const seen = seenOpts()
+      const { deps } = fakeDeps({ captureRendered: seen.capture })
+      const { header } = await buildWebSnapshot({ url: PAGE, html: page(paras(2, 1000)), finalUrl: PAGE }, deps)
+      expect(seen.opts).toHaveLength(1)
+      expect(seen.opts[0]).toMatchObject({ config: { minTextChars: 0 } })
+      // 结果不变：渲染是白纸，静态兜住
+      expect(header.capture.mode).toBe('static')
+    })
+
+    it('抓回的 HTML 是空壳（CSR）→ 不传 config，代理按默认值等正文出现', async () => {
+      const seen = seenOpts()
+      const { deps } = fakeDeps({ captureRendered: seen.capture })
+      await expect(buildWebSnapshot({ url: PAGE, html: SHELL, finalUrl: PAGE }, deps)).rejects.toThrow()
+      expect(seen.opts).toHaveLength(1)
+      expect(seen.opts[0]).not.toHaveProperty('config')
+    })
+
+    it('HTML 正文刚好在下限两侧：199 字仍等、200 字不等', async () => {
+      for (const [n, waits] of [[199, true], [200, false]] as const) {
+        const seen = seenOpts()
+        const { deps } = fakeDeps({ captureRendered: seen.capture })
+        await buildWebSnapshot({ url: PAGE, html: page(para(n)), finalUrl: PAGE }, deps).catch(() => undefined)
+        if (waits) expect(seen.opts[0]).not.toHaveProperty('config')
+        else expect(seen.opts[0]).toMatchObject({ config: { minTextChars: 0 } })
+      }
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 如实失败（§3 A3 的抛错端）：文案说清拿到多少字，hint 只在阅读模式确实没戏时给
+// ---------------------------------------------------------------------------
+
+describe('buildWebSnapshot：如实失败与 reader-wont-help', () => {
+  let warn: ReturnType<typeof vi.spyOn>
+  beforeEach(() => {
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(() => warn.mockRestore())
+
+  type Err = InstanceType<typeof IngestError>
+  const failOf = async (html: string, overrides: Parameters<typeof fakeDeps>[0]): Promise<Err> => {
+    const { deps } = fakeDeps(overrides)
+    const err = await buildWebSnapshot({ url: PAGE, html, finalUrl: PAGE }, deps).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(IngestError)
+    expect((err as Err).kind).toBe('empty')
+    return err as Err
+  }
+
+  /** 正文放在 `<xmp>` 里：stampBlocks 算它的字，DOMPurify 连内容一起删——「sanitize 之后才丢字」的最小复现 */
+  const LOST_ON_SANITIZE = page(`<xmp>${'丢'.repeat(300)}</xmp>`)
+
+  it('空壳 + 有脚本加载失败 → 「脚本被跨源策略拦截」，hint=reader-wont-help', async () => {
+    const err = await failOf(SHELL, { captureRendered: renderedOf(SHELL, { blockedScripts: 1 }) })
+    expect(err.message).toContain('该页面正文完全由脚本生成，且其脚本被浏览器跨源策略拦截；阅读模式同样无法抓取')
+    expect(err.message).toContain('渲染 0 字 / 静态 0 字')
+    expect(err.message).toContain('1 个脚本加载失败')
+    expect(err.message).not.toContain('重试')
+    expect(err.hint).toBe('reader-wont-help')
+  })
+
+  it('空壳 + 没有脚本加载失败 → 不提跨源拦截，但同样 hint=reader-wont-help', async () => {
+    const err = await failOf(SHELL, { captureRendered: renderedOf(SHELL, { blockedScripts: 0 }) })
+    expect(err.message).toContain('抓回的 HTML 里没有正文')
+    expect(err.message).toContain('阅读模式同样无法抓取')
+    expect(err.message).toContain('渲染 0 字 / 静态 0 字')
+    expect(err.message).not.toContain('跨源')
+    expect(err.message).not.toContain('重试')
+    expect(err.hint).toBe('reader-wont-help')
+  })
+
+  it('空壳 + Tier 2 抛错 → 同上，文案带上抛错原因与静态字数', async () => {
+    const err = await failOf(SHELL, {
+      captureRendered: async () => {
+        throw Object.assign(new Error('页面渲染超时'), { reason: 'timeout' })
+      },
+    })
+    expect(err.message).toContain('抓回的 HTML 里没有正文')
+    expect(err.message).toContain('静态 0 字')
+    expect(err.message).toContain('渲染捕获失败：timeout: 页面渲染超时')
+    expect(err.hint).toBe('reader-wont-help')
+  })
+
+  it('脚本加载失败但静态有正文、只是 sanitize 后丢了 → 沿用旧文案，不给 hint（阅读模式可能真能成）', async () => {
+    const err = await failOf(LOST_ON_SANITIZE, { captureRendered: renderedOf(LOST_ON_SANITIZE, { blockedScripts: 3 }) })
+    expect(err.message).toBe('渲染捕获只得到 0 字正文，未能生成网页原貌；可改用「阅读模式」重试')
+    expect(err.hint).toBeUndefined()
+  })
+
+  it('渲染空壳、静态 ≥ 下限而胜出、sanitize 后才丢字 → 旧文案带退化原因，不给 hint', async () => {
+    const err = await failOf(LOST_ON_SANITIZE, { captureRendered: renderedOf(SHELL, { blockedScripts: 1 }) })
+    expect(err.message).toBe('静态捕获（渲染捕获退化（渲染 0 字 < 静态 300 字），改用静态捕获）只得到 0 字正文，未能生成网页原貌；可改用「阅读模式」重试')
+    expect(err.hint).toBeUndefined()
+  })
+
+  it('没注入任何渲染层的纯静态路径 → 旧文案、不给 hint（没试过渲染，别一口咬定是脚本生成）', async () => {
+    const err = await failOf(SHELL, {})
+    expect(err.message).toBe('静态捕获只得到 0 字正文，未能生成网页原貌；可改用「阅读模式」重试')
+    expect(err.hint).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tier 3 接缝（§4 B5 的客户端半边）：captureRemote 注入前行为不变，注入后只在本地两层都不到下限时才用
+// ---------------------------------------------------------------------------
+
+describe('buildWebSnapshot：Tier 3 服务器渲染接缝', () => {
+  let warn: ReturnType<typeof vi.spyOn>
+  beforeEach(() => {
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(() => warn.mockRestore())
+
+  const REMOTE_HTML = page(`<h1>服务器渲染出的标题</h1>${paras(2, 1000)}`)
+  const remoteOk = (extra: Partial<Rendered> = {}) =>
+    vi.fn(async (): Promise<Rendered> => ({ html: REMOTE_HTML, title: '服务器标题', finalUrl: `${PAGE}?remote`, viewportWidth: 1440, agentVersion: 7, ...extra }))
+
+  it('本地两层都不到下限 → 走 Tier 3：报 remote 阶段，产物仍记 mode=rendered', async () => {
+    const captureRemote = remoteOk()
+    const phases: string[] = []
+    const controller = new AbortController()
+    const { deps } = fakeDeps({
+      signal: controller.signal,
+      captureRendered: renderedOf(SHELL, { blockedScripts: 1 }),
+      captureRemote,
+      onPhase: (p) => {
+        if (phases[phases.length - 1] !== p) phases.push(p)
+      },
+    })
+    const { header, capture, renderFallback } = await buildWebSnapshot({ url: `${PAGE}#frag`, html: SHELL, finalUrl: PAGE }, deps)
+    expect(captureRemote).toHaveBeenCalledTimes(1)
+    expect(captureRemote).toHaveBeenCalledWith({ url: `${PAGE}#frag`, finalUrl: PAGE }, { signal: controller.signal })
+    expect(phases).toEqual(['rendering', 'remote', 'assets', 'sanitizing', 'packing'])
+    // webSnapshot.ts 只认 rendered/static，旧客户端还要能解码同步过去的快照：Tier 3 不能发明第三种 mode
+    expect(header.capture).toEqual({ mode: 'rendered', katex: false, viewportWidth: 1440, agentVersion: 7 })
+    expect(capture.mode).toBe('rendered')
+    expect(header.title).toBe('服务器标题')
+    expect(header.finalUrl).toBe(`${PAGE}?remote`)
+    expect(totalChars(header.blocks)).toBe(2009)
+    expect(renderFallback).toBeUndefined()
+    assertBlockInvariant(header.html, header.blocks)
+  })
+
+  it('Tier 2 抛错 + 静态空壳 + Tier 3 成功 → renderFallback 不带回（它说的是「最终走了静态」）；缺 agentVersion 按当前版本', async () => {
+    const { deps } = fakeDeps({
+      captureRendered: async () => {
+        throw new Error('frame-buster')
+      },
+      captureRemote: remoteOk({ agentVersion: undefined }),
+    })
+    const { header, renderFallback } = await buildWebSnapshot({ url: PAGE, html: SHELL, finalUrl: PAGE }, deps)
+    expect(header.capture.mode).toBe('rendered')
+    expect(header.capture.agentVersion).toBe(CAPTURE_AGENT_VERSION)
+    expect(renderFallback).toBeUndefined()
+  })
+
+  it('Tier 3 的产物仍不到下限 → 不采用，如实失败并附上原因', async () => {
+    const captureRemote = vi.fn(renderedOf(page(para(50))))
+    const { deps } = fakeDeps({ captureRendered: renderedOf(SHELL, { blockedScripts: 2 }), captureRemote })
+    const err = await buildWebSnapshot({ url: PAGE, html: SHELL, finalUrl: PAGE }, deps).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(IngestError)
+    expect((err as Error).message).toContain('且其脚本被浏览器跨源策略拦截')
+    expect((err as Error).message).toMatch(/；服务器渲染：只得到 50 字正文$/)
+    expect((err as InstanceType<typeof IngestError>).hint).toBe('reader-wont-help')
+    expect(captureRemote).toHaveBeenCalledTimes(1)
+  })
+
+  it('Tier 3 抛错（非取消）→ 不改变失败的性质，如实失败并附上原因', async () => {
+    const { deps } = fakeDeps({
+      captureRendered: renderedOf(SHELL),
+      captureRemote: async () => {
+        throw new Error('渲染服务暂不可用（503）')
+      },
+    })
+    const err = await buildWebSnapshot({ url: PAGE, html: SHELL, finalUrl: PAGE }, deps).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(IngestError)
+    expect((err as Error).message).toContain('抓回的 HTML 里没有正文')
+    expect((err as Error).message).toMatch(/；服务器渲染：渲染服务暂不可用（503）$/)
+    expect((err as InstanceType<typeof IngestError>).hint).toBe('reader-wont-help')
+  })
+
+  it('Tier 3 期间取消（captureRemote 抛 AbortError）→ 原样冒出，不落成失败文案、不抓资源', async () => {
+    const controller = new AbortController()
+    const { deps, calls } = fakeDeps({
+      signal: controller.signal,
+      captureRendered: renderedOf(SHELL),
+      captureRemote: async () => {
+        controller.abort()
+        throw abortErr()
+      },
+    })
+    await expect(buildWebSnapshot({ url: PAGE, html: SHELL, finalUrl: PAGE }, deps)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(calls).toEqual([])
+  })
+
+  it('Tier 3 返回时信号已取消 → 同样是 AbortError，结果不被采用', async () => {
+    const controller = new AbortController()
+    const remote = remoteOk()
+    const { deps, calls } = fakeDeps({
+      signal: controller.signal,
+      captureRendered: renderedOf(SHELL),
+      captureRemote: async () => {
+        controller.abort()
+        return remote()
+      },
+    })
+    await expect(buildWebSnapshot({ url: PAGE, html: SHELL, finalUrl: PAGE }, deps)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(calls).toEqual([])
+  })
+
+  it('健康页面 / 静态胜出且过了下限 → Tier 3 一次都不调用，也不报 remote 阶段', async () => {
+    const captureRemote = remoteOk()
+    const phases: string[] = []
+    const onPhase = (p: string): void => void phases.push(p)
+
+    // 渲染健康
+    const healthy = fakeDeps({ captureRendered: renderedOf(page(paras(2, 1000))), captureRemote, onPhase })
+    const a = await buildWebSnapshot({ url: PAGE, html: page(paras(2, 1000)), finalUrl: PAGE }, healthy.deps)
+    expect(a.header.capture.mode).toBe('rendered')
+
+    // 渲染空壳但静态够用（死区同款）
+    const demoted = fakeDeps({ captureRendered: renderedOf(SHELL, { blockedScripts: 1 }), captureRemote, onPhase })
+    const b = await buildWebSnapshot({ url: PAGE, html: page(para(250)), finalUrl: PAGE }, demoted.deps)
+    expect(b.header.capture.mode).toBe('static')
+
+    // 纯静态路径
+    const staticOnly = fakeDeps({ captureRemote, onPhase })
+    const c = await buildWebSnapshot({ url: PAGE, html: HTML, finalUrl: PAGE }, staticOnly.deps)
+    expect(c.header.capture.mode).toBe('static')
+
+    expect(captureRemote).not.toHaveBeenCalled()
+    expect(phases).not.toContain('remote')
   })
 })

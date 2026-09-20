@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { AGENT_ELEMENTS, AGENT_PITFALLS, FC_LOOP, GRAPH_NODES } from '../data/agent'
 
 function Box({ title, sub, tone = 'default' }: { title: string; sub?: string; tone?: 'default' | 'accent' | 'ok' | 'warn' | 'model' }) {
@@ -28,6 +29,7 @@ export default function AgentPage() {
 
   return (
     <div className="space-y-8">
+      <Link to="/agent-rl" className="block rounded-xl border border-accent/30 bg-accent/5 p-4 text-sm text-accent">进入 Agent RL 模拟器 → 亲手看奖励如何改变工具选择，再把新策略部署回 Agent</Link>
       {/* 五要素蓝图 */}
       <section>
         <h2 className="mb-3 text-lg font-bold">Agent 架构五要素</h2>

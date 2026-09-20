@@ -1,5 +1,7 @@
 # LLM Infra Studio
 
+**Agent RL learning lab** (`/#/agent-rl`): an in-browser customer-support environment with real tabular policy updates (REINFORCE, PPO with GAE/critic, and GRPO), inspectable trajectories and rewards, independent evaluation, simulated releases/rollback, and a provider service/cost map. LLM tokens and GPU costs are explicitly labeled teaching estimates; no external training or real business tools are invoked. Run `node scripts/agent-rl-repro.mjs` for Chromium/WebKit interaction checks.
+
 **English** | [简体中文](README.zh-CN.md)
 
 An interactive, visual **AI learning & coaching companion** for LLM infrastructure — model architecture evolution, the inference serving pipeline, agent architecture, graded pre-sales practice drills, and an AI paper-reading copilot. Built for people selling, operating, or just seriously learning large-model infrastructure.
@@ -18,6 +20,16 @@ Everything runs local-first: your notes, papers, and practice history stay in yo
 | **Agent Architecture** | `/agent` | Annotated agent architecture diagram — where the base model sits, where the harness boundary is |
 | **Pre-sales Trainer** | `/interview` | Rubric-based question bank (must-cover points + red flags per question), answers graded live by an LLM, voice input, mastery dashboard, attempt history |
 | **Paper Copilot** | `/papers` | Import PDF/DOCX papers, read in original PDF or semantic text view, select-to-ask, streaming AI copilot with citations, reading progress; guest-local by default, account sync when signed in |
+
+### Paper Copilot: importing by URL — known limits
+
+"按 URL 导入" offers two presentations: **网页原貌** (web snapshot, the default: keeps the page's own styles and images) and **阅读模式** (reader: extracted article text only). The snapshot is captured in your own browser, inside a sandboxed frame that does not run on the page's real origin, so:
+
+- **Pages rendered entirely by scripts** (an empty HTML shell whose content lives in a JS bundle) usually cannot be captured in the browser: module scripts are always loaded under CORS rules, and most sites do not send CORS headers for them. Reader mode cannot help either, because it never runs page scripts. Deployments that enable the optional server-side render fallback (`deploy/provision.md` §10) can import these pages; without it the import fails quickly with a message that says so.
+- Content inside **shadow DOM** or **embedded iframes** is not captured.
+- **Video** is not kept, and content that only appears on hover or click is saved in its initial state.
+- The page's media queries apply at the reading column's width, so a snapshot can look like the site's narrow layout.
+- WeChat articles and multi-link imports always use reader mode.
 
 ## Engineering highlights
 

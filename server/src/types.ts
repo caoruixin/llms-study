@@ -44,6 +44,17 @@ export interface AppDeps {
     maxBytes?: number
     timeoutMs?: number
   }
+  /**
+   * 服务端渲染路由参数覆盖(测试专用),同 llmTuning 的理由不进 config。
+   * 渲染服务的地址本身走 config.renderServiceSocket(它是运维开关);这里只放测试要压短/压小的量:
+   * 超时压到几百毫秒才能测"渲染服务不回话",响应上限压到几 KB 才能测 413 而不必真造 12MB。
+   */
+  renderTuning?: {
+    timeoutMs?: number
+    maxResponseBytes?: number
+    rateCapacity?: number
+    rateRefillMs?: number
+  }
 }
 
 export type AppEnv = {

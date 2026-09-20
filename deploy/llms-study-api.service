@@ -9,6 +9,10 @@ After=network.target
 Type=simple
 User=llmapp
 Group=llmapp
+# 渲染服务(deploy/llms-study-render.service,可选)的 unix socket 是 0660、属组 llmrender:
+# API 要入这个组才打得开它。该组不存在时 systemd 会拒绝启动本 unit——
+# 所以**先**按 provision.md 第 10 节建好 llmrender 用户/组,**再**更新这份 unit 文件
+SupplementaryGroups=llmrender
 WorkingDirectory=/opt/llms-study-api
 EnvironmentFile=/etc/llms-study/api.env
 # 路径与 server npm run build 的 dist 布局一致(rootDir=仓库根 → dist/server/src/index.js)

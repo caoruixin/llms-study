@@ -21,6 +21,15 @@ export type IngestFailureKind =
   | 'storage'
   | 'unknown'
 
+/**
+ * 失败的结构化补充信号：UI 据此调整「下一步怎么办」，绝不靠匹配 message 文案
+ * （文案一改，UI 分支就悄悄失效）。
+ *
+ * 'reader-wont-help' = 抓回来的 HTML 本身就没有正文（正文全靠脚本生成）。阅读模式同样
+ * 不执行页面脚本、同样有 200 字下限，所以「改用阅读模式重试」必然再失败一次，不该提供。
+ */
+export type IngestFailureHint = 'reader-wont-help'
+
 /** 正文语言三态（全文翻译）：与阅读视图（original/text）正交，只作用于语义化视图 */
 export type LangMode = 'orig' | 'zh' | 'both'
 
@@ -41,6 +50,8 @@ export interface IngestFailure {
   kind: IngestFailureKind
   message: string
   at: number
+  /** 加法字段：抛错方给 UI 的结构化提示（见 IngestFailureHint），缺省视同「没有特别提示」 */
+  hint?: IngestFailureHint
 }
 
 /**

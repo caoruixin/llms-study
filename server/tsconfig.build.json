@@ -8,5 +8,10 @@
     "sourceMap": false,
     "declaration": false
   },
-  "include": ["src", "../shared", "../src/lib/keyRotation.ts"]
+  "include": [
+    "src",
+    "../shared",
+    "../src/lib/keyRotation.ts",
+    "../src/lib/paper/url/captureAgent.ts"
+  ]
 }

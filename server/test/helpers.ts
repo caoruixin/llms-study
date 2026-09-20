@@ -43,6 +43,8 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
       defaultVoice: 'anna',
       dailyCharLimit: 0,
     },
+    // 默认关服务端渲染:只有 renderUrl.test.ts 显式指到自己的 stub socket
+    renderServiceSocket: null,
     ...overrides,
   }
 }

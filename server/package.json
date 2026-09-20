@@ -16,6 +16,7 @@
     "@node-rs/argon2": "^2.0.2",
     "better-sqlite3": "^12.2.0",
     "hono": "^4.7.0",
+    "playwright-core": "^1.63.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {

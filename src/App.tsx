@@ -21,6 +21,7 @@ import { NAV } from './nav'
 // 内联为 false，整支三元被 Rollup 剪除，动态 import 不发射 chunk；若无条件调用 lazy()，Rollup 会
 // 保守认为该调用有副作用而保留动态 import，flag-off 产物就会多出一份 paper chunk。
 const PAPER_ENABLED = import.meta.env.VITE_ENABLE_PAPER_COPILOT === '1'
+const AgentRlPage = lazy(() => import('./pages/AgentRlPage'))
 const PapersPage = PAPER_ENABLED ? lazy(() => import('./pages/papers/PapersPage')) : null
 const PaperWorkbenchPage = PAPER_ENABLED ? lazy(() => import('./pages/papers/PaperWorkbenchPage')) : null
 
@@ -108,6 +109,7 @@ export default function App() {
           <Route path="/architecture" element={<ErrorBoundary><ArchitecturePage /></ErrorBoundary>} />
           <Route path="/inference" element={<ErrorBoundary><InferencePage /></ErrorBoundary>} />
           <Route path="/agent" element={<ErrorBoundary><AgentPage /></ErrorBoundary>} />
+          <Route path="/agent-rl" element={<ErrorBoundary><Suspense fallback={<PageLoading />}><AgentRlPage /></Suspense></ErrorBoundary>} />
           <Route path="/kda" element={<ErrorBoundary><KdaPage /></ErrorBoundary>} />
           <Route path="/interview" element={<ErrorBoundary><InterviewPage /></ErrorBoundary>} />
           {/* 懒加载页：Suspense 嵌在 ErrorBoundary 内，chunk 加载失败同样只废该页 */}
