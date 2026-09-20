@@ -5,13 +5,13 @@ import { NAV } from '../../nav'
 export default function MobileTabBar() {
   return (
     <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-ink/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
-      <div className="flex">
+      <div className="flex overflow-x-auto">
         {NAV.map((n) => (
           <NavLink
             key={n.to}
             to={n.to}
             className={({ isActive }) =>
-              `relative flex min-h-12 flex-1 items-center justify-center text-[13px] ${
+              `relative flex min-h-12 min-w-11 flex-1 shrink-0 items-center justify-center text-[13px] ${
                 isActive ? 'font-medium text-accent' : 'text-dim'
               }`
             }

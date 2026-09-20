@@ -1,5 +1,7 @@
 # LLM Infra Studio
 
+**Agent RL learning lab** (`/#/agent-rl`): an in-browser customer-support environment with real tabular policy updates (REINFORCE, PPO with GAE/critic, and GRPO), inspectable trajectories and rewards, independent evaluation, simulated releases/rollback, and a provider service/cost map. LLM tokens and GPU costs are explicitly labeled teaching estimates; no external training or real business tools are invoked. Run `node scripts/agent-rl-repro.mjs` for Chromium/WebKit interaction checks.
+
 **English** | [简体中文](README.zh-CN.md)
 
 An interactive, visual **AI learning & coaching companion** for LLM infrastructure — model architecture evolution, the inference serving pipeline, agent architecture, graded pre-sales practice drills, and an AI paper-reading copilot. Built for people selling, operating, or just seriously learning large-model infrastructure.

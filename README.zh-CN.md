@@ -16,10 +16,13 @@
 | **KDA 拆解** | `/kda` | Kimi Delta Attention 分步推导 + 实时数值场景(入口在注意力演进表的「交互式拆解」链接) |
 | **推理链路** | `/inference` | KPI 全景图与 AIPerf Benchmark 分析、全链路四层、7 类推理架构图谱、Prompt 生命周期、**显存墙计算器**与 Token 经济 |
 | **Agent 架构** | `/agent` | Agent 架构标注图——基础模型在哪里,Harness 边界在哪里 |
+| **Agent RL** | `/agent-rl` | 从客服工单到策略升级：生命周期地图、REINFORCE/PPO/GRPO 实验、奖励漏洞、独立评测与模拟发布、Provider 服务和教学成本账本 |
 | **售前陪练** | `/interview` | rubric 题库(每题带必答点 + 红线),LLM 实时评分,语音作答,掌握度仪表盘,答题历史 |
 | **论文陪读** | `/papers` | 导入 PDF/DOCX,原版 PDF / 语义文本双视图,选段提问,流式 AI 陪读(带引用),阅读进度;游客本地优先,登录后账号同步 |
 
 ## 工程亮点
+
+- **Agent RL 是可复算的策略实验。** 浏览器内对离散观察上的 softmax 策略求梯度，分别实现 REINFORCE、PPO（GAE + Critic + 裁剪）和 GRPO（同任务分组 + 裁剪 + 精确类别 KL）；不调用真实 LLM 或训练平台。默认初始策略具有弱工具顺序偏好，避免把基座的基础工具能力与 RL 学习混淆。轨迹、优势、动作概率、曲线来自同一记录；训练、采样、生产版本独立。Token 与 GPU 成本明确属于教学假设，不能用于推断真实大模型效果或账单。实际 URL 使用 HashRouter：`/#/agent-rl`。
 
 - **数据驱动的扩展性。** 所有内容——模型、硬件、注意力阶段、题目、价格——都是 `src/data/` 下的类型化数据,组件只负责渲染。加一个模型或题目就是往数组里加一个对象,不碰组件。见 [EXTENDING.md](EXTENDING.md)。
 - **拒绝伪精确。** 模拟引擎(`src/lib/simEngine.ts`)是纯函数,配已知算例单测。没有公开公式参数的架构(DSA、KDA 等)显式标注「不支持数值估算」,只展示官方相对指标。易变事实(价格/规格)必须带 `sourceUrl` + `asOf`。
@@ -64,6 +67,7 @@ npm run dev            # 网关:http://localhost:8787(vite 把 /api/* 代理过�
 ```bash
 npm run typecheck                      # tsc --noEmit
 npx vitest run                         # 720+ 前端单测
+node scripts/agent-rl-repro.mjs        # Agent RL：Chromium/WebKit 桌面与 390px 交互验收
 cd server && npx vitest run            # 后端测试
 npm run build                          # flag-on 生产构建
 VITE_ENABLE_PAPER_COPILOT= npm run build   # flag-off 构建(必须同样通过)

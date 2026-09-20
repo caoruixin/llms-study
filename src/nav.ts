@@ -6,6 +6,7 @@ export const NAV = [
   { to: '/architecture', label: '架构演进', short: '架构' },
   { to: '/inference', label: '推理链路', short: '推理' },
   { to: '/agent', label: 'Agent 架构', short: 'Agent' },
+  { to: '/agent-rl', label: 'Agent RL', short: 'RL' },
   // /kda 不在顶部导航：入口收纳在 架构演进 → 注意力演进 → KDA/GDN 行的「交互式拆解」链接
   { to: '/interview', label: '售前陪练', short: '售前' },
   ...(PAPER_ENABLED ? [{ to: '/papers', label: '论文陪读', short: '论文' }] : []),
