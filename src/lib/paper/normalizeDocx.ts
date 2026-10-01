@@ -44,6 +44,12 @@ export function toText(html: string): string {
 export interface RawBlock {
   tag: string
   inner: string
+  /** 开标签在输入串里的起始下标（normalizeHtml 的 figure 分支据此把表格与图/图注按源码顺序排块） */
+  start: number
+  /** `inner` 在输入串里的起始下标（开标签之后）；递归扫描嵌套块时用它把相对偏移换算成绝对偏移 */
+  innerStart: number
+  /** 闭标签之后的下标（未闭合时为输入串长度）；[start, end) 覆盖整个元素 */
+  end: number
 }
 
 /**
@@ -91,10 +97,10 @@ export function extractBlocks(html: string): RawBlock[] {
 
     if (closeStart === -1) {
       // 未闭合标签：把剩余内容整体作为该块，避免丢正文
-      out.push({ tag, inner: html.slice(contentStart) })
+      out.push({ tag, inner: html.slice(contentStart), start: m.index, innerStart: contentStart, end: html.length })
       break
     }
-    out.push({ tag, inner: html.slice(contentStart, closeStart) })
+    out.push({ tag, inner: html.slice(contentStart, closeStart), start: m.index, innerStart: contentStart, end: closeEnd })
     i = closeEnd
   }
   return out

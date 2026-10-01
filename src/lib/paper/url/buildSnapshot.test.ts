@@ -83,6 +83,7 @@ const SERVED: Record<string, { bytes: ArrayBuffer; contentType: string } | Error
   [`${SITE}/img/fig.png`]: { bytes: bin(4, 4), contentType: 'image/png' },
   [`${SITE}/img/inline.png`]: { bytes: bin(5, 5), contentType: 'image/png' },
   [`${SITE}/img/missing.png`]: Object.assign(new Error('not found'), { status: 404 }),
+  [`${SITE}/img/arch.svg`]: { bytes: bin(6, 6), contentType: 'image/svg+xml' },
 }
 
 function fakeDeps(overrides: Partial<Parameters<Mod['buildWebSnapshot']>[1]> = {}) {
@@ -191,6 +192,29 @@ describe('buildWebSnapshot：静态路径全链路', () => {
     expect(header.blocks.find((b) => b.kind === 'image')).toMatchObject({ text: '[图: 示意图]', src: `${SITE}/img/fig.png` })
     expect(header.blocks.find((b) => b.kind === 'caption')?.text).toBe('图 1：示意')
     expect(header.blocks.every((b) => b.anchor.kind === 'html' && b.anchor.section === '一级标题')).toBe(true)
+  })
+
+  it('指向图片的 <object>（arXiv/LaTeXML 的 svg 图）进资源计划：换成 <img> 并打 data-pc-asset，不出占位', async () => {
+    const html =
+      '<!doctype html><html><head><title>T</title></head><body>' +
+      `<p>${LONG}</p>` +
+      '<figure><object type="image/svg+xml" data="/img/arch.svg" id="S1.F1.g1" class="ltx_graphics" width="476" height="273"></object>' +
+      '<figcaption>图 1：架构</figcaption></figure>' +
+      '<object type="application/pdf" data="/paper.pdf"></object>' +
+      '</body></html>'
+    const { deps, calls } = fakeDeps()
+    const { header } = await buildWebSnapshot({ url: PAGE, html, finalUrl: PAGE }, deps)
+
+    expect(calls).toContain(`${SITE}/img/arch.svg`)
+    expect(calls).not.toContain(`${SITE}/paper.pdf`)
+    expect(header.assets.map((a) => [a.id, a.mime])).toEqual([['id66', 'image/svg+xml']])
+    expect(header.stats.skipped).toEqual([])
+    expect(header.html).toMatch(/<img[^>]*src="https:\/\/site\.test\/img\/arch\.svg"[^>]*data-pc-asset="id66"/)
+    expect(header.html).not.toContain('<object')
+    // 非图片的 object 仍是占位
+    expect(header.html).toContain('[嵌入内容]')
+    expect(header.blocks.find((b) => b.kind === 'image')).toMatchObject({ src: `${SITE}/img/arch.svg` })
+    expect(header.blocks.find((b) => b.kind === 'caption')?.text).toBe('图 1：架构')
   })
 
   it('阶段回调：rendering → assets（含 done/total）→ sanitizing → packing', async () => {

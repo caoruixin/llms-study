@@ -30,7 +30,31 @@ export interface HtmlSectionInput {
 const HEADING_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
 
 const IMG_TAG_RE = /<img\b[^>]*>/gi
-const FIGCAPTION_RE = /<figcaption\b[^>]*>([\s\S]*?)<\/figcaption\s*>/i
+// figcaption 不会嵌套，全局非贪婪匹配即可；多面板 figure 里每个面板各有一条，外层还有主图注
+const FIGCAPTION_RE = /<figcaption\b[^>]*>([\s\S]*?)<\/figcaption\s*>/gi
+
+interface FigureTable {
+  inner: string
+  /** 在 figure inner 里的绝对偏移：[start, end) 覆盖整张表 */
+  start: number
+  end: number
+}
+
+/**
+ * figure 里最外层的表格（含嵌套 figure 面板里的）。arXiv 的子表是
+ * `<figure class="ltx_table"><div class="ltx_flex_figure"><div class="ltx_flex_cell"><figure class="ltx_figure_panel"><table>…`：
+ * extractBlocks 把内层 figure 当成一个块整体返回，只在顶层筛 table 会把面板里的表丢掉，所以对 figure 块递归；
+ * 表格自身不再下探（嵌套 tabular 留在外层表的 html 里）。偏移按 innerStart 逐层换算成相对整段 figure inner 的绝对值，
+ * 源码顺序排序与「img 是否在表内」的判定才成立。
+ */
+function collectFigureTables(html: string, offset = 0): FigureTable[] {
+  const out: FigureTable[] = []
+  for (const blk of extractBlocks(html)) {
+    if (blk.tag === 'table') out.push({ inner: blk.inner, start: offset + blk.start, end: offset + blk.end })
+    else if (blk.tag === 'figure') out.push(...collectFigureTables(blk.inner, offset + blk.innerStart))
+  }
+  return out
+}
 
 /**
  * 从单个 `<img ...>` 标签字符串里抠属性值（双引号/单引号/无引号三种写法）。
@@ -109,20 +133,53 @@ export function normalizeHtmlSections(sections: readonly HtmlSectionInput[]): No
         continue
       }
       if (b.tag === 'figure') {
-        // 每张图独立成 image 块：text 是 [图: alt] 占位（供检索/翻译兜底展示），src 是远程 https URL
-        for (const tag of b.inner.match(IMG_TAG_RE) ?? []) {
-          const src = imgAttr(tag, 'src')
-          const alt = imgAttr(tag, 'alt')?.trim()
-          dedupPending = false
-          push('image', alt ? `[图: ${alt}]` : '[图]', src ? { src } : undefined)
+        // figure 内按源码顺序落块（嵌套的面板 figure 一并摊平，不另起层级）：
+        // - 每张图独立成 image 块：text 是 [图: alt] 占位（供检索/翻译兜底展示），src 是远程 https URL
+        // - 最外层 <table> 落 table 块（arXiv 的表格是 <figure class="ltx_table"><figcaption>…</figcaption><table>，
+        //   图注在前表在后）：用 extractBlocks 的深度计数扫描——LaTeXML 会嵌套 tabular，非贪婪正则会在
+        //   内层 </table> 截断；表格内部的 img 归表格 html，不单独成 image 块（与顶层 table 分支口径一致）
+        // - 每条 figcaption 各落一个既有 caption kind 的块（面板的 (a)/(b) 与外层主图注都保留）：
+        //   可译/可高亮/可检索全部走既有机制
+        const tables = collectFigureTables(b.inner)
+        const inTable = (at: number): boolean => tables.some((t) => at >= t.start && at < t.end)
+        const parts: { at: number; emit: () => void }[] = []
+        for (const m of b.inner.matchAll(IMG_TAG_RE)) {
+          const at = m.index ?? 0
+          if (inTable(at)) continue
+          const src = imgAttr(m[0], 'src')
+          const alt = imgAttr(m[0], 'alt')?.trim()
+          parts.push({
+            at,
+            emit: () => {
+              dedupPending = false
+              push('image', alt ? `[图: ${alt}]` : '[图]', src ? { src } : undefined)
+            },
+          })
         }
-        // 图注独立落为既有 caption kind：可译/可高亮/可检索全部走既有机制
-        const capText = toText(FIGCAPTION_RE.exec(b.inner)?.[1] ?? '')
-        if (capText) {
-          dedupPending = false
-          push('caption', capText)
+        for (const t of tables) {
+          parts.push({
+            at: t.start,
+            emit: () => {
+              const text = tableToText(t.inner)
+              if (text) dedupPending = false
+              push('table', text, { html: `<table>${t.inner}</table>` })
+            },
+          })
         }
-        // figure 内其余内容（非 img/figcaption）忽略
+        for (const cap of b.inner.matchAll(FIGCAPTION_RE)) {
+          const capText = toText(cap[1])
+          if (!capText) continue
+          parts.push({
+            at: cap.index ?? 0,
+            emit: () => {
+              dedupPending = false
+              push('caption', capText)
+            },
+          })
+        }
+        parts.sort((x, y) => x.at - y.at)
+        for (const part of parts) part.emit()
+        // figure 内其余内容（非 img/table/figcaption）忽略
         continue
       }
       const text = toText(b.inner)

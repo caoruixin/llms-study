@@ -154,6 +154,48 @@ describe('preprocessFidelity：媒体占位', () => {
     expect(kinds).toEqual(['embed', 'embed', 'embed', 'canvas'])
     expect(doc.querySelectorAll('.pc-placeholder')[0].textContent).toBe('[嵌入内容]')
   })
+
+  it('指向图片的 object/embed → img：src 按文档基准绝对化，id/class/style/尺寸/title 保留，alt 取备用文字；非图片的照旧占位', () => {
+    const doc = parse(
+      page(
+        '',
+        // arXiv/LaTeXML 的形态：页面 URL 无尾斜杠，相对 data 带 `<id>/` 前缀
+        '<object type="image/svg+xml" data="2407.00079v4/arch.svg" id="S1.F1.g1" class="ltx_graphics" style="aspect-ratio:476/273;" width="476" height="273"></object>' +
+          '<embed type="IMAGE/PNG" src="/img/e.png" title="截图">' +
+          // 没有 type：只看扩展名（大小写不敏感，查询串不算）
+          '<object data="fig.JPG?x=1">备用文字</object>' +
+          '<object type="image/svg+xml" data="px.svg" width="1" height="300"></object>' +
+          '<object data="a.swf"></object><embed src="b.pdf" type="application/pdf">',
+      ),
+    )
+    preprocessFidelity(doc, 'https://arxiv.org/html/2407.00079v4')
+    expect(doc.querySelector('object, embed')).toBeNull()
+    const imgs = Array.from(doc.querySelectorAll('img'))
+    expect(imgs.map((i) => i.getAttribute('src'))).toEqual([
+      'https://arxiv.org/html/2407.00079v4/arch.svg',
+      'https://arxiv.org/img/e.png',
+      'https://arxiv.org/html/fig.JPG?x=1',
+    ])
+    expect(imgs[0].getAttribute('id')).toBe('S1.F1.g1')
+    expect(imgs[0].getAttribute('class')).toBe('ltx_graphics')
+    expect(imgs[0].getAttribute('style')).toBe('aspect-ratio:476/273;')
+    expect(imgs[0].getAttribute('width')).toBe('476')
+    expect(imgs[0].getAttribute('height')).toBe('273')
+    expect(imgs[0].getAttribute('alt')).toBe('')
+    expect(imgs[1].getAttribute('title')).toBe('截图')
+    expect(imgs[2].getAttribute('alt')).toBe('备用文字')
+    // 1×1 追踪像素直接删，不出图也不出占位
+    expect(doc.documentElement.outerHTML).not.toContain('px.svg')
+    const kinds = Array.from(doc.querySelectorAll('.pc-placeholder')).map((p) => p.getAttribute('data-pc-placeholder'))
+    expect(kinds).toEqual(['embed', 'embed'])
+  })
+
+  it('<base href> 下 object 的相对 data 按 base 解析（与 img 同一口径）', () => {
+    const doc = parse(page('<base href="/papers/2412/">', '<object type="image/svg+xml" data="x1.svg"></object>'))
+    preprocessFidelity(doc, FINAL)
+    expect(doc.querySelector('object')).toBeNull()
+    expect(doc.querySelector('img')?.getAttribute('src')).toBe('https://arxiv.org/papers/2412/x1.svg')
+  })
 })
 
 describe('preprocessFidelity：删噪与样式表', () => {

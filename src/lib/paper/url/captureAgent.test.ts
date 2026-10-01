@@ -160,7 +160,7 @@ describe('captureAgentMain 自包含性', () => {
     const literals = Array.from(src.matchAll(/agentVersion:\s*([^,\s}]+)/g)).map((m) => m[1])
     expect(literals.length).toBeGreaterThanOrEqual(2)
     expect(literals).toEqual(literals.map(() => String(CAPTURE_AGENT_VERSION)))
-    expect(CAPTURE_AGENT_VERSION).toBe(2)
+    expect(CAPTURE_AGENT_VERSION).toBe(3)
   })
 
   it('本文件零 import：序列化后的源码里没有被改写的导入绑定', () => {
@@ -415,6 +415,62 @@ describe('serialize()', () => {
     expect(holders[0].textContent).toBe('[视频：clip.webm]')
     expect(holders[1].textContent).toBe('[视频]')
     expect(holders[2].textContent).toBe('[音频：track.mp3]')
+  })
+
+  it('指向图片的 object/embed 提升为 img：绝对 src，保留 id/class/style/width/height/title，alt 取备用文字', () => {
+    const doc = makeDoc(
+      [
+        // arXiv/LaTeXML 的形态：相对 data + type=image/svg+xml
+        '<object id="f1" class="ltx_graphics" type="image/svg+xml" data="2407.00079v4/arch.svg" style="aspect-ratio:476/273;" width="476" height="273"></object>',
+        '<embed id="e1" type="image/png" src="../shot.png" title="截图">',
+        // 没有 type：只看扩展名（大小写不敏感），备用文字进 alt
+        '<object id="f2" data="plain.PNG">备用文字</object>',
+        // 查询串 / 锚点不影响扩展名判定
+        '<object id="f3" type="image/svg+xml" data="x.svg?v=1#frag"></object>',
+        '<p>正文</p>',
+      ].join(''),
+    )
+    const out = parse(captureAgentMain(cfgOf(), fakeWin(doc).win).serialize())
+    expect(out.querySelectorAll('object, embed')).toHaveLength(0)
+    expect(out.querySelectorAll('img')).toHaveLength(4)
+    const f1 = out.getElementById('f1')!
+    expect(f1.localName).toBe('img')
+    expect(f1.getAttribute('src')).toBe('https://ex.com/a/2407.00079v4/arch.svg')
+    expect(f1.getAttribute('class')).toBe('ltx_graphics')
+    expect(f1.getAttribute('style')).toBe('aspect-ratio:476/273;')
+    expect(f1.getAttribute('width')).toBe('476')
+    expect(f1.getAttribute('height')).toBe('273')
+    expect(f1.getAttribute('alt')).toBe('')
+    expect(f1.getAttribute('type')).toBeNull()
+    expect(f1.getAttribute('data')).toBeNull()
+    const e1 = out.getElementById('e1')!
+    expect(e1.localName).toBe('img')
+    expect(e1.getAttribute('src')).toBe('https://ex.com/shot.png')
+    expect(e1.getAttribute('title')).toBe('截图')
+    const f2 = out.getElementById('f2')!
+    expect(f2.localName).toBe('img')
+    expect(f2.getAttribute('src')).toBe('https://ex.com/a/plain.PNG')
+    expect(f2.getAttribute('alt')).toBe('备用文字')
+    expect(out.getElementById('f3')!.getAttribute('src')).toBe('https://ex.com/a/x.svg?v=1#frag')
+    expect(out.querySelector('p')!.textContent).toBe('正文')
+  })
+
+  it('非图片的 object/embed 与追踪像素尺寸的图片 object 照删，不出 img', () => {
+    const doc = makeDoc(
+      '<object type="application/pdf" data="paper.pdf"></object>' +
+        '<embed src="movie.swf">' +
+        '<object type="image/svg+xml" data="px.svg" width="1" height="1"></object>' +
+        '<object type="image/gif" data="px.gif" hidden></object>' +
+        // 扩展名要看路径而不是查询串
+        '<object data="view.html?file=a.svg"></object>' +
+        '<p>正文</p>',
+    )
+    const html = captureAgentMain(cfgOf(), fakeWin(doc).win).serialize()
+    expect(html).not.toContain('<object')
+    expect(html).not.toContain('<embed')
+    expect(html).not.toContain('<img')
+    expect(html).not.toContain('px.svg')
+    expect(html).toContain('<p>正文</p>')
   })
 
   it('canvas 取 toDataURL，污染（抛错）时退化成占位', () => {
