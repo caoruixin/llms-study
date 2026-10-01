@@ -177,11 +177,83 @@ describe('normalizeHtmlSections', () => {
       expect(blocks[0].src).toBeUndefined()
     })
 
-    it('figure 内 img/figcaption 之外的内容忽略', () => {
+    it('figure 内 img/table/figcaption 之外的内容忽略', () => {
       const blocks = normalizeHtmlSections([
         { html: '<figure><p>杂项说明</p><img src="https://x.org/a.png"></figure>' },
       ])
       expect(blocks.map((b) => [b.kind, b.text])).toEqual([['image', '[图]']])
+    })
+
+    it('figure 内的表格落 table 块（arXiv 的 ltx_table：图注在前）；只取最外层一张，嵌套 tabular 留在它的 html 里', () => {
+      const blocks = normalizeHtmlSections([
+        {
+          html: '<figure><figcaption>Table 1: x</figcaption><table><tr><td>a<table><tr><td>n</td></tr></table></td></tr></table></figure>',
+        },
+      ])
+      expect(blocks.map((b) => b.kind)).toEqual(['caption', 'table'])
+      expect(blocks[0].text).toBe('Table 1: x')
+      expect(blocks[1].html).toBe('<table><tr><td>a<table><tr><td>n</td></tr></table></td></tr></table>')
+      // 与顶层 table 分支同一形态：text 是表格文本化结果
+      expect(blocks[1].text).toContain('a')
+      expect(blocks[1].src).toBeUndefined()
+    })
+
+    it('figure 内 img + table + figcaption 按源码顺序落块；表格内部的 img 归表格 html，不单独成 image 块', () => {
+      const blocks = normalizeHtmlSections([
+        {
+          html:
+            '<figure><img src="https://x.org/a.png" alt="A">' +
+            '<table><tr><td>c</td></tr><tr><td><img src="https://x.org/in-cell.png"></td></tr></table>' +
+            '<figcaption>混合</figcaption></figure>',
+        },
+      ])
+      expect(blocks.map((b) => [b.kind, b.text])).toEqual([
+        ['image', '[图: A]'],
+        ['table', 'c'],
+        ['caption', '混合'],
+      ])
+      expect(blocks[0].src).toBe('https://x.org/a.png')
+      expect(blocks[1].html).toContain('in-cell.png')
+      blocks.forEach((b, i) => expect(b.anchor.blockIndex).toBe(i))
+    })
+
+    it('子表面板（嵌套 figure 里的 table）不丢：面板图注 + 表格逐个落块，外层主图注殿后，顺序按源码；面板表内的 img 不单独成块', () => {
+      const html =
+        '<figure class="ltx_table"><div class="ltx_flex_figure">' +
+        '<div class="ltx_flex_cell"><figure id="S4.T2.sf1" class="ltx_table ltx_figure_panel">' +
+        '<figcaption>(a) 面板甲</figcaption><table><tr><td>a1</td></tr><tr><td><img src="https://x.org/in-panel.png"></td></tr></table></figure></div>' +
+        '<div class="ltx_flex_cell"><figure id="S4.T2.sf2" class="ltx_table ltx_figure_panel">' +
+        '<figcaption>(b) 面板乙</figcaption><table><tr><td>b1<table><tr><td>n</td></tr></table></td></tr></table></figure></div>' +
+        '</div><figcaption>Table 2: 总表</figcaption></figure>'
+      const blocks = normalizeHtmlSections([{ html }])
+      expect(blocks.map((b) => [b.kind, b.text])).toEqual([
+        ['caption', '(a) 面板甲'],
+        ['table', 'a1'],
+        ['caption', '(b) 面板乙'],
+        ['table', expect.stringContaining('b1')],
+        ['caption', 'Table 2: 总表'],
+      ])
+      expect(blocks[1].html).toBe('<table><tr><td>a1</td></tr><tr><td><img src="https://x.org/in-panel.png"></td></tr></table>')
+      // 嵌套 tabular 留在外层表的 html 里，不另成块
+      expect(blocks[3].html).toBe('<table><tr><td>b1<table><tr><td>n</td></tr></table></td></tr></table>')
+      expect(blocks.filter((b) => b.kind === 'image')).toHaveLength(0)
+      blocks.forEach((b, i) => expect(b.anchor.blockIndex).toBe(i))
+    })
+
+    it('多面板图：每个面板的 img 与 (a)/(b) 图注交错落块，外层主图注不丢', () => {
+      const html =
+        '<figure><div class="ltx_flex_figure">' +
+        '<div class="ltx_flex_cell"><figure id="S8.F10.sf1"><img src="https://x.org/a.svg" alt="A"><figcaption>(a) 甲</figcaption></figure></div>' +
+        '<div class="ltx_flex_cell"><figure id="S8.F10.sf2"><img src="https://x.org/b.svg" alt="B"><figcaption>(b) 乙</figcaption></figure></div>' +
+        '</div><figcaption>Figure 10: 主图注</figcaption></figure>'
+      const blocks = normalizeHtmlSections([{ html }])
+      expect(blocks.map((b) => [b.kind, b.text, b.src])).toEqual([
+        ['image', '[图: A]', 'https://x.org/a.svg'],
+        ['caption', '(a) 甲', undefined],
+        ['image', '[图: B]', 'https://x.org/b.svg'],
+        ['caption', '(b) 乙', undefined],
+        ['caption', 'Figure 10: 主图注', undefined],
+      ])
     })
 
     it('image / caption 块的 blockIndex 全局连续，anchor.section 沿用最近标题', () => {

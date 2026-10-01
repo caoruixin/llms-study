@@ -28,10 +28,11 @@
  * 代理协议版本：消息里回传，父页据此判断能否解读。
  * - 1：初版
  * - 2：内容感知的静默判定（空页面不再在第一个静默窗口收工）、`blockedScripts` 信号、`collect()`
+ * - 3：指向图片的 `<object data>` / `<embed src>` 提升为 `<img>`（arXiv/LaTeXML 的 svg 图不再整个删掉）
  *
- * 函数体里引用不到这个常量，那边是内联字面量，靠单测保持一致——改这里要同时改 `agentVersion: 2` 两处。
+ * 函数体里引用不到这个常量，那边是内联字面量，靠单测保持一致——改这里要同时改 `agentVersion: 3` 两处。
  */
-export const CAPTURE_AGENT_VERSION = 2
+export const CAPTURE_AGENT_VERSION = 3
 
 /** 捕获代理在活树上标出的 fixed/sticky 元素：阅读器把它们改回 static，否则整页浮层会压住正文 */
 export const FIXED_ATTR = 'data-pc-fixed'
@@ -162,8 +163,11 @@ export function captureAgentMain(cfg: CaptureAgentConfig, win?: unknown): Captur
   ]
   // 这三个标签的 white-space: pre* 是 UA 默认值，stampBlocks 已按标签名兜住，不必再标
   const IMPLICIT_PRE = ['pre', 'code', 'textarea']
-  // 克隆树上整体删掉的标签（脚本执行面 + 不会被快照消费的嵌入内容 + base）
+  // 克隆树上整体删掉的标签（脚本执行面 + 不会被快照消费的嵌入内容 + base）；
+  // 指向图片的 object/embed 在这之前已换成 img（serialize 第 3b 步）
   const DROP_SELECTOR = 'script, noscript, iframe, object, embed, template, base'
+  // object/embed → img 时原样搬过去的属性（src 单独算，alt 取备用文字）
+  const EMBED_KEEP_ATTRS = ['id', 'class', 'style', 'width', 'height', 'title']
   // 需要查 javascript: 的 URL 属性
   const URL_ATTRS = ['href', 'src', 'action', 'formaction', 'xlink:href']
   // 判「有没有正文」时整棵跳过的子树：里面的文本节点不是读者看得到的字
@@ -225,6 +229,20 @@ export function captureAgentMain(cfg: CaptureAgentConfig, win?: unknown): Captur
     const clean = String(url || '').split('#')[0].split('?')[0]
     const parts = clean.split('/')
     return parts[parts.length - 1] || ''
+  }
+
+  /** object[data] / embed[src] 是否指向图片：type 以 image/ 开头，或 URL 路径（去掉 ?/#）以图片扩展名结尾 */
+  function isImageEmbed(el: any, url: string): boolean {
+    const type = String(el.getAttribute('type') || '').trim().toLowerCase()
+    if (type.slice(0, 6) === 'image/') return true
+    return /\.(svg|png|jpe?g|gif|webp|avif)$/i.test(basename(url))
+  }
+
+  /** 属性里的尺寸 ≤1 或带 hidden：追踪像素，直接删不出图（NaN 的比较为 false，没写尺寸不算） */
+  function isTinyEmbed(el: any): boolean {
+    const width = parseFloat(el.getAttribute('width'))
+    const height = parseFloat(el.getAttribute('height'))
+    return width <= 1 || height <= 1 || el.hasAttribute('hidden')
   }
 
   function placeholder(kind: string, label: string): any {
@@ -386,6 +404,29 @@ export function captureAgentMain(cfg: CaptureAgentConfig, win?: unknown): Captur
       replaceNode(audio, placeholder('audio', name ? '[音频：' + name + ']' : '[音频]'))
     }
 
+    // 3b) 指向图片的 object/embed → img：LaTeXML 把 arXiv 的矢量图写成
+    //     `<object type="image/svg+xml" data="x.svg">`，沙箱 CSP object-src 'none' 下它是空壳，
+    //     照第 4 步整体删掉就只剩图注。换成 img 后父页的资源管线按普通图片抓取固化；
+    //     追踪像素尺寸的直接删；非图片的（PDF/HTML/Flash）留给第 4 步
+    const embeds = clone.querySelectorAll('object[data], embed[src]')
+    for (let i = 0; i < embeds.length; i++) {
+      const node = embeds[i]
+      const url = String(node.getAttribute(tagOf(node) === 'object' ? 'data' : 'src') || '').trim()
+      if (!url || !isImageEmbed(node, url)) continue
+      if (isTinyEmbed(node)) {
+        if (node.parentNode) node.parentNode.removeChild(node)
+        continue
+      }
+      const img = doc.createElement('img')
+      img.setAttribute('src', absolutize(url, base))
+      for (let k = 0; k < EMBED_KEEP_ATTRS.length; k++) {
+        const value = node.getAttribute(EMBED_KEEP_ATTRS[k])
+        if (value) img.setAttribute(EMBED_KEEP_ATTRS[k], value)
+      }
+      img.setAttribute('alt', String(node.textContent || '').trim())
+      replaceNode(node, img)
+    }
+
     // 4) 脚本执行面与嵌入内容整体删掉（`<style>` 保留：MathJax 注入的 #MJX-CHTML-styles 就在里面）
     const drop = clone.querySelectorAll(DROP_SELECTOR)
     for (let i = 0; i < drop.length; i++) {
@@ -447,7 +488,7 @@ export function captureAgentMain(cfg: CaptureAgentConfig, win?: unknown): Captur
       ok: false,
       reason: String(reason || 'agent-error'),
       blockedScripts: blockedScripts,
-      agentVersion: 2,
+      agentVersion: 3,
     })
   }
 
@@ -477,7 +518,7 @@ export function captureAgentMain(cfg: CaptureAgentConfig, win?: unknown): Captur
         hidden: counts.hidden,
         fixed: counts.fixed,
         blockedScripts: blockedScripts,
-        agentVersion: 2,
+        agentVersion: 3,
       })
     } catch (e) {
       fail(errText(e))

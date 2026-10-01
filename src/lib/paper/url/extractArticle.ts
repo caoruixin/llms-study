@@ -1,4 +1,5 @@
 import { sanitizeArticleHtml } from '../sanitize'
+import { promoteImageEmbeds } from './captureStatic'
 import { paragraphizeHtml } from './paragraphize'
 import { WEIXIN_BLOCKED_MESSAGE, isWeixinArticleUrl, isWeixinCaptchaUrl } from './weixin'
 
@@ -12,7 +13,7 @@ import { WEIXIN_BLOCKED_MESSAGE, isWeixinArticleUrl, isWeixinCaptchaUrl } from '
  *
  * 抽取阶梯（§Track 1）：
  *   finalUrl 是微信验证页（wappoc_appmsgcaptcha）→ 直接抛风控提示
- *   → 预处理（删脚本类标签、链接/图片绝对化、图片包 figure 规整；保不住的图降级为文本占位）
+ *   → 预处理（删脚本类标签、图片型 object/embed 提升为 img、链接/图片绝对化、图片包 figure 规整；保不住的图降级为文本占位）
  *   → 微信文章页直取 #js_content（其 visibility:hidden 会被 Readability 整体丢弃，必须绕过）
  *   → 否则 isProbablyReaderable + Readability
  *   → 都不行时启发式后备（main/article/[role=main] 里取文本最长的一个，先删导航类噪声）
@@ -75,7 +76,7 @@ export function decodeHtmlBytes(bytes: ArrayBuffer, contentType: string): string
 // 预处理 / 启发式后备（碰 DOM，只在 extractArticle 内部调用）
 // ---------------------------------------------------------------------------
 
-/** 删脚本类标签 + 链接/图片绝对化 + 图片包 figure 规整。不下载任何外部资源 */
+/** 删脚本类标签 + 图片型 object/embed 提升为 img + 链接/图片绝对化 + 图片包 figure 规整。不下载任何外部资源 */
 function preprocess(doc: Document, finalUrl: string): void {
   // svg 照删：tikz-svg 图已知缺失，本期只处理 img（ar5iv 公式主体是 MathML，math 由 sanitize FORBID，公式现状不变）
   doc.querySelectorAll('script,style,noscript,iframe,svg').forEach((el) => el.remove())
@@ -102,6 +103,15 @@ function preprocess(doc: Document, finalUrl: string): void {
       a.removeAttribute('href')
     }
   })
+
+  // 指向图片的 <object data> / <embed src>（LaTeXML 把 arXiv 的矢量图写成 <object type="image/svg+xml">）
+  // 先换成 <img>，让它们走下面同一条按 base 绝对化 / https 校验 / 包 figure / 提出 <p> 的流程；
+  // 不转换的话 Readability 与 sanitize 都会把 <object> 整个删掉，图只剩图注
+  promoteImageEmbeds(doc)
+
+  // LaTeXML 给 arXiv 表格标的 ltx_guessed_headers 会命中 Readability 的 unlikelyCandidates（/header/），
+  // 整张表在抽取阶段就被当成页眉删掉、只剩图注。class 不在文章白名单里，只摘这一个 token 不损失任何输出
+  doc.querySelectorAll('table.ltx_guessed_headers').forEach((t) => t.classList.remove('ltx_guessed_headers'))
 
   doc.querySelectorAll('img').forEach((img) => {
     const alt = img.getAttribute('alt')?.trim()

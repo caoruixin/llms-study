@@ -103,8 +103,9 @@ function ImageBlock({ block }: { block: PaperBlock }) {
     try {
       // 动态 import：代理兜底是低频路径，fetchUrlApi 不进阅读视图主 chunk
       const { fetchUrl } = await import('../../lib/paper/url/fetchUrlApi')
-      const { bytes } = await fetchUrl(block.src)
-      setProxySrc(URL.createObjectURL(new Blob([bytes])))
+      // 走 asset 口径：page 口径对 image/svg+xml 回 415；Blob 带上 MIME，svg 才能从 blob: URL 显示出来
+      const { bytes, contentType } = await fetchUrl(block.src, { kind: 'asset' })
+      setProxySrc(URL.createObjectURL(new Blob([bytes], { type: contentType })))
       setProxyStatus('idle')
     } catch (e) {
       setProxyMessage((e as Error).message || '代理加载失败')

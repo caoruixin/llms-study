@@ -186,7 +186,7 @@ describe.skipIf(!CHROME)('真浏览器渲染(RENDER_E2E_CHROME)', () => {
       // 主文档的 30x 是一次重新导航:最终地址是跳转后的真实 URL(而不是"内容换了、地址没换")
       expect(result.finalUrl).toBe('http://origin.test/app/')
       expect(result.title).toBe('E2E 页面')
-      expect(result.agentVersion).toBe(2)
+      expect(result.agentVersion).toBe(3)
       expect(result.blockedScripts).toBe(0)
       expect(result.viewportWidth).toBe(1280)
       expect(result.html).toContain(MARKER)

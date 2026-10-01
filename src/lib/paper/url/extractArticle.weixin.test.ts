@@ -85,3 +85,28 @@ describe('extractArticle 微信路径', () => {
     await expect(promise).rejects.not.toThrow('脚本渲染')
   })
 })
+
+/**
+ * preprocess 的图片型 object/embed 提升：preprocess 是模块私有函数，借微信直取路径观察
+ * （同样不触发 Readability）。Readability 主路径上的同一处理归 codex E2E 环覆盖。
+ */
+describe('extractArticle 预处理：图片型 object/embed 提升为 img', () => {
+  it('<object type="image/svg+xml"> 按 base 绝对化成 https 的 <img> 并包进 <figure>；PDF object 与 1×1 追踪像素不出图', async () => {
+    const para = '丁'.repeat(240)
+    const out = await extractArticle({
+      html: weixinPage(
+        `<section>${para}</section>` +
+          '<object type="image/svg+xml" data="fig/arch.svg" width="476" height="273"></object>' +
+          '<object type="application/pdf" data="paper.pdf"></object>' +
+          '<object type="image/svg+xml" data="px.svg" width="1" height="1"></object>',
+      ),
+      finalUrl: ARTICLE_URL,
+    })
+    expect(out.html).toContain(`<p>${para}</p>`)
+    expect(out.html).toMatch(/<figure><img[^>]*src="https:\/\/mp\.weixin\.qq\.com\/s\/fig\/arch\.svg"/)
+    // PDF object 不出图（它本身由 sanitize 的 FORBID 删除——happy-dom 的 NodeIterator 限制见文件头，
+    // 这里不断言残留，sanitize.test.ts 已锁住 object 被禁）；1×1 追踪像素由预处理直接删
+    expect(out.html.match(/<img\b/g)).toHaveLength(1)
+    expect(out.html).not.toContain('px.svg')
+  })
+})

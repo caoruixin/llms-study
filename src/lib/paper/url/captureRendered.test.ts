@@ -188,13 +188,13 @@ describe('captureRendered', () => {
     await expect(run({ blockedScripts: null })).resolves.toMatchObject({ blockedScripts: 0 })
   })
 
-  it('agentVersion 缺失时回落到当前代理版本（2）', async () => {
+  it('agentVersion 缺失时回落到当前代理版本（3）', async () => {
     const h = harness()
     const promise = captureRendered(INPUT, { doc: h.doc, parentWindow: h.parentWindow, outerTimeoutMs: 2000 })
     await until(() => h.created.length === 1)
     h.send(okMessage({ agentVersion: undefined }))
     await expect(promise).resolves.toMatchObject({ agentVersion: CAPTURE_AGENT_VERSION })
-    expect(CAPTURE_AGENT_VERSION).toBe(2)
+    expect(CAPTURE_AGENT_VERSION).toBe(3)
   })
 
   it('finalUrl 为空时回落到入参', async () => {

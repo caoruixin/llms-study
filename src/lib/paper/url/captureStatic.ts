@@ -209,9 +209,44 @@ function isTracker(el: Element): boolean {
   return (Number.isFinite(w) && w <= 1) || (Number.isFinite(h) && h <= 1) || el.hasAttribute('hidden')
 }
 
+const IMAGE_EXT_RE = /\.(?:svg|png|jpe?g|gif|webp|avif)$/i
+
+/** `object[data]` / `embed[src]` 是否指向图片：type 以 image/ 开头，或 URL 路径（去掉 ?/#）以图片扩展名结尾 */
+function isImageEmbed(el: Element, url: string): boolean {
+  if (/^image\//i.test((el.getAttribute('type') ?? '').trim())) return true
+  return IMAGE_EXT_RE.test(url.split('#')[0].split('?')[0])
+}
+
+/**
+ * 指向图片的 `<object data>` / `<embed src>` 提升为 `<img>`：LaTeXML 把 arXiv 的矢量图写成
+ * `<object type="image/svg+xml" data="x.svg">`，不转换就会被 replaceMedia 换成「[嵌入内容]」，图全丢。
+ * src 先原样搬过来，随后 absolutizeUrls 按文档基准统一绝对化（尊重 `<base>`）；id/class/style/尺寸/title
+ * 一并保留，alt 取备用文字。追踪像素尺寸的直接删；非图片的嵌入不动，仍归 replaceMedia 出占位。
+ * export：extractArticle.ts 的阅读模式预处理复用同一条规则（那边由 img 循环负责绝对化）。
+ */
+export function promoteImageEmbeds(doc: Document): void {
+  for (const el of Array.from(doc.querySelectorAll('object[data], embed[src]'))) {
+    const url = (el.getAttribute(el.localName === 'object' ? 'data' : 'src') ?? '').trim()
+    if (!url || !isImageEmbed(el, url)) continue
+    if (isTracker(el)) {
+      el.remove()
+      continue
+    }
+    const img = doc.createElement('img')
+    img.setAttribute('src', url)
+    for (const attr of ['id', 'class', 'style', 'width', 'height', 'title']) {
+      const v = el.getAttribute(attr)
+      if (v) img.setAttribute(attr, v)
+    }
+    img.setAttribute('alt', (el.textContent ?? '').trim())
+    el.replaceWith(img)
+  }
+}
+
 /**
  * 不能固化的媒体：video → poster 图（有 poster）或「[视频：文件名]」占位；
- * audio → 「[音频]」；iframe/object/embed → 「[嵌入内容]」；canvas（静态路径拿不到像素）→ 「[嵌入内容]」。
+ * audio → 「[音频]」；iframe 与非图片的 object/embed（图片的已由 promoteImageEmbeds 转成 img）→ 「[嵌入内容]」；
+ * canvas（静态路径拿不到像素）→ 「[嵌入内容]」。
  * 占位是 `div.pc-placeholder[data-pc-placeholder=<kind>]`，阅读器有对应样式。
  */
 function replaceMedia(doc: Document, base: string): void {
@@ -288,6 +323,7 @@ export function preprocessFidelity(doc: Document, finalUrl: string): void {
   const base = resolveDocumentBase(doc, finalUrl)
   unwrapPictures(doc)
   promoteLazyImages(doc)
+  promoteImageEmbeds(doc)
   absolutizeUrls(doc, base)
   replaceMedia(doc, base)
   removeNoise(doc)
