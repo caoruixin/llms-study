@@ -156,6 +156,9 @@ export function isPageActive(page: number, range: PageRange | null, window: numb
   return page >= r.min - window && page <= r.max + window
 }
 
+/** 程序化对齐（目录跳转 / 重开续读 / 切视图）时目标元素顶边离阅读窗格顶边的留白：16px = `scroll-mt-4` */
+export const READER_ALIGN_MARGIN = 16
+
 /**
  * 容器内滚动定位：把目标元素顶边对齐到滚动容器视口顶边下 margin 处，返回容器应设的 scrollTop。
  *
@@ -166,9 +169,14 @@ export function isPageActive(page: number, range: PageRange | null, window: numb
  * @param scrollTop 容器当前 scrollTop
  * @param elTop 目标元素顶边（视口坐标，getBoundingClientRect().top）
  * @param viewportTop 容器滚动视口顶边（视口坐标，含 clientTop 边框修正）
- * @param margin 顶部留白，默认 16 = scroll-mt-4
+ * @param margin 顶部留白，默认 READER_ALIGN_MARGIN（16 = scroll-mt-4）
  */
-export function readerScrollTop(scrollTop: number, elTop: number, viewportTop: number, margin: number = 16): number {
+export function readerScrollTop(
+  scrollTop: number,
+  elTop: number,
+  viewportTop: number,
+  margin: number = READER_ALIGN_MARGIN,
+): number {
   // 元素与容器顶边的相对偏移在滚动中保持不变，所以目标 scrollTop 是简单的平移；负值钳到 0
   return Math.max(0, scrollTop + (elTop - viewportTop) - margin)
 }

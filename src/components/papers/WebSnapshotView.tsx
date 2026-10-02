@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import katexCssUrl from 'katex/dist/katex.min.css?url'
 import type { LlmAuthCode } from '../../lib/llmClient'
-import { CURRENT_PAGE_EPSILON, readerScrollTop } from '../../lib/paper/anchors'
+import { readerScrollTop } from '../../lib/paper/anchors'
 import type { LangMode, PaperBlock, PaperHighlight } from '../../lib/paper/types'
 import { decodeWebSnapshot, type WebSnapshotHeader } from '../../lib/paper/url/webSnapshot'
 import { flashElement } from './ReaderContext'
 import type { SelectionSource } from './SelectionActions'
 import {
   READER_STYLE_ID,
+  SNAPSHOT_BAND_INSET,
   applyHighlights,
   applyLangState,
   buildReaderSrcdoc,
+  currentBlockRootMargin,
   hostRectInParent,
   pickLinkAction,
   stampScrollers,
@@ -28,7 +30,8 @@ import {
  * 高度由 iframe 自己窗口的 ResizeObserver 观察 documentElement 同步过来。
  *
  * 观察器建在**父窗口**（root 隐式 = 顶层视口；规范要求 root 与 target 同文档，不能传 main），
- * 祖先链 main 的 overflow 裁剪已计入交集，两个观察器与 rootMargin 语义照 BlockReader。
+ * 祖先链 main 的 overflow 裁剪已计入交集。语义照 BlockReader，但 rootMargin 不能照抄：那边的
+ * root 是 main，这边是浏览器视口，「当前块」的观察带要按 main 的实时几何换算（currentBlockRootMargin）。
  *
  * 译文/高亮/链接/跳转全部委托 snapshotDom.ts 的纯 DOM 函数；本组件只管生命周期与事件。
  */
@@ -117,6 +120,8 @@ export default function WebSnapshotView({
   const [srcdoc, setSrcdoc] = useState<string | null>(null)
   /** 每次 iframe 文档载入并绑定后 +1：依赖它的 effect 才会去碰新文档 */
   const [docTick, setDocTick] = useState(0)
+  /** 「当前块」观察器的 rootMargin（按 main 的实时几何换算）；null = main 不可见，不建观察器 */
+  const [bandMargin, setBandMargin] = useState<string | null>(null)
 
   // 回调走 ref：文档绑定发生在 load 时，不因回调引用变化重绑
   const callbacks = useRef({ onRetryTranslation, onReady, onSelectionSource, onMarkClick, onNavigate, onError })
@@ -357,10 +362,45 @@ export default function WebSnapshotView({
     applyHighlights(bound.doc, highlights ?? EMPTY_HIGHLIGHTS)
   }, [docTick, blocks, langMode, translations, failedTranslations, translationAuthIssue, highlights])
 
-  // 当前块：只统计「视口上 1/4 区域」内的块，顶边内缩 CURRENT_PAGE_EPSILON（语义同 BlockReader）
+  /**
+   * 「当前块」观察带跟着阅读窗格（main）的几何走，否则它会落到 main 之外，当前块就此冻住
+   * （见 currentBlockRootMargin）。重算时机：main 改尺寸、窗口改尺寸、任何滚动。main 只挪位置不改尺寸
+   * （头部换行把它整体顶下去）时没有事件可挂，带子会旧到下一次滚动才追上——滚动正是需要它准的时候。
+   * 带子没变不 setState，滚动零重渲染。
+   */
+  useEffect(() => {
+    const main = containerRef.current
+    if (!main) return
+    let last: string | null | undefined
+    const update = () => {
+      const next = currentBlockRootMargin(
+        main.getBoundingClientRect().top + main.clientTop,
+        main.clientHeight,
+        document.documentElement.clientHeight || window.innerHeight,
+        SNAPSHOT_BAND_INSET,
+      )
+      if (next === last) return
+      last = next
+      setBandMargin(next)
+    }
+    update()
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update)
+    ro?.observe(main)
+    window.addEventListener('resize', update)
+    // capture：scroll 不冒泡。main 自己滚、页面整体滚（main 位置变了而尺寸没变）都从这里过
+    window.addEventListener('scroll', update, { capture: true, passive: true })
+    return () => {
+      ro?.disconnect()
+      window.removeEventListener('resize', update)
+      window.removeEventListener('scroll', update, true)
+    }
+    // docTick：文档绑定后再量一次（首帧 main 可能还没排版完）
+  }, [containerRef, docTick])
+
+  // 当前块：只统计「阅读窗格上 1/4 区域」内的块，顶边内缩 SNAPSHOT_BAND_INSET（语义同 BlockReader，内缩更大的原因见常量注释）
   useEffect(() => {
     const bound = boundRef.current
-    if (!bound || docTick === 0 || !blocks.length) return
+    if (!bound || docTick === 0 || !blocks.length || bandMargin === null) return
     const visible = new Set<number>()
     const io = new IntersectionObserver(
       (entries) => {
@@ -372,11 +412,11 @@ export default function WebSnapshotView({
         }
         if (visible.size) onVisibleBlock(Math.min(...visible))
       },
-      { rootMargin: `-${CURRENT_PAGE_EPSILON}px 0px -75% 0px`, threshold: 0 },
+      { rootMargin: bandMargin, threshold: 0 },
     )
     for (const el of bound.doc.querySelectorAll('[data-pc-block]')) io.observe(el)
     return () => io.disconnect()
-  }, [docTick, blocks.length, onVisibleBlock])
+  }, [docTick, blocks.length, onVisibleBlock, bandMargin])
 
   // 第二观察器：全视口可见块区间（语音陪读用）；onVisibleRange 缺省时完全不建
   useEffect(() => {
