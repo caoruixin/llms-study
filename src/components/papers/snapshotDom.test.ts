@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeAll, describe, expect, it } from 'vitest'
+import { READER_ALIGN_MARGIN } from '../../lib/paper/anchors'
 import type { NormalizedBlock, PaperHighlight } from '../../lib/paper/types'
 import type { WebSnapshotHeader, WebSnapshotInput } from '../../lib/paper/url/webSnapshot'
 
@@ -416,6 +417,67 @@ describe('hostRectInParent', () => {
     el.getBoundingClientRect = () => ({ top: 10, left: 5, bottom: 30, right: 55, width: 50, height: 20 }) as DOMRect
     expect(mod.hostRectInParent(iframe, el)).toEqual({ top: 111, left: 27, bottom: 131, right: 77, width: 50, height: 20 })
     iframe.remove()
+  })
+})
+
+describe('currentBlockRootMargin', () => {
+  /** rootMargin → 顶层视口坐标下的观察带 [top, bottom]（隐式 root = 视口 [0, viewportHeight]） */
+  const band = (margin: string | null, viewportHeight: number): [number, number] => {
+    if (margin === null) throw new Error('观察带为空')
+    const [top, , bottom] = margin.split(' ').map((s) => Number.parseFloat(s))
+    return [0 - top, viewportHeight + bottom]
+  }
+
+  it('回归：矮窗口下观察带仍落在阅读窗格里（1000×674，窗格顶边 225）', () => {
+    // 旧写法 `-8px 0px -75% 0px` 量的是浏览器视口的上 1/4 = [8, 168.5]，整条在窗格 [225, 673] 上方：
+    // 没有块能进带，当前块冻住，译文窗口不跟滚动走，屏幕上的骨架永远等不到译文
+    expect(674 * 0.25).toBeLessThan(225)
+    const margin = mod.currentBlockRootMargin(225, 448, 674, 8)
+    expect(margin).toBe('-233px 0px -337px 0px')
+    expect(band(margin, 674)).toEqual([225 + 8, 225 + 448 / 4])
+  })
+
+  it('任意几何：带子恒为「窗格上 1/4、顶边内缩 epsilon」，不随视口高与窗格位置跑到窗格外', () => {
+    const cases = [
+      [147, 720, 868],
+      [190, 484, 674],
+      [172, 671, 844],
+      [225, 974, 1200],
+      [300.4, 401.7, 702],
+    ]
+    for (const [paneTop, paneHeight, viewport] of cases) {
+      const [top, bottom] = band(mod.currentBlockRootMargin(paneTop, paneHeight, viewport, 8), viewport)
+      expect(top).toBe(Math.round(paneTop + 8))
+      expect(bottom).toBe(Math.round(paneTop + paneHeight * 0.25))
+      expect(top).toBeGreaterThanOrEqual(paneTop)
+      expect(bottom).toBeLessThanOrEqual(paneTop + paneHeight)
+      expect(bottom).toBeGreaterThan(top)
+    }
+  })
+
+  it('窗格占满视口时退化成 BlockReader 那句 -8px / -75%', () => {
+    expect(mod.currentBlockRootMargin(0, 800, 800, 8)).toBe('-8px 0px -600px 0px')
+  })
+
+  it('取整到 px、四段齐全（rootMargin 只收 px / %）', () => {
+    expect(mod.currentBlockRootMargin(300.4, 401.7, 702, 8)).toMatch(/^-?\d+px 0px -?\d+px 0px$/)
+    // 顶边恰为 0：不写出 "-0px"
+    expect(mod.currentBlockRootMargin(-8, 800, 800, 8)).toBe('0px 0px -608px 0px')
+  })
+
+  it('内缩量大于程序化对齐的顶部留白：对齐后的上一块进不了带，重开/切视图不会一格一格往回走', () => {
+    // 回归：对齐后目标块顶边在窗格顶边下 16px；块间距为 0（arXiv 参考文献条目）时上一块的底边也在这条线上。
+    // 内缩 8 时它仍在带里，min 取到上一块——实测停在 248 存成 247，重开 4 次退到 243
+    expect(mod.SNAPSHOT_BAND_INSET).toBeGreaterThan(READER_ALIGN_MARGIN)
+    const [top] = band(mod.currentBlockRootMargin(225, 448, 674, mod.SNAPSHOT_BAND_INSET), 674)
+    expect(top).toBeGreaterThan(225 + READER_ALIGN_MARGIN)
+  })
+
+  it('窗格不可见（display:none，高度 0）或带高不为正：返回 null，调用方不建观察器', () => {
+    expect(mod.currentBlockRootMargin(0, 0, 800, 8)).toBeNull()
+    expect(mod.currentBlockRootMargin(100, 20, 800, 8)).toBeNull() // 1/4 高 5px < epsilon
+    expect(mod.currentBlockRootMargin(Number.NaN, 400, 800, 8)).toBeNull()
+    expect(mod.currentBlockRootMargin(100, 400, 0, 8)).toBeNull()
   })
 })
 

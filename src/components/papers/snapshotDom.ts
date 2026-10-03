@@ -1,4 +1,5 @@
 import type { LlmAuthCode } from '../../lib/llmClient'
+import { READER_ALIGN_MARGIN } from '../../lib/paper/anchors'
 import { validRanges } from '../../lib/paper/highlight/highlightModel'
 import { isTranslatableBlock } from '../../lib/paper/translate/translateBatch'
 import type { LangMode, NormalizedBlock, PaperHighlight } from '../../lib/paper/types'
@@ -548,6 +549,47 @@ export function hostRectInParent(iframe: HTMLIFrameElement, el: Element): Parent
   const dx = frame.left + iframe.clientLeft
   const dy = frame.top + iframe.clientTop
   return { top: r.top + dy, left: r.left + dx, bottom: r.bottom + dy, right: r.right + dx, width: r.width, height: r.height }
+}
+
+/** 「当前块」观察带占阅读窗格可视高度的比例：上 1/4（与 BlockReader 的 `-75%` 同一口径） */
+export const CURRENT_BLOCK_BAND_RATIO = 0.25
+
+/**
+ * 「当前块」观察带的顶边内缩量。必须**大于**程序化对齐的顶部留白（READER_ALIGN_MARGIN）：
+ * 对齐后目标块顶边在窗格顶边下 16px，上一块的底边不会低过这条线。BlockReader 的块间距恒 ≥ 12px，
+ * 内缩 8（CURRENT_PAGE_EPSILON）就够；快照里的块间距由站点 CSS 决定，可以是 0（列表项、参考文献条目，
+ * arXiv 那篇 259 个间距里 78 个 ≤ 8px）。内缩不过对齐留白，上一块就还在带里，`min` 取到它，当前块倒退一格；
+ * 每次重开/切视图又按倒退后的位置再对齐，阅读位置就一格一格往回走。
+ */
+export const SNAPSHOT_BAND_INSET = READER_ALIGN_MARGIN + 2
+
+/**
+ * 「当前块」观察带 → 父窗口 IntersectionObserver 的 rootMargin。
+ *
+ * 快照的块在 iframe 文档里，观察器的 root 只能是隐式的**顶层视口**（规范要求显式 root 与 target 同文档），
+ * rootMargin 因此是相对浏览器视口算的，不是相对阅读窗格（main）。BlockReader 那句 `-8px 0px -75% 0px`
+ * 原样搬过来，量的就成了「浏览器视口的上 1/4」：main 的顶边在导航 + 标题 + 工具行之下，窗口一矮
+ * （或工具行一换行）它就整个落在这条带子下面，再没有块能进带——当前块冻住，目录高亮与阅读进度不动，
+ * 译文窗口（当前块 −4…+16）不再跟着滚动走，屏幕上的骨架永远等不到译文。
+ *
+ * 这里把「main 的上 1/4、顶边内缩 epsilon」换算成视口坐标下的内缩量（epsilon 传 SNAPSHOT_BAND_INSET）：
+ * - paneTop / paneHeight：main 内容盒顶边的视口坐标与可视高度（`getBoundingClientRect().top + clientTop`、`clientHeight`）；
+ * - viewportHeight：顶层视口高。
+ * 取整到 px（rootMargin 只收 px / %）。main 不可见（display:none，高度 0）或带高不为正时返回 null：
+ * 此时没有「当前块」可言，调用方不建观察器。
+ */
+export function currentBlockRootMargin(
+  paneTop: number,
+  paneHeight: number,
+  viewportHeight: number,
+  epsilon: number,
+): string | null {
+  if (![paneTop, paneHeight, viewportHeight].every(Number.isFinite) || paneHeight <= 0 || viewportHeight <= 0) return null
+  const bandTop = Math.round(paneTop + epsilon)
+  const bandBottom = Math.round(paneTop + paneHeight * CURRENT_BLOCK_BAND_RATIO)
+  if (bandBottom <= bandTop) return null
+  // 负值 = 向内收：顶边下移到 bandTop，底边上移到 bandBottom
+  return `${-bandTop}px 0px ${bandBottom - Math.round(viewportHeight)}px 0px`
 }
 
 export type LinkAction = { kind: 'fragment'; id: string } | { kind: 'external'; href: string } | { kind: 'ignore' }

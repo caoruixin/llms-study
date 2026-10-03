@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -50,5 +51,26 @@ describe('WebSnapshotView 安全护栏', () => {
     const html = render(new Uint8Array([1, 2, 3]).buffer as ArrayBuffer)
     expect(html).not.toContain('<iframe')
     expect(html).toContain('无法解析')
+  })
+})
+
+/**
+ * 接线护栏（源码级，沿 captureAgent.test.ts 断言函数体字面量的先例）：「当前块」观察器建在父窗口、
+ * root 是隐式的顶层视口，rootMargin 必须由阅读窗格的实时几何换算（currentBlockRootMargin → bandMargin）。
+ * 写死成 `-8px 0px -75% 0px` 量的是浏览器视口的上 1/4：窗口一矮带子就落到窗格之外，当前块冻住，
+ * 译文窗口不再跟着滚动走（屏幕上的骨架永远等不到译文）。node 环境没有布局，effect 也不跑，
+ * 真实行为由 .e2e-qa-fixtures/diag-translate-window.mjs 在浏览器里验；这里只防那句字面量被改回来。
+ */
+describe('WebSnapshotView「当前块」观察带护栏', () => {
+  const src = readFileSync(new URL('./WebSnapshotView.tsx', import.meta.url), 'utf8')
+
+  it('观察带按阅读窗格换算，并用专属内缩量', () => {
+    expect(src).toMatch(/currentBlockRootMargin\(/)
+    expect(src).toMatch(/SNAPSHOT_BAND_INSET,\s*\)/)
+    expect(src).toMatch(/rootMargin:\s*bandMargin\b/)
+  })
+
+  it('任何观察器都不写相对视口的百分比 rootMargin', () => {
+    expect(src).not.toMatch(/rootMargin:\s*[`'"][^`'"]*%/)
   })
 })
