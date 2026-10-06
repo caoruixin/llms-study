@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { SyncTable } from '../../../../shared/apiTypes'
-import { PAPER_TASKS, buildStructuredFallbackSpec } from '../../../data/paperPolicy'
+import { PAPER_CIRCUIT, PAPER_TASKS, buildStructuredFallbackSpec } from '../../../data/paperPolicy'
 import { LlmError, type LlmAuthCode } from '../../llmClient'
 import { GatewayError, type ModelGateway } from '../modelGateway'
 import { getPaperGateway } from '../gatewaySingleton'
@@ -18,13 +18,19 @@ import {
 } from './translateBatch'
 
 /**
- * 全文翻译的调度层：内存 Map 缓存、单飞行逐包串行、窗口重算、失败对分与 Dexie 读写。
+ * 全文翻译的调度层：内存 Map 缓存、单飞行逐包串行、窗口重算、失败对分、熔断暂停到点自动续上与 Dexie 读写。
  * 调度器（createTranslationScheduler）不含 React，依赖全部注入，node 环境直接单测；
  * useTranslations 是薄 hook 外壳：接线真实 gateway/repo/consent 并做 300ms 防抖。
  */
 
 /** 窗口重算防抖：滚动中 position.blockIndex 高频变化，稳定 300ms 才出包 */
 export const WINDOW_DEBOUNCE_MS = 300
+
+/**
+ * 熔断暂停的恢复余量：网关按 openUntil > now 判定仍在冷却，定时器要比 remainingMs 晚一点再续，
+ * 别正好踩在到期边界上又被拒一次（那只会白换一个定时器，但没必要）
+ */
+export const CIRCUIT_RESUME_SLACK_MS = 500
 
 export interface TranslationSnapshot {
   /** blockIndex → 已完成译文（缺席 = 骨架态） */
@@ -63,9 +69,15 @@ export function createTranslationScheduler(opts: {
   paper: Pick<PaperRecord, 'id' | 'sensitive'>
   blocks: readonly PaperBlock[]
   deps: TranslationSchedulerDeps
+  /**
+   * 出包顺序开关：true = 当前块起往后在前、回看在后（只在有滚动锚定兜底的场合成立），false = 文档顺序。
+   * 每次重算时读——同一个调度器存续期间视图可能切换，不必为此重建。缺省恒真
+   */
+  aheadFirst?: () => boolean
   onChange: (snap: TranslationSnapshot) => void
 }): TranslationScheduler {
   const { paper, blocks, deps } = opts
+  const aheadFirst = opts.aheadFirst ?? (() => true)
   const now = deps.now ?? (() => Date.now())
   const blockByIndex = new Map<number, PaperBlock>()
   for (const b of blocks) blockByIndex.set(b.index, b)
@@ -81,8 +93,17 @@ export function createTranslationScheduler(opts: {
   let currentIndex = 0
   let running = false
   let disposed = false
-  /** 授权被拒 / 网关级失败（熔断等）后停机：骨架保留，重试或再激活恢复 */
+  /**
+   * 要用户动作才能解除的停机：授权被拒、敏感 / 未授权（GatewayError）、账号 auth 失败。
+   * 骨架保留，retryBlock 或再激活恢复。熔断不走这里——它有期限，见 pauseTimer
+   */
   let halted = false
+  /**
+   * 熔断暂停定时器：circuit-open 不停机也不标失败，按网关给的剩余冷却时长暂停，到点自动
+   * recompute + schedule 续上。「定时器在手」即「暂停中」，二者永远一致，任何时刻最多一个；
+   * activate / retryBlock 先把它清掉再立即重试，dispose 清掉后到点绝不再出包
+   */
+  let pauseTimer: ReturnType<typeof setTimeout> | null = null
   /** auth 失败细分码（未登录/未配 key）：随停机记录，重试/再激活清除 */
   let authIssue: LlmAuthCode | null = null
   let consentOk = false
@@ -125,9 +146,12 @@ export function createTranslationScheduler(opts: {
   }
 
   const recompute = () => {
-    const items = planTranslationWindow(blocks, currentIndex, {
-      has: (i) => texts.has(i) || failed.has(i) || inFlight.has(i),
-    }).filter((it) => it.piece === undefined || !pieceBuf.get(it.blockIndex)?.has(it.piece))
+    const items = planTranslationWindow(
+      blocks,
+      currentIndex,
+      { has: (i) => texts.has(i) || failed.has(i) || inFlight.has(i) },
+      aheadFirst() ? 'ahead-first' : 'document',
+    ).filter((it) => it.piece === undefined || !pieceBuf.get(it.blockIndex)?.has(it.piece))
     queue = packBatches(items)
   }
 
@@ -190,12 +214,34 @@ export function createTranslationScheduler(opts: {
     emit()
   }
 
+  const paused = () => pauseTimer !== null
+
+  const clearPause = () => {
+    if (pauseTimer === null) return
+    clearTimeout(pauseTimer)
+    pauseTimer = null
+  }
+
+  /** 熔断暂停：先清旧定时器再设新的（任何时刻最多一个），到点未 dispose 就按最新窗口续上 */
+  const pauseFor = (ms: number) => {
+    // 网关是在 await 之后才抛的：这个空当里若已 dispose，别再挂一个最长 5 分钟的空定时器
+    if (disposed) return
+    clearPause()
+    pauseTimer = setTimeout(() => {
+      pauseTimer = null
+      if (disposed) return
+      recompute()
+      schedule()
+    }, ms)
+  }
+
   /**
    * 单包执行：gateway 内部已带 validate→同模型修复→兜底阶梯；仍对不齐时在这里
    * 对分递归隔离坏条目，最终单条失败才标记块级 error。
    */
   const runBatch = async (batch: TranslateItem[]): Promise<void> => {
-    if (disposed || halted) return
+    // 暂停中也不出包：对分递归里前半包撞上熔断，后半包别再去碰网关
+    if (disposed || halted || paused()) return
     const expectedKeys = batch.map((it) => translateItemKey(it.blockIndex, it.piece))
     let parsed: unknown
     try {
@@ -211,7 +257,14 @@ export function createTranslationScheduler(opts: {
       parsed = res.parsed
     } catch (e) {
       if (e instanceof GatewayError) {
-        // 熔断/敏感/未授权：整体停机保骨架（standalone 重试或再激活恢复），不刷一屏失败 chip
+        if (e.kind === 'circuit-open') {
+          // 熔断是有期限的（网关按 provider 冷却，对话/brief 的失败也会连带熔断翻译）：
+          // 不停机、不标失败，骨架保留；这包的块随 drain 的 finally 移出 inFlight，
+          // 暂停到点按最新窗口重新规划。网关在发请求之前就抛，这里没花钱
+          pauseFor((e.remainingMs ?? PAPER_CIRCUIT.cooldownMs) + CIRCUIT_RESUME_SLACK_MS)
+          return
+        }
+        // 敏感 / 未授权：要用户动作才能解除，整体停机保骨架（retryBlock 或再激活恢复），不刷一屏失败 chip
         halted = true
         return
       }
@@ -242,12 +295,12 @@ export function createTranslationScheduler(opts: {
   const drain = async () => {
     running = true
     try {
-      while (!disposed && !halted && queue.length) {
+      while (!disposed && !halted && !paused() && queue.length) {
         // 每轮出包前宏任务让位：drain 是 fire-and-forget，微任务续体总排在
         // 「await activate() 后同步调 dispose()/setWindow()」的调用方之前，
         // 不让位的话首包会抢在 dispose 前发出。让位后世界可能已变，重查再走。
         await new Promise((resolve) => setTimeout(resolve, 0))
-        if (disposed || halted || !queue.length) break
+        if (disposed || halted || paused() || !queue.length) break
         if (!consentOk) {
           consentOk = await deps.ensureConsent()
           if (!consentOk) {
@@ -272,14 +325,18 @@ export function createTranslationScheduler(opts: {
   }
 
   const schedule = () => {
-    if (running || disposed || halted || paper.sensitive) return
+    // 暂停中不出包：窗口变化只重算队列（setWindow / reload 照常 recompute），到点或用户动作再出
+    if (running || disposed || halted || paused() || paper.sensitive) return
     if (queue.length) void drain()
   }
 
   return {
     async activate() {
       if (disposed) return
-      halted = false // 再激活给拒绝授权/熔断后的用户一次重来机会
+      // 再激活给拒绝授权/熔断后的用户一次重来机会：熔断暂停不等到点，立即试一次；
+      // 冷却未过网关会在发请求之前再抛 circuit-open，届时换一个新定时器
+      clearPause()
+      halted = false
       authIssue = null
       loadPromise ??= load()
       await loadPromise
@@ -310,6 +367,7 @@ export function createTranslationScheduler(opts: {
     },
     retryBlock(blockIndex) {
       if (disposed) return
+      clearPause() // 用户主动重试：不等熔断到点，立即试一次（同 activate）
       failed.delete(blockIndex)
       halted = false
       authIssue = null // 用户可能已去设置页配好 key，给一次干净重试
@@ -320,6 +378,7 @@ export function createTranslationScheduler(opts: {
     },
     dispose() {
       disposed = true
+      clearPause() // 到点后绝不再出包
       queue = []
     },
   }
@@ -353,11 +412,16 @@ export function useTranslations(opts: {
   blocks: PaperBlock[]
   langMode: LangMode
   currentBlockIndex: number
+  /** 出包顺序：true = 当前块起往后在前（要有滚动锚定兜底），false = 文档顺序；缺省 true。变化不重建调度器 */
+  aheadFirst?: boolean
 }): UseTranslationsResult {
-  const { paper, blocks, langMode, currentBlockIndex } = opts
+  const { paper, blocks, langMode, currentBlockIndex, aheadFirst = true } = opts
   const [snapshot, setSnapshot] = useState<TranslationSnapshot>(EMPTY_SNAPSHOT)
   const [consentAsk, setConsentAsk] = useState<((granted: boolean) => void) | null>(null)
   const schedulerRef = useRef<TranslationScheduler | null>(null)
+  // 出包顺序放 ref：调度器每次重算时读最新值，视图切换（原貌 ↔ 文本）不必重建调度器、不丢在飞行的包
+  const aheadFirstRef = useRef(aheadFirst)
+  aheadFirstRef.current = aheadFirst
 
   // 换论文/blocks 重载时重建调度器（创建是零 IO 的，activate 才读库出包）
   useEffect(() => {
@@ -386,6 +450,7 @@ export function useTranslations(opts: {
           })
         },
       },
+      aheadFirst: () => aheadFirstRef.current,
       onChange: setSnapshot,
     })
     schedulerRef.current = scheduler

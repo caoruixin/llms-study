@@ -1,12 +1,19 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { PAPER_CIRCUIT } from '../../../data/paperPolicy'
 import { LlmError } from '../../llmClient'
 import { GatewayError, type CompletePaperJsonRequest, type CompletePaperJsonResult } from '../modelGateway'
-import { createTranslationScheduler, isPulledFor, type TranslationSchedulerDeps, type TranslationSnapshot } from './useTranslations'
+import {
+  CIRCUIT_RESUME_SLACK_MS,
+  createTranslationScheduler,
+  isPulledFor,
+  type TranslationSchedulerDeps,
+  type TranslationSnapshot,
+} from './useTranslations'
 import { TRANSLATE_PROMPT_VERSION, srcHash } from './translateBatch'
 import type { BlockTranslation, PaperBlock } from '../types'
 
 /**
- * 调度层测试：stub gateway 验证单飞行、失败对分、consent 停机与 sensitive 静默。
+ * 调度层测试：stub gateway 验证单飞行、失败对分、consent 停机、sensitive 静默与熔断暂停自动恢复（假时钟）。
  * gateway 契约按真实实现模拟：validate(raw) 的结果就是 parsed（修复阶梯在 gateway 内部，
  * stub 一次给出终局——返回能过校验的 raw = 成功，返回垃圾 = 修复兜底全失败 parsed null）。
  */
@@ -51,7 +58,27 @@ function okRaw(req: CompletePaperJsonRequest): string {
   })
 }
 
-type Responder = (req: CompletePaperJsonRequest, call: number) => string | Error
+/** 响应可以是 Promise：用例需要把网关挂起、再决定何时成功/失败时用 */
+type Responder = (req: CompletePaperJsonRequest, call: number) => string | Error | Promise<string | Error>
+
+/** 从请求 user 消息反解本包的块序号（按包内顺序） */
+const requestedIndices = (req: CompletePaperJsonRequest): number[] =>
+  (JSON.parse(req.messages[1].content) as { items: { i: number }[] }).items.map((it) => it.i)
+
+/** 网关在发请求之前抛出的熔断错误（checkBreaker 口径：带剩余冷却毫秒；不带则调度器按 PAPER_CIRCUIT 兜底） */
+const circuitOpen = (remainingMs?: number): GatewayError => {
+  const e = new GatewayError('circuit-open', 'deepseek', '熔断中')
+  if (remainingMs !== undefined) e.remainingMs = remainingMs
+  return e
+}
+
+/**
+ * 假时钟版 settle：drain 每轮让位的 setTimeout(0) 若是在 tick 内创建的，fake-timers 记成 now+1，
+ * 推 0ms 永远轮不到它，所以每步推 1ms。40 步 = 40ms 假时间，远小于任何熔断冷却，不会误触暂停定时器
+ */
+const settleFake = async (tries = 40) => {
+  for (let i = 0; i < tries; i++) await vi.advanceTimersByTimeAsync(1)
+}
 
 function makeHarness(opts: {
   blocks: PaperBlock[]
@@ -59,6 +86,8 @@ function makeHarness(opts: {
   cached?: BlockTranslation[]
   consent?: () => Promise<boolean>
   sensitive?: boolean
+  /** 出包顺序开关（调度器每次重算时读）；缺省恒真 */
+  aheadFirst?: () => boolean
 }) {
   const calls: CompletePaperJsonRequest[] = []
   let inFlight = 0
@@ -76,7 +105,7 @@ function makeHarness(opts: {
         inFlight += 1
         maxConcurrent = Math.max(maxConcurrent, inFlight)
         await Promise.resolve() // 让并发（若有）有机会暴露
-        const r = respond(req, calls.length - 1)
+        const r = await respond(req, calls.length - 1)
         inFlight -= 1
         if (r instanceof Error) throw r
         const parsed = req.validate ? req.validate(r) : r
@@ -109,6 +138,7 @@ function makeHarness(opts: {
     paper: { id: 'p1', sensitive: opts.sensitive ?? false },
     blocks: opts.blocks,
     deps,
+    aheadFirst: opts.aheadFirst,
     onChange: (s) => {
       snapshot = s
     },
@@ -290,23 +320,8 @@ describe('createTranslationScheduler', () => {
     expect(h.consentAsks).toBe(0)
   })
 
-  it('GatewayError（熔断等）→ 整体停机保骨架，不刷失败标记', async () => {
-    const blocks = [blk(0, 'a'), blk(1, 'b')]
-    const h = makeHarness({
-      blocks,
-      respond: () => new GatewayError('circuit-open', 'deepseek', '熔断中'),
-    })
-
-    await h.scheduler.activate()
-    h.scheduler.setWindow(0)
-    await h.settle()
-
-    expect(h.calls).toHaveLength(1)
-    expect(h.snapshot.failed.size).toBe(0)
-    h.scheduler.setWindow(1)
-    await h.settle()
-    expect(h.calls).toHaveLength(1) // 停机后不再出包
-  })
+  // GatewayError 分两种口径：circuit-open 是带期限的暂停（见下方「熔断暂停（假时钟）」）；
+  // no-consent / sensitive-blocked 要用户动作才能解除，永久停机（同一组用例里对照）
 
   it('auth 失败（no-user-key）→ 停机 + 该包标失败 + authIssue 记码；retryBlock 清码后恢复', async () => {
     const blocks = [blk(0, 'a'), blk(1, 'b')]
@@ -421,6 +436,248 @@ describe('createTranslationScheduler', () => {
     const before = h.snapshot
     await h.scheduler.reload()
     expect(h.snapshot).toBe(before)
+  })
+
+  // PLAN 2.2：出包顺序按视图有无滚动锚定兜底切换——没有兜底（WebKit 的文本视图）保持文档顺序
+  it('aheadFirst 为 false 按文档顺序出包（首包从回看块起）；同一调度器中途翻成 true，下一次 setWindow 后按新顺序', async () => {
+    // 每块 1800 字符 ≈ 600 token → 每包 3 条；窗口 21 块 → 7 包
+    const blocks = Array.from({ length: 60 }, (_, i) => blk(i, `text-${i} `.padEnd(1800, 'x')))
+    let aheadFirst = false
+    const h = makeHarness({ blocks, aheadFirst: () => aheadFirst })
+
+    h.scheduler.setWindow(10)
+    await h.scheduler.activate()
+    await h.settle()
+    expect(h.calls).toHaveLength(7)
+    expect(requestedIndices(h.calls[0])).toEqual([6, 7, 8]) // 文档顺序：回看块在前
+    expect(requestedIndices(h.calls[6])).toEqual([24, 25, 26])
+
+    aheadFirst = true // 视图切到有锚定兜底的场合：同一个调度器，不重建
+    h.scheduler.setWindow(40)
+    await h.settle()
+    expect(h.calls).toHaveLength(14)
+    expect(requestedIndices(h.calls[7])).toEqual([40, 41, 42]) // 当前块起往后在前
+    expect(requestedIndices(h.calls[13])).toEqual([37, 38, 39]) // 回看块排在最后
+    for (let i = 36; i <= 56; i++) expect(h.snapshot.texts.get(i)).toBe(`译${i}#-`)
+  })
+
+  // PLAN 2.3：熔断（circuit-open）不再整体停机——按网关给的剩余冷却时长暂停，到点自动续上。
+  // 全部走假时钟：真定时器下 5 分钟冷却跑不动，且 vi.getTimerCount() 能直接数出暂停定时器
+  describe('熔断暂停（假时钟）', () => {
+    type Harness = ReturnType<typeof makeHarness>
+    /** 两种用户动作都应立即解除暂停 / 停机 */
+    const resumeWays = [
+      { name: 'retryBlock', resume: (h: Harness) => h.scheduler.retryBlock(0) },
+      { name: 'activate', resume: (h: Harness) => h.scheduler.activate() },
+    ]
+
+    beforeEach(() => vi.useFakeTimers())
+    afterEach(() => vi.useRealTimers())
+
+    it('circuit-open → 不停机不标失败、骨架保留；冷却到点自动续上，按最新窗口把缺译块译完', async () => {
+      const blocks = Array.from({ length: 30 }, (_, i) => blk(i, `t${i}`))
+      let open = true
+      const h = makeHarness({ blocks, respond: (req) => (open ? circuitOpen(60_000) : okRaw(req)) })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+
+      expect(h.calls).toHaveLength(1)
+      expect(h.snapshot.failed.size).toBe(0) // 骨架态，不是失败态
+      expect(h.snapshot.texts.size).toBe(0)
+      expect(vi.getTimerCount()).toBe(1) // 只剩暂停定时器：drain 已退出，没有让位定时器挂着
+
+      // 暂停期间窗口变化只重算队列，不出包
+      h.scheduler.setWindow(20)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+
+      // 冷却还差一截：仍不出包（settle 累计只花了几十毫秒假时间）
+      await vi.advanceTimersByTimeAsync(60_000 - 1_000)
+      expect(h.calls).toHaveLength(1)
+
+      // 到点（含余量）：自动续上，按最新窗口 [16, 29] 出包，早已离屏的 0..15 不翻
+      open = false
+      await vi.advanceTimersByTimeAsync(1_000 + CIRCUIT_RESUME_SLACK_MS + 100)
+      await settleFake()
+      expect(h.calls).toHaveLength(2)
+      for (let i = 16; i <= 29; i++) expect(h.snapshot.texts.get(i)).toBe(`译${i}#-`)
+      expect(h.snapshot.texts.has(15)).toBe(false)
+      expect(h.snapshot.failed.size).toBe(0)
+      expect(vi.getTimerCount()).toBe(0) // 定时器用完即清，没有遗留
+    })
+
+    it('circuit-open 不带 remainingMs：按 PAPER_CIRCUIT.cooldownMs 兜底暂停', async () => {
+      const blocks = [blk(0, 'a')]
+      let open = true
+      const h = makeHarness({ blocks, respond: (req) => (open ? circuitOpen() : okRaw(req)) })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+
+      open = false
+      await vi.advanceTimersByTimeAsync(PAPER_CIRCUIT.cooldownMs - 1_000)
+      expect(h.calls).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1_000 + CIRCUIT_RESUME_SLACK_MS + 100)
+      await settleFake()
+      expect(h.calls).toHaveLength(2)
+      expect(h.snapshot.texts.get(0)).toBe('译0#-')
+    })
+
+    it('请求在途时 dispose、网关随后才抛 circuit-open：不挂暂停定时器，到点也不出包', async () => {
+      const blocks = [blk(0, 'a'), blk(1, 'b')]
+      let release!: (r: string | Error) => void
+      const gate = new Promise<string | Error>((resolve) => {
+        release = resolve
+      })
+      const h = makeHarness({ blocks, respond: () => gate })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(1) // 首包已发出，网关挂起中
+      expect(vi.getTimerCount()).toBe(0)
+
+      h.scheduler.dispose()
+      release(circuitOpen(60_000)) // dispose 之后网关才以熔断拒绝
+      await settleFake()
+      expect(vi.getTimerCount()).toBe(0) // 没有挂上空定时器
+      expect(h.snapshot.failed.size).toBe(0)
+
+      await vi.advanceTimersByTimeAsync(60_000 + CIRCUIT_RESUME_SLACK_MS + 1_000)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+    })
+
+    it('暂停期间 dispose：定时器清掉，到点后不再出包', async () => {
+      const blocks = [blk(0, 'a'), blk(1, 'b')]
+      const h = makeHarness({ blocks, respond: () => circuitOpen(60_000) })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(1)
+
+      h.scheduler.dispose()
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(60_000 + CIRCUIT_RESUME_SLACK_MS + 1_000)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+    })
+
+    it.each(resumeWays)('暂停期间 $name：清掉定时器立即恢复（网关已可用），不留重复/遗留的暂停定时器', async ({ resume }) => {
+      const blocks = [blk(0, 'a'), blk(1, 'b')]
+      let open = true
+      const h = makeHarness({ blocks, respond: (req) => (open ? circuitOpen(60_000) : okRaw(req)) })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(1)
+
+      open = false
+      await resume(h)
+      await settleFake()
+      expect(h.calls).toHaveLength(2) // 没等冷却到点
+      expect(h.snapshot.texts.size).toBe(2)
+      expect(h.snapshot.failed.size).toBe(0)
+      expect(vi.getTimerCount()).toBe(0) // 暂停定时器已清，没有遗留
+
+      // 原定到点时刻过去也不会再来一发
+      await vi.advanceTimersByTimeAsync(60_000 + CIRCUIT_RESUME_SLACK_MS + 1_000)
+      await settleFake()
+      expect(h.calls).toHaveLength(2)
+    })
+
+    it('熔断未过时 retryBlock：网关再抛 circuit-open → 只换一个新定时器，按新的 remainingMs 到点续上', async () => {
+      const blocks = [blk(0, 'a'), blk(1, 'b')]
+      let remaining: number | null = 60_000
+      const h = makeHarness({ blocks, respond: (req) => (remaining === null ? okRaw(req) : circuitOpen(remaining)) })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(1)
+
+      remaining = 5_000 // 第二次撞上的是更短的剩余冷却
+      h.scheduler.retryBlock(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(2) // 立即试了一次，网关在发请求之前再抛
+      expect(h.snapshot.failed.size).toBe(0)
+      expect(vi.getTimerCount()).toBe(1) // 换了一个新定时器，不是叠成两个
+
+      // 新定时器按 5s 到点（旧的 60s 已作废）
+      remaining = null
+      await vi.advanceTimersByTimeAsync(5_000 + CIRCUIT_RESUME_SLACK_MS + 100)
+      await settleFake()
+      expect(h.calls).toHaveLength(3)
+      expect(h.snapshot.texts.size).toBe(2)
+      expect(vi.getTimerCount()).toBe(0)
+
+      // 旧定时器的到点时刻过去也不会再来一发
+      await vi.advanceTimersByTimeAsync(60_000)
+      await settleFake()
+      expect(h.calls).toHaveLength(3)
+    })
+
+    it('对分递归里前半包撞上熔断：后半包不再碰网关，到点后整包重新规划', async () => {
+      const blocks = [blk(0, 'a'), blk(1, 'b')]
+      let open = true
+      const h = makeHarness({
+        blocks,
+        // 整包对不齐 → 对分；[0] 撞熔断 → 暂停；[1] 直接跳过
+        respond: (req, call) => (call === 0 ? 'not a json at all' : open ? circuitOpen(60_000) : okRaw(req)),
+      })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(2) // 不是 3：暂停中后半包没出
+      expect(h.snapshot.failed.size).toBe(0)
+      expect(vi.getTimerCount()).toBe(1)
+
+      open = false
+      await vi.advanceTimersByTimeAsync(60_000 + CIRCUIT_RESUME_SLACK_MS + 100)
+      await settleFake()
+      expect(h.calls).toHaveLength(3) // 到点后 [0,1] 作为一包重新规划
+      expect(h.snapshot.texts.get(0)).toBe('译0#-')
+      expect(h.snapshot.texts.get(1)).toBe('译1#-')
+    })
+
+    it.each(
+      (['no-consent', 'sensitive-blocked'] as const).flatMap((kind) => resumeWays.map((w) => ({ kind, ...w }))),
+    )('$kind → 永久停机保骨架：无暂停定时器，时间推多久都不出包，直到 $name 才恢复', async ({ kind, resume }) => {
+      const blocks = [blk(0, 'a'), blk(1, 'b')]
+      let blocked = true
+      const h = makeHarness({
+        blocks,
+        respond: (req) => (blocked ? new GatewayError(kind, 'deepseek', '拒绝') : okRaw(req)),
+      })
+
+      await h.scheduler.activate()
+      h.scheduler.setWindow(0)
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+      expect(h.snapshot.failed.size).toBe(0) // 骨架态，不刷失败 chip
+      expect(vi.getTimerCount()).toBe(0) // 不是暂停：没有定时器会来自动恢复
+
+      h.scheduler.setWindow(1)
+      await vi.advanceTimersByTimeAsync(10 * PAPER_CIRCUIT.cooldownMs)
+      await settleFake()
+      expect(h.calls).toHaveLength(1) // 停机后不再出包
+
+      blocked = false
+      await resume(h)
+      await settleFake()
+      expect(h.calls).toHaveLength(2)
+      expect(h.snapshot.texts.size).toBe(2)
+    })
   })
 })
 

@@ -592,6 +592,417 @@ export function currentBlockRootMargin(
   return `${-bandTop}px 0px ${bandBottom - Math.round(viewportHeight)}px 0px`
 }
 
+// ---------------------------------------------------------------------------
+// 跨 iframe 滚动锚定：坐标与锚点规则
+// ---------------------------------------------------------------------------
+
+/** iframe 文档坐标里的一段纵向区间：`getBoundingClientRect()` 再加 iframe 窗口的 scrollY */
+export interface DocSpan {
+  top: number
+  bottom: number
+}
+
+/**
+ * 元素在 iframe 文档坐标里的上下边。iframe 文档不内滚，scrollY 正常恒为 0；照加不误，防的是焦点/页内查找把它的视口挪了。
+ * 宽高都为 0 = 没有布局（display:none、zh 模式下随外层原文被包进 `.pc-orig[hidden]` 的块）：坐标没有意义，返回 null。
+ */
+export function docSpanOf(el: Element, scrollY: number): DocSpan | null {
+  const r = el.getBoundingClientRect()
+  if (r.width === 0 && r.height === 0) return null
+  return { top: r.top + scrollY, bottom: r.bottom + scrollY }
+}
+
+/** 阅读窗格（main 的滚动视口，含 clientTop 边框修正）在 iframe 文档坐标里的上下边 */
+export function paneSpanInFrame(main: Element, iframe: HTMLIFrameElement, scrollY: number): DocSpan {
+  const paneTop = main.getBoundingClientRect().top + main.clientTop
+  const frame = iframe.getBoundingClientRect()
+  const top = paneTop - (frame.top + iframe.clientTop) + scrollY
+  return { top, bottom: top + main.clientHeight }
+}
+
+/**
+ * 跨 iframe 滚动锚定选哪一块当锚点（WebSnapshotView 的 A/B 两路共用）。返回 `spans` 的下标，没有返回 -1（不补偿）。
+ *
+ * 为什么要自己锚：iframe 不内滚、整篇在 main 里滚，浏览器原生的 scroll anchoring 看不进 iframe——main 里能当锚点的
+ * 只有 iframe 元素本身。iframe 文档里视口上方任何内容变高变矮（回看块的译文落地、切语言一次性挂上全部缓存译文、
+ * 「中文」把原文包进 `.pc-orig[hidden]`），都会把正在读的内容整体推走。
+ *
+ * 规则（坐标一律是 iframe 文档坐标；`probe` = 窗格顶 + SNAPSHOT_BAND_INSET，与「当前块」观察带同口径）：
+ * 1. 优先取**包含探测线**的块（`top ≤ probe < bottom`）；有多个（嵌套）时取 top 最大的最内层，top 相同取文档序靠后者；
+ * 2. 否则取顶边落在 `(probe, viewBottom)` 里、top 最小的块；
+ * 3. 都没有返回 -1。`spans` 按文档序给出，null（没有布局的块）跳过。
+ *
+ * 两个关键场景：
+ * - 目录跳转：第 N 块顶边对齐在窗格顶 +16px（READER_ALIGN_MARGIN），探测线在 +18 → 锚 N；第 N−1 块底边 ≤ +16，选不中。
+ *   若锚「第一个底边低于窗格顶的块」会选中 N−1——N−1 自己的译文挂在它底部，一挂上 N 就被推走；
+ * - 顺读：正在读的块 K 跨着窗格顶 → 锚 K。K 的译文挂在它底部往下推后文，正在读的那几行不动（同原生锚定的手感）。
+ */
+export function pickScrollAnchor(spans: readonly (DocSpan | null | undefined)[], probe: number, viewBottom: number): number {
+  let inside = -1
+  let insideTop = -Infinity
+  let below = -1
+  let belowTop = Infinity
+  for (let i = 0; i < spans.length; i++) {
+    const s = spans[i]
+    if (!s) continue
+    if (s.top <= probe && probe < s.bottom) {
+      // >=：top 相同取文档序靠后者（嵌套时它在里层）
+      if (s.top >= insideTop) {
+        inside = i
+        insideTop = s.top
+      }
+    } else if (s.top > probe && s.top < viewBottom && s.top < belowTop) {
+      below = i
+      belowTop = s.top
+    }
+  }
+  return inside >= 0 ? inside : below
+}
+
+/**
+ * 在 iframe 文档里按 pickScrollAnchor 的规则选锚点块：`pane` 是阅读窗格在 iframe 文档坐标里的上下边（paneSpanInFrame），
+ * 探测线 = 窗格顶 + SNAPSHOT_BAND_INSET。返回宿主元素、它的文档坐标顶边，以及它是不是按规则 1 选中的
+ * （`contained`：此刻包含探测线）；窗格里没有可用的块返回 null。
+ */
+export function findScrollAnchor(
+  doc: Document,
+  pane: DocSpan,
+  scrollY: number,
+): { el: Element; top: number; contained: boolean } | null {
+  const els = Array.from(doc.querySelectorAll(`[${STAMP_ATTR}]`))
+  const spans = els.map((el) => docSpanOf(el, scrollY))
+  const probe = pane.top + SNAPSHOT_BAND_INSET
+  const i = pickScrollAnchor(spans, probe, pane.bottom)
+  const el = els[i]
+  const span = spans[i]
+  return el && span ? { el, top: span.top, contained: span.top <= probe && probe < span.bottom } : null
+}
+
+// ---------------------------------------------------------------------------
+// 锚点补偿的判定（WebSnapshotView 只管读 DOM / 写 scrollTop，怎么算全在这里，node 单测）
+// ---------------------------------------------------------------------------
+
+/** 锚点位移小于它不补偿（亚像素噪声） */
+export const ANCHOR_EPSILON_PX = 0.5
+
+/** 一条锚点记录里与滚动位置有关的两个数：读回来的 scrollTop，与未取整的理想 scrollTop */
+export interface IdealScroll {
+  scrollTop: number
+  ideal: number
+}
+
+/**
+ * 新记录的理想 scrollTop：上一条记录仍新鲜（scrollTop 自记录以来没动过，差 <1px）就沿用它的理想值，否则以读回值重新起算。
+ *
+ * 为什么要有「理想值」：WebKit 的 scrollTop 只存整数且**向下截断**。每次补偿写 `读回值 + d`，写进去又被截掉小数，
+ * 再拿读回的整数当下一次的基准——每补偿一次丢约 0.5px，块单向下漂。对齐留白 16、探测线 18，只有 2px 余量，
+ * 漂过去锚点就翻到上一块（实测第 320 块 16.7 → 17 → 17.9 → 18 → −137）。按未取整的理想值累计，误差恒 <1px。
+ */
+export function inheritIdealScrollTop(actual: number, prev: IdealScroll | null | undefined): number {
+  return prev && Math.abs(actual - prev.scrollTop) < 1 ? prev.ideal : actual
+}
+
+/**
+ * 写入之后理想值怎么记：读回与想写的差不到 1px 只是被取整，保留想写的值；否则是被钳位了（到顶 / 到底），以读回值为准。
+ */
+export function resolveIdealScrollTop(wanted: number, actual: number): number {
+  return Math.abs(actual - wanted) < 1 ? wanted : actual
+}
+
+/**
+ * 塌缩重对齐要追加的滚动量（加到 scrollTop 上，负值 = 往回滚）；不需要时返回 0。
+ *
+ * 锚点块原本包含探测线（规则 1），改动后它自己变矮——读到段落中部时切「中文」而译文还没缓存，原文收起只剩骨架——
+ * 顶边虽然被补偿留在原处，底边却到了探测线之上：探测线落到后面的块上，当前块前移、阅读位置跟着跑。
+ * 这时改为把它的顶边对齐到窗格顶 + alignMargin（与程序化对齐同一口径），探测线仍落在它身上。
+ *
+ * @param offsetTop 块顶边相对窗格顶的偏移（补偿会保持它不变）
+ * @param height 块此刻的高度
+ */
+export function collapseRealign(
+  offsetTop: number,
+  height: number,
+  probeInset: number = SNAPSHOT_BAND_INSET,
+  alignMargin: number = READER_ALIGN_MARGIN,
+): number {
+  return offsetTop + height <= probeInset ? offsetTop - alignMargin : 0
+}
+
+/** 补偿判定需要的锚点记录字段 */
+export interface AnchorState {
+  /** 记录时锚点块在 iframe 文档坐标里的顶边 */
+  docTop: number
+  /** 记录时它的顶边相对窗格顶的偏移 */
+  offsetTop: number
+  /** 按规则 1 选中（记录时包含探测线） */
+  contained: boolean
+  /** 记录时未取整的理想 scrollTop */
+  ideal: number
+}
+
+/**
+ * 按记录补偿该把 scrollTop 写成多少：锚点块在文档里挪了多少，main 就跟着滚多少，再叠加塌缩重对齐。
+ * 用**记录里的理想值**算绝对值——iframe 变矮时浏览器可能先钳位了 main.scrollTop，按现值去加会算错；负值截到 0，
+ * 超上限交给浏览器钳位。总位移不到 ANCHOR_EPSILON_PX 返回 null（不写）。
+ */
+export function anchorRestoreTarget(a: AnchorState, now: DocSpan): { top: number; realigned: boolean } | null {
+  const shift = now.top - a.docTop
+  const realign = a.contained ? collapseRealign(a.offsetTop, now.bottom - now.top) : 0
+  if (Math.abs(shift + realign) < ANCHOR_EPSILON_PX) return null
+  return { top: Math.max(0, a.ideal + shift + realign), realigned: realign !== 0 }
+}
+
+/** 共享锚点记录此刻能不能拿来补偿：没有记录 / 已过期 / 平滑跳转进行中（不补，记录留着）/ 可用 */
+export type SharedRecordVerdict = 'none' | 'stale' | 'smooth' | 'use'
+
+/**
+ * 共享锚点记录还能不能用来补偿「记录之后发生的外部重排」（B 的 RO 回调与 A 现量锚点之前共用同一口径）：
+ * - 没有记录，或拿不到容器的 scrollTop → 'none'；
+ * - scrollTop 与记录差 ≥1px → 'stale'：记录之后滚动过（用户滚动；程序化滚动刚写过、scroll 事件还没派发），
+ *   按它去补会把那次滚动抵消掉，调用方应作废记录；
+ * - 平滑跳转进行中 → 'smooth'：不写 scrollTop（会打断动画），记录留着；
+ * - 其余 → 'use'。
+ * 过期先于平滑跳转判定：跳转途中 scrollTop 一直在变，记录本来就该作废。
+ */
+export function sharedRecordVerdict(
+  rec: { scrollTop: number } | null | undefined,
+  scrollTop: number | null | undefined,
+  smoothActive: boolean,
+): SharedRecordVerdict {
+  if (!rec || scrollTop === null || scrollTop === undefined) return 'none'
+  if (Math.abs(scrollTop - rec.scrollTop) >= 1) return 'stale'
+  return smoothActive ? 'smooth' : 'use'
+}
+
+/** 「改 DOM + 锚定」这一串动作里要碰 DOM 的各步（WebSnapshotView 给真实现，单测给模型） */
+export interface AnchoredMutationSteps<A> {
+  /** 按共享记录把「上次记录之后、还没补偿的外部重排」补掉（记录不可用就什么都不做） */
+  compensatePending(): void
+  /** 现量锚点；窗格里没有可锚的块返回 null */
+  capture(): A | null
+  /** 改 DOM */
+  mutate(): void
+  /** 同步 iframe 高度 */
+  syncHeight(): void
+  /** 按锚点位移补偿 */
+  restore(anchor: A): void
+  /** 收尾：刷新共享记录。`anchor` 是刚补偿过的那条，新记录要继承它未取整的理想值 */
+  commit(anchor: A | null): void
+}
+
+/**
+ * A 的时序（没有平滑跳转在进行时）。这个函数的全部内容就是顺序：
+ *
+ * 1. **先补偿待处理的外部重排，再现量锚点。** B 靠 iframe 的 ResizeObserver，回调要等下一次渲染才来；React 的 effect
+ *    可能抢在它前面。现量会强制排版，量到的是已经被外部重排推偏的位置——把它当成既成事实去锚，还顺手刷新了共享记录，
+ *    随后 B 到来时位移为 0，不补，块就停在偏了的地方。全应用 WebKit「中文」带缓存重开 2/94 次：续读对齐后字体换上，
+ *    上方矮了 52px，块停在 −35.5px；每来一次还会累计（16.4 → 25.1 → 33.8 → …）。
+ * 2. 现量在改 DOM 之前；改完先同步高度再补偿（高度没跟上就写 scrollTop 会被钳位）。
+ */
+export function runAnchoredMutation<A>(steps: AnchoredMutationSteps<A>): void {
+  steps.compensatePending()
+  const anchor = steps.capture()
+  steps.mutate()
+  steps.syncHeight()
+  if (anchor) steps.restore(anchor)
+  steps.commit(anchor)
+}
+
+// ---------------------------------------------------------------------------
+// 平滑跳转、滚动来源与暂缓的判定
+// ---------------------------------------------------------------------------
+
+/**
+ * 平滑跳转发起时目标是否已在原位（截到最大滚动位置后的目标与当前 scrollTop 差 <1px）：这时不会有任何 scroll 事件，
+ * 调用方要自己起静止计时来结束跳转状态。其余情况**不能**在发起时起计时——工作台点目录是先发起滚动、再触发整页同步重渲染，
+ * 主线程一卡过静止时长，计时器就先于第一个 scroll 事件到点，把还没动的跳转判成结束（随后的落地按锚点去补，
+ * 把动画掐在半路，实测最终偏出一万多像素）。等第一个 scroll 事件来起计时，另有时长上限兜底。
+ */
+export function smoothStartsInPlace(target: number, current: number, maxScroll: number): boolean {
+  return Math.abs(Math.min(target, Math.max(0, maxScroll)) - current) < 1
+}
+
+/** 平滑跳转的逼近进度：`dist` 是离目标的距离（逼近中记最小值），`approaching` 表示已经开始变近 */
+export interface SmoothProgress {
+  dist: number | null
+  approaching: boolean
+}
+
+/** 发起 / 重新瞄准时的初始进度：目标变了，距离从头量 */
+export const SMOOTH_PROGRESS_START: SmoothProgress = { dist: null, approaching: false }
+
+/** 逼近中离目标又变远超过它，判定用户已接管 */
+export const SMOOTH_DIVERGE_PX = 2
+
+/**
+ * 平滑跳转进行中的每个 scroll 事件喂一次「离目标的距离」，判断用户是不是已经接管了滚动。
+ *
+ * 为什么需要：WebKit 不给无脚本沙箱文档派发父窗口挂的监听，iframe 里的滚轮 / 触摸 / 按键全收不到，跳转状态会一直留到
+ * 静止或时长上限，期间落地的改动被「重新瞄准」拽回目标。动画只会让距离变小；逼近中距离反而变大（超过 SMOOTH_DIVERGE_PX），
+ * 只可能是用户在往别处滚。
+ *
+ * 为什么要等「开始变近」才判：对一个进行中的平滑滚动重新瞄准到身后的目标时，两个引擎都会先沿旧方向再走一帧
+ * （实测 Chromium +192px、WebKit +627px）才掉头——自己重新瞄准后的头几个事件里距离本来就在变大，不能算接管。
+ */
+export function trackSmoothProgress(p: SmoothProgress, dist: number): { progress: SmoothProgress; takenOver: boolean } {
+  if (p.dist === null) return { progress: { dist, approaching: false }, takenOver: false }
+  if (!p.approaching) return { progress: { dist, approaching: dist < p.dist - 0.5 }, takenOver: false }
+  if (dist > p.dist + SMOOTH_DIVERGE_PX) return { progress: p, takenOver: true }
+  return { progress: { dist: Math.min(p.dist, dist), approaching: true }, takenOver: false }
+}
+
+/** main 的一次 scroll 事件是谁滚的 */
+export type ScrollSource = 'smooth' | 'own' | 'native'
+
+/**
+ * 区分滚动来源：有进行中的平滑跳转 → 不算原生；否则 scrollTop 与组件自己最后写入的值（读回值）差 <1px → 自己写的
+ * （补偿、瞬时对齐、滚轮转发桥、同步高度后的复位）；其余是用户的原生滚动（触摸惯性、键盘翻页、拖滚动条、WebKit 的原生滚轮）。
+ */
+export function classifyScroll(scrollTop: number, ownWrite: number | null, smoothActive: boolean): ScrollSource {
+  if (smoothActive) return 'smooth'
+  return ownWrite !== null && Math.abs(scrollTop - ownWrite) < 1 ? 'own' : 'native'
+}
+
+/**
+ * 这次 DOM 改动要不要暂缓到滚动停稳再落。
+ *
+ * 用户的原生滚动由浏览器的滚动线程 / 滚动动画驱动，途中写 scrollTop 会被它按旧位置覆盖：WebKit 键盘 PageDown 途中落地译文，
+ * 翻页被截断（只滚 126px，正常 408px），参考块被下推 603px，补偿整个丢了；原生滚轮则是闪两帧。所以原生滚动刚发生过
+ * （距今不到 holdMs）就先不改 DOM，停稳后带着锚定一起落。平滑跳转进行中不暂缓（那条路径只重新瞄准、不写 scrollTop）；
+ * 窗格不可见时没有位置可言，直接应用。holdMs 必须小于静止时长，否则停稳时的冲刷自己也会被暂缓。
+ */
+export function shouldHoldMutation(input: {
+  smooth: boolean
+  paneVisible: boolean
+  sinceNativeMs: number
+  holdMs: number
+}): boolean {
+  return !input.smooth && input.paneVisible && input.sinceNativeMs < input.holdMs
+}
+
+// ---------------------------------------------------------------------------
+// iframe 高度：两段式、内容尺寸跟着视口走（耦合）、整次同步的编排
+// ---------------------------------------------------------------------------
+
+/** iframe 高度的一次测量（全在 iframe 文档里量） */
+export interface FrameHeightProbe {
+  /** 流内内容高 = max(html 的 rect 高, body.scrollHeight)：两者都是 auto 高，没有视口下限 */
+  inFlow: number
+  /** html.scrollHeight：含绝对定位溢出（只反映在它上面），但永远不小于 iframe 当前视口高——是下限，不是测量值 */
+  scroll: number
+  /** html.clientHeight：iframe 当前的视口高（= 当前 iframe 高度） */
+  view: number
+}
+
+export interface FrameHeightStep {
+  height: number
+  /** true = 这是一次降高：调用方写入后要再量一次（降下来才看得出绝对定位版式有没有溢出） */
+  recheck: boolean
+}
+
+/**
+ * iframe 高度的单段判定（syncFrameHeight 编排两段）：
+ * - `scroll > view + 1`：内容溢出当前高度，取 scroll（含绝对定位溢出）；
+ * - 否则内容装得下，scroll 只是视口下限：inFlow 与 view 差不到 1px 就维持现高；明显更矮则降到 inFlow 并要求复查——
+ *   调用方写入后（同一任务里，没有中间帧）再量一次，此时 scroll 溢出（绝对定位版式）就取第二次的 scroll。
+ *
+ * 原先取 `max(html.scrollHeight, …)`：根元素的 scrollHeight 不小于 iframe 视口高，iframe 只增不减，
+ * 「对照 → 原文」后底部留下上万像素空白。
+ *
+ * 绝对定位溢出撑着高度时，稳态下 scroll 恰等于 view，单段分不清这是视口下限还是真实溢出，所以每次都会复查一遍；
+ * 两段在同一任务里落回同一高度（没有中间帧，不会跨帧振荡）。中间那次降高可能让外层滚动容器被钳位，
+ * 由 WebSnapshotView 的 syncHeight 在量完后把 scrollTop 放回去。
+ */
+export function frameHeightPass({ inFlow, scroll, view }: FrameHeightProbe): FrameHeightStep {
+  // 与 inFlow 取大：scrollHeight 是四舍五入的整数，流内高度带小数时它可能比向上取整的 inFlow 少 1px，最后那点内容不能裁掉
+  if (scroll > view + 1) return { height: Math.max(scroll, inFlow), recheck: false }
+  if (inFlow >= view - 1) return { height: Math.max(view, inFlow), recheck: false }
+  return { height: inFlow, recheck: true }
+}
+
+/**
+ * 内容尺寸跟着 iframe 视口走的量：视口每长高 1px，内容也跟着长 1px，所以量出来总比视口多出固定的一截。
+ * 两种形态：
+ * - (i) 溢出跟着视口：`position:absolute; bottom:-200px`（包含块是初始包含块）永远挂在视口底边下方 → 只有 scrollExtra；
+ * - (ii) 流内高度跟着视口：正文容器 `min-height:100vh` 后面还跟着页脚 → 文档高 = max(正文, 视口) + 页脚，两个量都有。
+ *   vh 本该在水合时钉死（neutralizeViewportUnits），但导入时样式表抓取失败会回落成 `@import url(远程)`，远程文本改不到。
+ */
+export interface FrameCoupling {
+  /** 流内高度比视口多出的部分（形态 ii；形态 i 为 0） */
+  inFlowExtra: number
+  /** scrollHeight 比视口多出的部分 */
+  scrollExtra: number
+}
+
+/**
+ * 刚把高度写成量到的值之后，同一任务里再量一次：扣掉已知的耦合量还溢出（>1px），只可能是内容尺寸跟着视口走——
+ * 同步过程中没有别的东西在变。返回按这次测量记下的耦合量；不溢出则原样返回 `known`（没有耦合就是 null）。
+ *
+ * 不认这个的后果：每同步一次高度就往上棘轮一截，永远追不上。形态 (ii) 每个 RO 回合涨一截，直到高度上限，
+ * 正文区一片空白（实测每 250ms 涨约 5000px）；形态 (i) 每落一包译文涨 200px，切回原文也缩不回。
+ * 合法的绝对定位溢出（`top:6000px`）不随视口动，撑到它的底边就不再溢出，不会被判成耦合。
+ * `known` 非空时用于复查：耦合量自己变了（页脚换行变高）也会表现成「长完还想长」，改记新量即可。
+ */
+export function probeViewportCoupling(after: FrameHeightProbe, known: FrameCoupling | null): FrameCoupling | null {
+  const residual = Math.max(
+    after.inFlow - after.view - (known?.inFlowExtra ?? 0),
+    after.scroll - after.view - (known?.scrollExtra ?? 0),
+  )
+  if (residual <= 1) return known
+  return { inFlowExtra: Math.max(0, after.inFlow - after.view), scrollExtra: Math.max(0, after.scroll - after.view) }
+}
+
+/**
+ * 耦合模式下的一步，返回该有的高度（等于 `view` 即维持现高）：
+ * - 扣掉耦合量之后还多出 >1px：内容真的变多了，只长这一截；
+ * - 否则，流内不耦合（形态 i）且流内高度明显小于视口：降到流内高度——切回原文能缩回；
+ * - 其余维持现高。形态 (ii) 下「流内高度」本身含着视口，分不出正文到底多高，所以只长不缩，页脚也会落在视口之外被裁掉：
+ *   这是可以接受的降级（正文完整、不再失控）。彻底的修法是运行期把跟着视口走的元素钉住，不在这里做。
+ */
+export function coupledFrameHeight({ inFlow, scroll, view }: FrameHeightProbe, c: FrameCoupling): number {
+  const grow = Math.max(inFlow - view - c.inFlowExtra, scroll - view - c.scrollExtra)
+  if (grow > 1) return view + grow
+  if (c.inFlowExtra <= 1 && inFlow < view - 1) return inFlow
+  return view
+}
+
+/** 高度同步要用到的两个动作（WebSnapshotView 给真实现，单测给布局模型） */
+export interface FrameHeightIO {
+  /** 在 iframe 文档里量一次 */
+  measure(): FrameHeightProbe
+  /** 写入 iframe 高度，返回写完后实际生效的高度（调用方可能按上限截断，或因差不到 1px 没写） */
+  write(height: number): number
+}
+
+/**
+ * 同步一次 iframe 高度（全在同一个任务里，没有中间帧），返回此后这份文档的耦合量（null = 不耦合）。
+ * - 不耦合：两段式（frameHeightPass）。凡是按 scroll 撑高之后——包括第二段——再量一次探测耦合；探到了就按耦合模式收尾一步
+ *   （形态 i 首次同步时把刚才多撑的那截还回去）。写入被上限截断时不探测：截断后必然还溢出，那不是耦合。
+ * - 已耦合：只走 coupledFrameHeight；长高之后复查耦合量有没有变。
+ */
+export function syncFrameHeight(io: FrameHeightIO, coupling: FrameCoupling | null): FrameCoupling | null {
+  if (coupling) {
+    const probe = io.measure()
+    const height = coupledFrameHeight(probe, coupling)
+    if (height === probe.view) return coupling
+    const wrote = io.write(height)
+    return height > probe.view && wrote === height ? probeViewportCoupling(io.measure(), coupling) : coupling
+  }
+  let probe = io.measure()
+  let step = frameHeightPass(probe)
+  let wrote = io.write(step.height)
+  if (step.recheck) {
+    probe = io.measure()
+    step = frameHeightPass(probe)
+    wrote = io.write(step.height)
+  }
+  if (step.height <= probe.view + 1 || wrote !== step.height) return null
+  const after = io.measure()
+  const found = probeViewportCoupling(after, null)
+  if (found) io.write(coupledFrameHeight(after, found))
+  return found
+}
+
 export type LinkAction = { kind: 'fragment'; id: string } | { kind: 'external'; href: string } | { kind: 'ignore' }
 
 const sameDocument = (a: URL, b: URL): boolean => a.origin === b.origin && a.pathname === b.pathname && a.search === b.search
