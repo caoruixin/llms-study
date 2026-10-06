@@ -59,6 +59,13 @@ import { isHollow, needsRemotePull } from './workbenchLoad'
 const PROGRESS_DEBOUNCE_MS = 600
 const TOAST_MS = 2600
 
+/**
+ * 浏览器有没有原生滚动锚定（overflow-anchor）：Chromium / Firefox 有，WebKit（Safari / iOS）没有。
+ * 文本视图里回看块的译文落地会推走正文，只有原生锚定能兜住——据此决定翻译出包顺序（useTranslations.aheadFirst）
+ */
+const HAS_NATIVE_SCROLL_ANCHORING =
+  typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('overflow-anchor', 'auto')
+
 /** Copilot 面板懒加载（§4.7）：react-markdown + KaTeX（JS/CSS/字体）只在首次展开面板时拉取 */
 const CopilotPanel = lazy(() => import('../../components/papers/CopilotPanel'))
 
@@ -583,7 +590,15 @@ export default function PaperWorkbenchPage() {
     authIssue: translationAuthIssue,
     retryBlock,
     consentAsk,
-  } = useTranslations({ paper, blocks, langMode, currentBlockIndex: position.blockIndex })
+  } = useTranslations({
+    paper,
+    blocks,
+    langMode,
+    currentBlockIndex: position.blockIndex,
+    // 「当前块起往后在前、回看在后」只在有锚定兜底时用：网页原貌视图有跨 iframe 锚定（PLAN 2.1），
+    // 文本视图靠浏览器原生 overflow-anchor；其余场合（WebKit 的文本视图）保持文档顺序，别让位移挪到读一半才跳
+    aheadFirst: (mode === 'original' && isSnapshot) || HAS_NATIVE_SCROLL_ANCHORING,
+  })
   const translationEstimate = useMemo(() => estimateTranslationCost(blocks, DEEPSEEK_V4_PRO.pricing), [blocks])
 
   useEffect(() => {

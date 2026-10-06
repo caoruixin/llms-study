@@ -91,21 +91,46 @@ describe('planTranslationWindow', () => {
   const blocks = Array.from({ length: 41 }, (_, i) => blk(i, 'paragraph', `para ${i}`))
   const noCache = { has: () => false }
 
-  it('窗口 = 当前块前 4 后 16', () => {
+  it('窗口 = 当前块前 4 后 16；出包顺序：当前块起往后在前，回看块排在最后', () => {
     const items = planTranslationWindow(blocks, 10, noCache)
-    expect(items.map((it) => it.blockIndex)).toEqual(Array.from({ length: 21 }, (_, i) => i + 6))
+    expect(items.map((it) => it.blockIndex)).toEqual([...Array.from({ length: 17 }, (_, i) => i + 10), 6, 7, 8, 9])
   })
 
-  it('文档头部：窗口向前钳位到 0', () => {
+  it('文档头部：窗口向前钳位到 0（没有回看块，顺序即文档顺序）', () => {
     const items = planTranslationWindow(blocks, 0, noCache)
-    expect(items[0].blockIndex).toBe(0)
-    expect(items[items.length - 1].blockIndex).toBe(16)
+    expect(items.map((it) => it.blockIndex)).toEqual(Array.from({ length: 17 }, (_, i) => i))
   })
 
-  it('文档尾部：窗口向后钳位到末块', () => {
+  it('文档尾部：窗口向后钳位到末块，回看块仍排在当前块之后', () => {
     const items = planTranslationWindow(blocks, 40, noCache)
-    expect(items[0].blockIndex).toBe(36)
-    expect(items[items.length - 1].blockIndex).toBe(40)
+    expect(items.map((it) => it.blockIndex)).toEqual([40, 36, 37, 38, 39])
+  })
+
+  // PLAN 2.2：跳到没译过的地方时，屏幕从当前块往下先译——回看块别占首包额度
+  it('跳到没译过的地方：打包后首包从当前块排起，回看块落在最后几包的末尾', () => {
+    // 800 字符 ≈ 267 token：6 条 1602 ≤ 1800，第 7 条 1869 超限另起 → 每包 6 条；
+    // 窗口 [16, 36] 共 21 条 → 20..36 + 16..19 打成 4 包
+    const paras = Array.from({ length: 41 }, (_, i) => blk(i, 'paragraph', 'w'.repeat(800)))
+    const batches = packBatches(planTranslationWindow(paras, 20, noCache)).map((b) => b.map((it) => it.blockIndex))
+    expect(batches).toHaveLength(4)
+    expect(batches[0]).toEqual([20, 21, 22, 23, 24, 25])
+    const flat = batches.flat()
+    expect(flat).toHaveLength(21)
+    expect(flat.slice(-4)).toEqual([16, 17, 18, 19])
+    expect(flat.slice(0, 17)).toEqual(Array.from({ length: 17 }, (_, i) => i + 20))
+  })
+
+  it('顺读：回看块都已缓存时，条目只剩当前块往后缺的那些，仍按文档顺序', () => {
+    const cached = new Set([16, 17, 18, 19, 20, 21])
+    const items = planTranslationWindow(blocks, 20, cached)
+    expect(items.map((it) => it.blockIndex)).toEqual(Array.from({ length: 15 }, (_, i) => i + 22))
+  })
+
+  // 没有滚动锚定兜底的场合（WebKit 的文本视图）：保持文档顺序，回看块在前
+  it("order = 'document'：文档顺序，回看块在前；显式 'ahead-first' 与缺省一致", () => {
+    const doc = planTranslationWindow(blocks, 10, noCache, 'document')
+    expect(doc.map((it) => it.blockIndex)).toEqual(Array.from({ length: 21 }, (_, i) => i + 6))
+    expect(planTranslationWindow(blocks, 10, noCache, 'ahead-first')).toEqual(planTranslationWindow(blocks, 10, noCache))
   })
 
   it('已缓存/不可译/空白块都跳过', () => {
@@ -128,6 +153,16 @@ describe('planTranslationWindow', () => {
     expect(items.map((it) => it.piece)).toEqual(items.map((_, i) => i))
     expect(items.every((it) => it.blockIndex === 7)).toBe(true)
     expect(items.map((it) => it.text).join('')).toBe(long)
+  })
+
+  it('回看组里的长块：分片整体挪到后面，仍连续有序', () => {
+    const long = 'z'.repeat(9200)
+    const items = planTranslationWindow([blk(5, 'paragraph', long), blk(6, 'paragraph', 'a'), blk(7, 'paragraph', 'b')], 6, noCache)
+    const keys = items.map((it) => translateItemKey(it.blockIndex, it.piece))
+    const pieces = items.filter((it) => it.blockIndex === 5)
+    expect(keys.slice(0, 2)).toEqual(['6', '7'])
+    expect(keys.slice(2)).toEqual(pieces.map((_, i) => `5#${i}`))
+    expect(pieces.map((it) => it.text).join('')).toBe(long)
   })
 })
 

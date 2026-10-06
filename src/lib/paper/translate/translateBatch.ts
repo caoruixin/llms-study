@@ -35,7 +35,7 @@ export const TRANSLATE_SYSTEM_PROMPT = `你是学术文档翻译引擎（协议�
 // 常量（PLAN Track 2）
 // ---------------------------------------------------------------------------
 
-/** 懒翻译窗口：当前块前 4（回看余量）后 16（顺读预取） */
+/** 懒翻译窗口：当前块前 4（回看余量）后 16（顺读预取）；出包顺序按视图有无锚定兜底切换，见 planTranslationWindow */
 export const WINDOW_BEFORE = 4
 export const WINDOW_AFTER = 16
 /** 单包上限：≤1800 估算 token 或 ≤24 条（先到为准；chars/3 口径同全链路） */
@@ -106,7 +106,23 @@ function expandBlock(b: Pick<PaperBlock, 'index' | 'kind' | 'text'>): TranslateI
 }
 
 /**
- * 懒翻译窗口规划：当前块前 4 后 16 里缺译的可译块，按文档顺序展开为待译条目。
+ * 窗口内条目的出包顺序：
+ * - 'ahead-first'：当前块起往后在前、回看块（index < currentBlockIndex）在最后。只在有滚动锚定兜底的场合用
+ * - 'document'：文档顺序，回看块在前。没有锚定兜底的场合用
+ */
+export type TranslationOrder = 'ahead-first' | 'document'
+
+/**
+ * 懒翻译窗口规划：当前块前 4 后 16 里缺译的可译块展开为待译条目，order 决定出包顺序。
+ *
+ * 'ahead-first'（缺省）：当前块起往后的条目在前，回看块排在最后；两组内部各自保持文档顺序，长块分片
+ * 仍连续有序。跳到没译过的地方时，4 个回看块已经滚出屏幕，按文档顺序它们会占掉首包的大半额度，屏幕
+ * 下半截要等第二包才有译文。前提是回看译文晚到不会推走正文，所以只在有锚定兜底的场合用：网页原貌视图
+ * （跨 iframe 锚定，PLAN 2.1）、文本视图在有原生 overflow-anchor 的浏览器（Chromium / Firefox）。
+ *
+ * 'document'：整段文档顺序。WebKit（Safari / iOS）不支持 overflow-anchor，文本视图（BlockReader）自己
+ * 也没有锚定，回看译文落地照样推走正文——这时让位移发生在首包，而不是读到一半才跳。
+ *
  * cache 只需 has(blockIndex)——Map / Set / 谓词包装皆可；窗口按块的 index 值裁剪
  * （文档头尾自然钳位，无需特判）。
  */
@@ -114,15 +130,17 @@ export function planTranslationWindow(
   blocks: readonly PaperBlock[],
   currentBlockIndex: number,
   cache: { has(blockIndex: number): boolean },
+  order: TranslationOrder = 'ahead-first',
 ): TranslateItem[] {
   const lo = currentBlockIndex - WINDOW_BEFORE
   const hi = currentBlockIndex + WINDOW_AFTER
-  const items: TranslateItem[] = []
+  const ahead: TranslateItem[] = []
+  const behind: TranslateItem[] = []
   for (const b of blocks) {
     if (b.index < lo || b.index > hi || cache.has(b.index)) continue
-    items.push(...expandBlock(b))
+    ;(order === 'ahead-first' && b.index < currentBlockIndex ? behind : ahead).push(...expandBlock(b))
   }
-  return items
+  return [...ahead, ...behind]
 }
 
 /** 贪心打包：保持顺序，≤1800 估算 token 且 ≤24 条/包；单条超限独立成包（分片已保 ≤1500） */

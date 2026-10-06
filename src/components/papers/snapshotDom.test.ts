@@ -482,6 +482,645 @@ describe('currentBlockRootMargin', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 跨 iframe 滚动锚定与 iframe 高度
+// ---------------------------------------------------------------------------
+
+describe('pickScrollAnchor', () => {
+  // 坐标一律是 iframe 文档坐标：窗格顶 1000、窗格可视高 448（1000×674 窗口下的工作台几何）
+  const PANE_TOP = 1000
+  const VIEW_BOTTOM = PANE_TOP + 448
+  const probe = () => PANE_TOP + mod.SNAPSHOT_BAND_INSET
+  const pick = (spans: ({ top: number; bottom: number } | null)[]) => mod.pickScrollAnchor(spans, probe(), VIEW_BOTTOM)
+
+  it('目录跳转：第 N 块顶边对齐在窗格顶 +16，块间距为 0 时也锚 N，不锚 N−1', () => {
+    // 回归：锚「第一个底边低于窗格顶的块」会选中 N−1——它的译文挂在它底部，一挂上 N 就被推走
+    const aligned = PANE_TOP + READER_ALIGN_MARGIN
+    const spans = [
+      { top: 600, bottom: 800 },
+      { top: 800, bottom: aligned }, // N−1：底边贴着 N 的顶边（arXiv 参考文献条目的块间距就是 0）
+      { top: aligned, bottom: aligned + 120 }, // N
+      { top: aligned + 120, bottom: aligned + 400 },
+    ]
+    expect(pick(spans)).toBe(2)
+  })
+
+  it('顺读：正在读的块跨着窗格顶，它就是锚点（它自己的译文挂在底部，只推后文）', () => {
+    const spans = [
+      { top: 400, bottom: 900 },
+      { top: 900, bottom: 1300 }, // K：跨着窗格顶
+      { top: 1300, bottom: 1700 },
+    ]
+    expect(pick(spans)).toBe(1)
+  })
+
+  it('探测线恰在边界：顶边等于探测线算包含，底边等于探测线不算', () => {
+    const p = probe()
+    expect(pick([{ top: 500, bottom: p }, { top: p, bottom: p + 50 }])).toBe(1)
+  })
+
+  it('嵌套：包含探测线的块取 top 最大的最内层；top 相同取文档序靠后者', () => {
+    const outer = { top: 900, bottom: 1400 }
+    const inner = { top: 990, bottom: 1100 }
+    expect(pick([outer, inner])).toBe(1)
+    // 入参顺序反过来（内层在前）也取 top 最大的那个
+    expect(pick([inner, outer])).toBe(0)
+    // 外层与里层顶边相同：文档序靠后的是里层
+    expect(pick([{ top: 990, bottom: 1400 }, { top: 990, bottom: 1100 }])).toBe(1)
+  })
+
+  it('探测线落在块间空隙里：取窗格里顶边最靠上的块，不假设入参有序', () => {
+    const spans = [
+      { top: 500, bottom: 990 }, // 已滚出窗格
+      { top: 1200, bottom: 1300 },
+      { top: 1050, bottom: 1150 }, // 绝对定位等原因，文档序靠后却更靠上
+    ]
+    expect(pick(spans)).toBe(2)
+  })
+
+  it('窗格里没有块：返回 -1（不补偿）', () => {
+    expect(pick([])).toBe(-1)
+    // 全在探测线之上，或顶边在窗格底边及以下
+    expect(pick([{ top: 100, bottom: 1000 }, { top: VIEW_BOTTOM, bottom: VIEW_BOTTOM + 100 }, { top: 5000, bottom: 5100 }])).toBe(-1)
+  })
+
+  it('没有布局的块（null）跳过', () => {
+    expect(pick([null, { top: 1100, bottom: 1200 }, null])).toBe(1)
+    expect(pick([null, null])).toBe(-1)
+  })
+})
+
+/** happy-dom 没有布局：矩形手动钉 */
+const stubRect = (el: Element, top: number, height: number, width = 600): void => {
+  el.getBoundingClientRect = () =>
+    ({ top, bottom: top + height, left: 0, right: width, width, height, x: 0, y: top, toJSON: () => ({}) }) as DOMRect
+}
+
+describe('docSpanOf / paneSpanInFrame / findScrollAnchor', () => {
+  it('docSpanOf：矩形加上 iframe 窗口的 scrollY；宽高都为 0（没有布局）返回 null，只是高为 0 仍有效', () => {
+    const el = document.createElement('p')
+    stubRect(el, 120, 40)
+    expect(mod.docSpanOf(el, 0)).toEqual({ top: 120, bottom: 160 })
+    expect(mod.docSpanOf(el, 30)).toEqual({ top: 150, bottom: 190 })
+    stubRect(el, 0, 0, 0)
+    expect(mod.docSpanOf(el, 30)).toBeNull()
+    stubRect(el, 200, 0, 600)
+    expect(mod.docSpanOf(el, 0)).toEqual({ top: 200, bottom: 200 })
+  })
+
+  it('paneSpanInFrame：窗格内容盒（含边框修正）换算到 iframe 文档坐标', () => {
+    const main = document.createElement('main')
+    stubRect(main, 225, 450)
+    Object.defineProperty(main, 'clientTop', { value: 1 })
+    Object.defineProperty(main, 'clientHeight', { value: 448 })
+    const iframe = document.createElement('iframe')
+    // main 已滚动 3000：iframe 顶边在视口坐标 226 - 3000
+    stubRect(iframe, 226 - 3000, 20000)
+    Object.defineProperty(iframe, 'clientTop', { value: 0 })
+    expect(mod.paneSpanInFrame(main, iframe, 0)).toEqual({ top: 3000, bottom: 3448 })
+    expect(mod.paneSpanInFrame(main, iframe, 5)).toEqual({ top: 3005, bottom: 3453 })
+  })
+
+  it('findScrollAnchor：按文档序取宿主、跳过没有布局的块，返回元素与文档坐标顶边', () => {
+    const doc = parseBody(
+      '<p data-pc-block="0">a</p><p data-pc-block="1">b</p><p data-pc-block="2">c</p><p data-pc-block="3">d</p><p>非块</p>',
+    )
+    const [b0, b1, b2, b3] = Array.from(doc.querySelectorAll('[data-pc-block]'))
+    stubRect(b0, 0, 990)
+    // b1 不钉：happy-dom 的默认矩形全 0 = 没有布局（例如随外层原文被包进 .pc-orig[hidden]）
+    expect(b1.getBoundingClientRect().width + b1.getBoundingClientRect().height).toBe(0)
+    stubRect(b2, 1016, 100)
+    stubRect(b3, 1116, 300)
+    // 窗格顶 1000 → 探测线 1018：b0 已滚出，b2 顶边在 +16 包含探测线
+    const hit = mod.findScrollAnchor(doc, { top: 1000, bottom: 1448 }, 0)
+    expect(hit?.el).toBe(b2)
+    expect(hit?.top).toBe(1016)
+    expect(hit?.contained).toBe(true)
+    // 探测线落在 b0 与 b2 之间的空隙里（窗格顶 980 → 探测线 998）：按规则 2 取下方第一个，不算包含
+    const below = mod.findScrollAnchor(doc, { top: 980, bottom: 1428 }, 0)
+    expect(below?.el).toBe(b2)
+    expect(below?.contained).toBe(false)
+    // iframe 视口被挪过（scrollY ≠ 0）：同一几何整体平移，仍是 b2
+    const shifted = mod.findScrollAnchor(doc, { top: 1010, bottom: 1458 }, 10)
+    expect(shifted?.el).toBe(b2)
+    expect(shifted?.top).toBe(1026)
+    // 窗格里一个块都没有
+    expect(mod.findScrollAnchor(doc, { top: 5000, bottom: 5448 }, 0)).toBeNull()
+  })
+})
+
+describe('frameHeightPass', () => {
+  it('内容溢出当前高度：取 scroll（含绝对定位溢出），不复查', () => {
+    expect(mod.frameHeightPass({ inFlow: 5000, scroll: 6000, view: 4000 })).toEqual({ height: 6000, recheck: false })
+    // 首屏占位（60vh）→ 正文远高于它
+    expect(mod.frameHeightPass({ inFlow: 20000, scroll: 20000, view: 404 })).toEqual({ height: 20000, recheck: false })
+    // scrollHeight 是四舍五入的整数：流内高 5315.4 → 向上取整 5316，scrollHeight 报 5315——最后那点内容不能裁掉
+    expect(mod.frameHeightPass({ inFlow: 5316, scroll: 5315, view: 404 })).toEqual({ height: 5316, recheck: false })
+  })
+
+  it('内容装得下（scroll 只是视口下限）：降到 inFlow 并要求复查', () => {
+    // 「对照 → 原文」：内容从 33107 缩回 20000，scrollHeight 仍报视口高 33107
+    expect(mod.frameHeightPass({ inFlow: 20000, scroll: 33107, view: 33107 })).toEqual({ height: 20000, recheck: true })
+  })
+
+  it('相等或差不到 1px：维持现高，不复查（不会自激振荡）', () => {
+    expect(mod.frameHeightPass({ inFlow: 4000, scroll: 4000, view: 4000 })).toEqual({ height: 4000, recheck: false })
+    expect(mod.frameHeightPass({ inFlow: 3999, scroll: 4000, view: 4000 })).toEqual({ height: 4000, recheck: false })
+    expect(mod.frameHeightPass({ inFlow: 4000, scroll: 4001, view: 4000 })).toEqual({ height: 4000, recheck: false })
+  })
+
+  /** WebSnapshotView.syncHeight 的编排：第一段要求复查就先写入、再量一次取第二段（最多两段） */
+  const twoPass = (measure: (view: number) => { inFlow: number; scroll: number; view: number }, view: number): number => {
+    const first = mod.frameHeightPass(measure(view))
+    return first.recheck ? mod.frameHeightPass(measure(first.height)).height : first.height
+  }
+
+  it('两段编排：降到 inFlow 后再量，绝对定位版式溢出就取第二次的 scroll（高度不被截短）', () => {
+    // 模型：流内内容 3000，绝对定位元素底边 3500（只反映在 html.scrollHeight 上），scrollHeight = max(视口高, 3500)
+    const absLayout = (view: number) => ({ inFlow: 3000, scroll: Math.max(view, 3500), view })
+    expect(mod.frameHeightPass(absLayout(10000))).toEqual({ height: 3000, recheck: true })
+    expect(mod.frameHeightPass(absLayout(3000))).toEqual({ height: 3500, recheck: false })
+    expect(twoPass(absLayout, 10000)).toBe(3500)
+    // 稳态：scrollHeight 恰等于视口高，单段分不清「视口下限」还是「绝对定位撑着」，所以每次都会复查——两段后仍落回 3500
+    expect(mod.frameHeightPass(absLayout(3500)).recheck).toBe(true)
+    expect(twoPass(absLayout, 3500)).toBe(3500)
+    // 纯流内版式：「对照 → 原文」从 33107 一步回到 20000，稳态不再复查
+    const flowLayout = (view: number) => ({ inFlow: 20000, scroll: Math.max(view, 20000), view })
+    expect(twoPass(flowLayout, 33107)).toBe(20000)
+    expect(mod.frameHeightPass(flowLayout(20000))).toEqual({ height: 20000, recheck: false })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// iframe 高度：内容尺寸跟着视口走（耦合）与整次同步的编排
+// ---------------------------------------------------------------------------
+
+type Layout = (view: number) => { inFlow: number; scroll: number }
+
+/** 布局模型：视口高 → 一次测量；write 改视口高（差不到 1px 不写、按上限截断，同 WebSnapshotView 的实现） */
+const frameModel = (initial: Layout, view0: number, max = Number.POSITIVE_INFINITY) => {
+  const s = { view: view0, layout: initial, writes: [] as number[], coupling: null as ReturnType<Mod['syncFrameHeight']> }
+  const io = {
+    measure: () => ({ ...s.layout(s.view), view: s.view }),
+    write: (h: number) => {
+      const next = Math.min(Math.ceil(h), max)
+      if (next && Math.abs(next - s.view) >= 1) {
+        s.view = next
+        s.writes.push(next)
+      }
+      return s.view
+    },
+  }
+  /** 跑一次同步，返回同步后的视口高 */
+  const sync = (): number => {
+    s.coupling = mod.syncFrameHeight(io, s.coupling)
+    return s.view
+  }
+  return { s, sync }
+}
+
+/** 纯流内版式：scrollHeight = max(视口, 内容) */
+const flow = (c: number): Layout => (view) => ({ inFlow: c, scroll: Math.max(view, c) })
+/** 合法的绝对定位溢出（top 固定）：只反映在 scrollHeight 上，不随视口动 */
+const absTail = (c: number, absBottom: number): Layout => (view) => ({ inFlow: c, scroll: Math.max(view, c, absBottom) })
+/** 形态 (i)：`position:absolute; bottom:-extra`，包含块是初始包含块——永远挂在视口底边下方 */
+const coupledOverflow = (c: number, extra: number): Layout => (view) => ({ inFlow: c, scroll: Math.max(c, view + extra) })
+/** 形态 (ii)：正文容器 min-height:100vh + 页脚——文档高 = max(正文, 视口) + 页脚 */
+const coupledInFlow = (c: number, foot: number): Layout => (view) => {
+  const inFlow = Math.max(c, view) + foot
+  return { inFlow, scroll: Math.max(view, inFlow) }
+}
+
+describe('probeViewportCoupling / coupledFrameHeight', () => {
+  it('刚撑到 scrollHeight 就又溢出 → 耦合，记下两个耦合量；不溢出 → 不耦合', () => {
+    // 形态 (i)：视口 5300，元素挂在视口下方 200
+    expect(mod.probeViewportCoupling({ inFlow: 5300, scroll: 5500, view: 5300 }, null)).toEqual({ inFlowExtra: 0, scrollExtra: 200 })
+    // 形态 (ii)：流内高度 = 视口 + 页脚 168
+    expect(mod.probeViewportCoupling({ inFlow: 5602, scroll: 5602, view: 5434 }, null)).toEqual({ inFlowExtra: 168, scrollExtra: 168 })
+    // 合法的绝对定位溢出：撑到它的底边就不再溢出
+    expect(mod.probeViewportCoupling({ inFlow: 5315, scroll: 6400, view: 6400 }, null)).toBeNull()
+    // 取整带来的 1px 不算
+    expect(mod.probeViewportCoupling({ inFlow: 5316, scroll: 5316, view: 5315 }, null)).toBeNull()
+  })
+
+  it('已知耦合量时复查：扣掉已知量不再溢出就原样返回；还溢出说明耦合量自己变了，改记新量', () => {
+    const known = { inFlowExtra: 168, scrollExtra: 168 }
+    expect(mod.probeViewportCoupling({ inFlow: 5602, scroll: 5602, view: 5434 }, known)).toBe(known)
+    // 页脚换行变高：168 → 248
+    expect(mod.probeViewportCoupling({ inFlow: 5762, scroll: 5762, view: 5514 }, known)).toEqual({ inFlowExtra: 248, scrollExtra: 248 })
+  })
+
+  it('耦合模式的一步：只长「扣掉耦合量之后还多出」的那截；形态 (i) 能缩回流内高度，形态 (ii) 只长不缩', () => {
+    const overflow = { inFlowExtra: 0, scrollExtra: 200 }
+    // 稳态：scrollHeight 永远比视口多 200，不追
+    expect(mod.coupledFrameHeight({ inFlow: 5300, scroll: 5500, view: 5300 }, overflow)).toBe(5300)
+    // 译文落地，流内长到 5600：只长到 5600
+    expect(mod.coupledFrameHeight({ inFlow: 5600, scroll: 5600, view: 5300 }, overflow)).toBe(5600)
+    // 切回原文，流内缩回 5300：降到流内高度
+    expect(mod.coupledFrameHeight({ inFlow: 5300, scroll: 5800, view: 5600 }, overflow)).toBe(5300)
+
+    const inFlow = { inFlowExtra: 168, scrollExtra: 168 }
+    // 稳态：流内高度永远比视口多 168（页脚），不追
+    expect(mod.coupledFrameHeight({ inFlow: 5602, scroll: 5602, view: 5434 }, inFlow)).toBe(5434)
+    // 正文长到 6000（> 视口）：文档高 6168，只长到 6000——正文完整，页脚落在外面
+    expect(mod.coupledFrameHeight({ inFlow: 6168, scroll: 6168, view: 5434 }, inFlow)).toBe(6000)
+    // 正文缩回去：流内高度含着视口，分不出正文多高——维持现高
+    expect(mod.coupledFrameHeight({ inFlow: 6168, scroll: 6168, view: 6000 }, inFlow)).toBe(6000)
+  })
+})
+
+describe('syncFrameHeight（整次同步的编排，按布局模型跑）', () => {
+  it('纯流内：首屏占位撑到内容高；稳态不再写；内容变矮一步缩回；始终不耦合', () => {
+    const m = frameModel(flow(20000), 404)
+    expect(m.sync()).toBe(20000)
+    expect(m.s.coupling).toBeNull()
+    m.s.writes.length = 0
+    expect(m.sync()).toBe(20000)
+    expect(m.s.writes).toEqual([])
+    // 「原文 → 对照」33107，再切回原文
+    m.s.layout = flow(33107)
+    expect(m.sync()).toBe(33107)
+    m.s.layout = flow(20000)
+    expect(m.sync()).toBe(20000)
+    expect(m.s.coupling).toBeNull()
+  })
+
+  it('合法的绝对定位溢出（验收 C9）：6400 → 10862 → 6400，不被判成耦合；稳态一降一升后落回原高', () => {
+    const m = frameModel(absTail(5315, 6400), 404)
+    expect(m.sync()).toBe(6400)
+    expect(m.s.coupling).toBeNull()
+    // 稳态：scrollHeight 恰等于视口高，分不清是下限还是真实溢出，所以每次都先降到流内再升回来——同一任务里，最终高度不变
+    m.s.writes.length = 0
+    expect(m.sync()).toBe(6400)
+    expect(m.s.writes).toEqual([5315, 6400])
+    m.s.layout = absTail(10862, 6400)
+    expect(m.sync()).toBe(10862)
+    m.s.layout = absTail(5315, 6400)
+    expect(m.sync()).toBe(6400)
+    expect(m.s.coupling).toBeNull()
+  })
+
+  it('形态 (i) 溢出跟着视口（验收 C19）：不棘轮；内容变多只长那一截；切回原文能缩回', () => {
+    const m = frameModel(coupledOverflow(5300, 200), 404)
+    expect(m.sync()).toBe(5300)
+    expect(m.s.coupling).toEqual({ inFlowExtra: 0, scrollExtra: 200 })
+    // 回归：原先每同步一次（A、B 各一次）就涨 200，永远追不上
+    for (let k = 0; k < 10; k++) expect(m.sync()).toBe(5300)
+    for (const c of [5600, 5900, 6400]) {
+      m.s.layout = coupledOverflow(c, 200)
+      expect(m.sync()).toBe(c)
+      expect(m.sync()).toBe(c)
+    }
+    m.s.layout = coupledOverflow(5300, 200)
+    expect(m.sync()).toBe(5300)
+  })
+
+  it('形态 (i) 且正文比首屏占位还矮：探到耦合后把刚才多撑的那截还回去', () => {
+    const m = frameModel(coupledOverflow(300, 200), 404)
+    expect(m.sync()).toBe(300)
+    expect(m.s.coupling).toEqual({ inFlowExtra: 0, scrollExtra: 200 })
+    expect(m.sync()).toBe(300)
+  })
+
+  it('形态 (ii) 流内高度跟着视口（验收 C11）：不失控；正文变多跟着长（正文始终完整），变少不缩', () => {
+    // 回归：原先每个 RO 回合涨一截页脚高，直到高度上限，正文区一片空白（实测每 250ms 涨约 5000px）
+    const m = frameModel(coupledInFlow(5266, 168), 404)
+    expect(m.sync()).toBe(5434)
+    expect(m.s.coupling).toEqual({ inFlowExtra: 168, scrollExtra: 168 })
+    for (let k = 0; k < 20; k++) expect(m.sync()).toBe(5434)
+    // 正文长到 6000：视口跟到 6000（≥ 正文），页脚落在视口外
+    m.s.layout = coupledInFlow(6000, 168)
+    expect(m.sync()).toBe(6000)
+    for (let k = 0; k < 5; k++) expect(m.sync()).toBe(6000)
+    // 正文缩回：降级——不再缩（min-height:100vh 自己把正文容器撑满了视口，量不出正文真实高度）
+    m.s.layout = coupledInFlow(5266, 168)
+    expect(m.sync()).toBe(6000)
+  })
+
+  it('样式表晚到才开始耦合：先按普通版式同步，之后多走一步就探到并稳住', () => {
+    const m = frameModel(flow(5340), 404)
+    expect(m.sync()).toBe(5340)
+    expect(m.s.coupling).toBeNull()
+    m.s.layout = coupledInFlow(5266, 168)
+    expect(m.sync()).toBe(5508)
+    expect(m.s.coupling).toEqual({ inFlowExtra: 168, scrollExtra: 168 })
+    for (let k = 0; k < 10; k++) expect(m.sync()).toBe(5508)
+  })
+
+  it('耦合量自己变了（窗口变窄，页脚换行 168 → 248）：多走一步后改记新量，不会每次再涨一截', () => {
+    const m = frameModel(coupledInFlow(5266, 168), 404)
+    expect(m.sync()).toBe(5434)
+    m.s.layout = coupledInFlow(5266, 248)
+    expect(m.sync()).toBe(5514)
+    expect(m.s.coupling).toEqual({ inFlowExtra: 248, scrollExtra: 248 })
+    for (let k = 0; k < 10; k++) expect(m.sync()).toBe(5514)
+  })
+
+  it('写入被高度上限截断：截断后必然还溢出，不能当成耦合', () => {
+    const m = frameModel(flow(500_000), 404, 400_000)
+    expect(m.sync()).toBe(400_000)
+    expect(m.s.coupling).toBeNull()
+    expect(m.sync()).toBe(400_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 锚点补偿的判定：理想滚动位置、塌缩重对齐
+// ---------------------------------------------------------------------------
+
+describe('理想 scrollTop（补偿不丢小数）', () => {
+  it('inheritIdealScrollTop：上一条记录仍新鲜就沿用它的理想值，滚动过就以读回值重新起算', () => {
+    expect(mod.inheritIdealScrollTop(1037, null)).toBe(1037)
+    expect(mod.inheritIdealScrollTop(1037, { scrollTop: 1037, ideal: 1037.4 })).toBe(1037.4)
+    // 差不到 1px 仍算新鲜（Chromium 的小数 scrollTop）
+    expect(mod.inheritIdealScrollTop(1037.6, { scrollTop: 1037, ideal: 1037.4 })).toBe(1037.4)
+    expect(mod.inheritIdealScrollTop(1100, { scrollTop: 1037, ideal: 1037.4 })).toBe(1100)
+  })
+
+  it('resolveIdealScrollTop：读回只是被取整 → 保留想写的值；被钳位 → 以读回值为准', () => {
+    expect(mod.resolveIdealScrollTop(1037.4, 1037)).toBe(1037.4)
+    expect(mod.resolveIdealScrollTop(1037.9, 1037)).toBe(1037.9)
+    expect(mod.resolveIdealScrollTop(1037.4, 1037.4)).toBe(1037.4)
+    // 到底了：想写 5000.4，只滚得到 4800
+    expect(mod.resolveIdealScrollTop(5000.4, 4800)).toBe(4800)
+    // 到顶了
+    expect(mod.resolveIdealScrollTop(0, 0)).toBe(0)
+  })
+
+  /**
+   * 回归（评审 P1-A / 验收 C16）：WebKit 的 scrollTop 只存整数且向下截断。按「读回值 + d」补偿，每次丢掉小数，
+   * 块单向下漂；对齐留白 16、探测线 18，只有 2px 余量。这里按 capture → restore → 重新 capture 的顺序把链条走一遍。
+   */
+  it('WebKit 式截断下反复补偿：按理想值累计，误差恒 <1px；按读回值累计则单向漂过 2px', () => {
+    const shifts = [37.4, 21.7, 13.3, 9.6, 180.5, 44.9, 0.7, 263.3, 51.6, 12.9, 88.8, 5.5]
+    const store = (v: number): number => Math.floor(v)
+    let truth = 1000 // 不取整时 scrollTop 该有的值
+    let rec = { docTop: 5000, offsetTop: 16, contained: true, scrollTop: 1000, ideal: 1000 }
+    let naive = 1000 // 旧做法：读回的整数当下一次的基准
+    let worstNaive = 0
+    for (const d of shifts) {
+      truth += d
+      naive = store(naive + d)
+      worstNaive = Math.max(worstNaive, truth - naive)
+      const now = { top: rec.docTop + d, bottom: rec.docTop + d + 120 }
+      const target = mod.anchorRestoreTarget(rec, now)
+      expect(target).not.toBeNull()
+      const actual = store(target!.top)
+      const restored = { ...rec, scrollTop: actual, ideal: mod.resolveIdealScrollTop(target!.top, actual), docTop: now.top }
+      // 重新记录：位置没动过，继承刚补偿过的那条
+      rec = { ...restored, ideal: mod.inheritIdealScrollTop(actual, restored) }
+      expect(rec.ideal).toBeCloseTo(truth, 6)
+      // 屏幕上的误差 = 理想值与实际存下的整数之差，恒在 [0, 1)
+      expect(truth - actual).toBeGreaterThanOrEqual(0)
+      expect(truth - actual).toBeLessThan(1)
+    }
+    expect(worstNaive).toBeGreaterThan(2)
+  })
+
+  it('anchorRestoreTarget：位移不到 0.5px 不写；负值截到 0；按理想值而不是读回值算', () => {
+    const rec = { docTop: 5000, offsetTop: 16, contained: true, ideal: 1037.4 }
+    expect(mod.anchorRestoreTarget(rec, { top: 5000.3, bottom: 5100 })).toBeNull()
+    const moved = mod.anchorRestoreTarget(rec, { top: 5021.7, bottom: 5100 })
+    expect(moved?.top).toBeCloseTo(1037.4 + 21.7, 6)
+    expect(moved?.realigned).toBe(false)
+    // 上方内容大幅变矮（对照 → 原文）
+    expect(mod.anchorRestoreTarget(rec, { top: 3000, bottom: 3100 })).toEqual({ top: 0, realigned: false })
+  })
+})
+
+describe('collapseRealign（锚点块自己塌缩）', () => {
+  it('块原本包含探测线、改动后底边到了探测线之上：改为把顶边对齐到窗格顶 +16', () => {
+    // 验收 C20：读到第 200 块中部（顶边在窗格顶 −84），切「中文」而译文未缓存，块塌成 33px 的骨架——底边在 −51
+    expect(mod.collapseRealign(-84, 33)).toBe(-100)
+    // 没塌（179px，底边在 +95，探测线 +18 仍在块内）
+    expect(mod.collapseRealign(-84, 179)).toBe(0)
+    // 底边恰在探测线上（包含是左闭右开）：算塌缩
+    expect(mod.collapseRealign(-12, mod.SNAPSHOT_BAND_INSET + 12)).toBe(-12 - READER_ALIGN_MARGIN)
+    // 已经对齐在 +16 的块：骨架也有二三十像素高，不动
+    expect(mod.collapseRealign(READER_ALIGN_MARGIN, 33)).toBe(0)
+  })
+
+  it('anchorRestoreTarget 叠加重对齐：只对按规则 1 选中的锚点做', () => {
+    // 上方内容变矮 300（都塌成骨架），锚点块自己也塌成 33px
+    const rec = { docTop: 5000, offsetTop: -84, contained: true, ideal: 4916 }
+    const now = { top: 4700, bottom: 4733 }
+    expect(mod.anchorRestoreTarget(rec, now)).toEqual({ top: 4916 - 300 - 100, realigned: true })
+    // 按规则 2 选中的（探测线在它上方的空隙里）：只补位移
+    expect(mod.anchorRestoreTarget({ ...rec, contained: false, offsetTop: 40 }, now)).toEqual({ top: 4916 - 300, realigned: false })
+    // 位移与重对齐恰好抵消：上方变高 100，块自己塌缩——不写，它已经落在 +16
+    expect(mod.anchorRestoreTarget(rec, { top: 5100, bottom: 5133 })).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A 的时序：先按共享记录补偿待处理的外部重排，再现量锚点
+// ---------------------------------------------------------------------------
+
+describe('sharedRecordVerdict（共享记录还能不能拿来补偿）', () => {
+  it('没有记录 / 拿不到 scrollTop → none；记录之后滚动过 → stale；平滑跳转中 → smooth；其余 → use', () => {
+    const rec = { scrollTop: 17017 }
+    expect(mod.sharedRecordVerdict(null, 17017, false)).toBe('none')
+    expect(mod.sharedRecordVerdict(rec, null, false)).toBe('none')
+    expect(mod.sharedRecordVerdict(rec, 17017, false)).toBe('use')
+    // 差不到 1px 仍算没动过（小数 scrollTop、取整）
+    expect(mod.sharedRecordVerdict(rec, 17017.6, false)).toBe('use')
+    // 用户滚过，或程序化滚动刚写过而 scroll 事件还没派发：按旧记录去补会把那次滚动抵消掉
+    expect(mod.sharedRecordVerdict(rec, 17018, false)).toBe('stale')
+    expect(mod.sharedRecordVerdict(rec, 12823, false)).toBe('stale')
+    expect(mod.sharedRecordVerdict(rec, 17017, true)).toBe('smooth')
+    // 过期先于平滑跳转：跳转途中 scrollTop 一直在变，记录本来就该作废
+    expect(mod.sharedRecordVerdict(rec, 17500, true)).toBe('stale')
+  })
+})
+
+describe('runAnchoredMutation（A 的时序）', () => {
+  it('顺序：补偿待处理的外部重排 → 现量锚点 → 改 DOM → 同步高度 → 补偿 → 刷新记录', () => {
+    const calls: string[] = []
+    const anchor = { id: 'a' }
+    mod.runAnchoredMutation({
+      compensatePending: () => void calls.push('compensatePending'),
+      capture: () => (calls.push('capture'), anchor),
+      mutate: () => void calls.push('mutate'),
+      syncHeight: () => void calls.push('syncHeight'),
+      restore: (a) => void calls.push(a === anchor ? 'restore' : 'restore(wrong anchor)'),
+      commit: (a) => void calls.push(a === anchor ? 'commit' : 'commit(wrong anchor)'),
+    })
+    expect(calls).toEqual(['compensatePending', 'capture', 'mutate', 'syncHeight', 'restore', 'commit'])
+  })
+
+  it('窗格里没有可锚的块：照样改 DOM、同步高度、刷新记录，只是不补偿', () => {
+    const calls: string[] = []
+    mod.runAnchoredMutation<object>({
+      compensatePending: () => void calls.push('compensatePending'),
+      capture: () => (calls.push('capture'), null),
+      mutate: () => void calls.push('mutate'),
+      syncHeight: () => void calls.push('syncHeight'),
+      restore: () => void calls.push('restore'),
+      commit: (a) => void calls.push(a === null ? 'commit(null)' : 'commit'),
+    })
+    expect(calls).toEqual(['compensatePending', 'capture', 'mutate', 'syncHeight', 'commit(null)'])
+  })
+
+  /**
+   * 一维模型：锚点块在文档里的顶边 anchorTop、容器的 scrollTop、共享记录。各步用的都是组件用的那些纯函数
+   * （sharedRecordVerdict / anchorRestoreTarget / inheritIdealScrollTop），所以这里跑的就是组件的判定 + 时序。
+   */
+  type Rec = { docTop: number; offsetTop: number; contained: boolean; scrollTop: number; ideal: number }
+  const BLOCK_H = 120
+  const world = (opts: { compensate: boolean } = { compensate: true }) => {
+    const w = { anchorTop: 5000, scrollTop: 4984, record: null as Rec | null }
+    const capture = (): Rec => {
+      const offsetTop = w.anchorTop - w.scrollTop
+      return {
+        docTop: w.anchorTop,
+        offsetTop,
+        contained: offsetTop <= mod.SNAPSHOT_BAND_INSET && mod.SNAPSHOT_BAND_INSET < offsetTop + BLOCK_H,
+        scrollTop: w.scrollTop,
+        ideal: mod.inheritIdealScrollTop(w.scrollTop, w.record),
+      }
+    }
+    const restore = (a: Rec): void => {
+      const target = mod.anchorRestoreTarget(a, { top: w.anchorTop, bottom: w.anchorTop + BLOCK_H })
+      if (!target) return
+      w.scrollTop = target.top
+      a.scrollTop = target.top
+      a.ideal = target.top
+      a.docTop = w.anchorTop
+    }
+    /** 组件的 A：改 DOM（mutate）并带着锚定 */
+    const apply = (mutate: () => void): void =>
+      mod.runAnchoredMutation<Rec>({
+        compensatePending: () => {
+          if (opts.compensate && w.record && mod.sharedRecordVerdict(w.record, w.scrollTop, false) === 'use') restore(w.record)
+        },
+        capture,
+        mutate,
+        syncHeight: () => undefined,
+        restore,
+        commit: (a) => {
+          if (a) w.record = a
+          w.record = capture()
+        },
+      })
+    /** 程序化对齐后记录（续读对齐）；锚点块顶边离窗格顶 16px */
+    w.record = capture()
+    return { w, apply, offset: () => w.anchorTop - w.scrollTop }
+  }
+
+  it('回归（验收 C22）：外部重排之后、B 的回调到来之前 A 先跑——位置不被吸收，也不累计', () => {
+    for (const step of [8.7, -8.7]) {
+      const { w, apply, offset } = world()
+      expect(offset()).toBe(16)
+      for (let k = 0; k < 6; k++) {
+        w.anchorTop += step // 外部重排（字体换上、图片解码）：不经过组件，共享记录还是旧的
+        apply(() => (w.anchorTop += 30)) // 紧接着译文落在上方
+        expect(offset()).toBeCloseTo(16, 6)
+      }
+    }
+  })
+
+  it('对照：去掉「先按共享记录补偿」这一步，每次外部重排都被现量吸收，单向累计（改前 16.4 → 25.1 → … → 68.6）', () => {
+    const { w, apply, offset } = world({ compensate: false })
+    for (let k = 0; k < 6; k++) {
+      w.anchorTop += 8.7
+      apply(() => (w.anchorTop += 30))
+    }
+    expect(offset()).toBeCloseTo(16 + 6 * 8.7, 6)
+  })
+
+  it('全应用里的那次：续读对齐后字体换上、上方矮了 52px，随后才挂缓存译文——块回到对齐的位置', () => {
+    const { w, apply, offset } = world()
+    w.anchorTop -= 52
+    expect(offset()).toBe(-36) // 这时 B 的回调还没来
+    apply(() => (w.anchorTop -= 4000)) // 「中文」+ 缓存译文：上方整体变矮
+    expect(offset()).toBeCloseTo(16, 6)
+  })
+
+  it('记录之后用户滚动过：不按旧记录补（那会把滚动抵消掉），就地按现在的位置锚', () => {
+    const { w, apply, offset } = world()
+    w.anchorTop += 40 // 外部重排
+    w.scrollTop += 300 // 随后用户滚走了：记录过期
+    const before = offset()
+    apply(() => (w.anchorTop += 30))
+    expect(offset()).toBeCloseTo(before, 6)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 平滑跳转、滚动来源与暂缓的判定
+// ---------------------------------------------------------------------------
+
+describe('smoothStartsInPlace（平滑跳转发起时要不要立刻起静止计时）', () => {
+  it('目标已在原位才起；目标截到最大滚动位置后再比', () => {
+    // 回归（评审 P1-B / 验收 C17）：无条件起计时，发起后主线程卡 140ms 以上，计时器先于第一个 scroll 事件到点，跳转被判成结束
+    expect(mod.smoothStartsInPlace(20000, 6400, 90000)).toBe(false)
+    expect(mod.smoothStartsInPlace(6400.4, 6400, 90000)).toBe(true)
+    // 目标超出可滚范围、而当前已经在底：不会有 scroll 事件
+    expect(mod.smoothStartsInPlace(9000, 8000, 8000)).toBe(true)
+    expect(mod.smoothStartsInPlace(9000, 7000, 8000)).toBe(false)
+    // 内容不满一屏（最大滚动位置为负）
+    expect(mod.smoothStartsInPlace(0, 0, -50)).toBe(true)
+  })
+})
+
+describe('trackSmoothProgress（平滑跳转中用户是否已接管）', () => {
+  /** 依次喂距离，返回每一步是否判定接管 */
+  const feed = (dists: number[]): boolean[] => {
+    let p = mod.SMOOTH_PROGRESS_START
+    return dists.map((d) => {
+      const r = mod.trackSmoothProgress(p, d)
+      p = r.progress
+      return r.takenOver
+    })
+  }
+
+  it('动画一路逼近：从不判接管', () => {
+    expect(feed([13000, 12400, 10100, 6000, 2200, 300, 0, 0])).toEqual(new Array(8).fill(false))
+  })
+
+  it('逼近中距离反而变大超过 2px：用户接管（WebKit 收不到 iframe 里的滚轮 / 触摸）', () => {
+    expect(feed([13000, 12400, 10100, 10140])).toEqual([false, false, false, true])
+    // 2px 以内的抖动不算；之后相对「到过的最近距离」累计超过 2px 才算
+    expect(feed([1000, 800, 801.5, 802, 802.5])).toEqual([false, false, false, false, true])
+    // 已经到位（距离 0）、状态还没来得及清，用户又滚走
+    expect(feed([500, 100, 0, 30])).toEqual([false, false, false, true])
+  })
+
+  it('刚重新瞄准到身后的目标：引擎会先沿旧方向再走一帧，开始变近之前距离变大不算接管', () => {
+    // 实测（Chromium）：重新瞄准时在 5422，目标 3000；随后的事件 5614（+192）→ 5611 → 5603 → …
+    expect(feed([5614, 5611, 5603, 5588].map((v) => Math.abs(v - 3000)))).toEqual([false, false, false, false])
+    // 多带了两帧也一样
+    expect(feed([2600, 2750, 2790, 2760, 2500])).toEqual([false, false, false, false, false])
+    // 掉头之后再变远才算
+    expect(feed([2600, 2750, 2700, 2710])).toEqual([false, false, false, true])
+  })
+})
+
+describe('classifyScroll / shouldHoldMutation（原生滚动进行中暂缓改 DOM）', () => {
+  it('滚动来源：平滑跳转进行中不算原生；与自己最后写入的值一致算自己的；其余是原生滚动', () => {
+    expect(mod.classifyScroll(1200, 1200, true)).toBe('smooth')
+    expect(mod.classifyScroll(1500, 1200, true)).toBe('smooth')
+    // 补偿 / 瞬时对齐 / 滚轮转发桥写的：读回值与事件里的值一致（差不到 1px）
+    expect(mod.classifyScroll(1200, 1200, false)).toBe('own')
+    expect(mod.classifyScroll(1200.4, 1200, false)).toBe('own')
+    // 触摸惯性、键盘翻页、拖滚动条、WebKit 的原生滚轮
+    expect(mod.classifyScroll(1206, 1200, false)).toBe('native')
+    expect(mod.classifyScroll(1206, null, false)).toBe('native')
+  })
+
+  it('原生滚动刚发生过（不到 holdMs）就暂缓；平滑跳转中、窗格不可见、早就停了都不暂缓', () => {
+    const base = { smooth: false, paneVisible: true, sinceNativeMs: 40, holdMs: 120 }
+    // 回归（验收 C18 / C15）：WebKit 键盘 PageDown 途中落地，翻页被截断、补偿丢失
+    expect(mod.shouldHoldMutation(base)).toBe(true)
+    expect(mod.shouldHoldMutation({ ...base, sinceNativeMs: 119 })).toBe(true)
+    // 停稳时的冲刷发生在最后一次滚动 150ms 之后：holdMs 必须小于它，冲刷才不会被再次暂缓
+    expect(mod.shouldHoldMutation({ ...base, sinceNativeMs: 150 })).toBe(false)
+    expect(mod.shouldHoldMutation({ ...base, sinceNativeMs: Number.POSITIVE_INFINITY })).toBe(false)
+    expect(mod.shouldHoldMutation({ ...base, smooth: true })).toBe(false)
+    expect(mod.shouldHoldMutation({ ...base, paneVisible: false })).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 滚动：内部滚动容器与滚轮归属
 // ---------------------------------------------------------------------------
 
