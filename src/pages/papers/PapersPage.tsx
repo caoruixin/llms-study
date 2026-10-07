@@ -3,15 +3,9 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import ClaimBanner from '../../components/papers/ClaimBanner'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
 import { useAuthStore } from '../../lib/auth/authStore'
-import {
-  createSerialQueue,
-  importPaper,
-  isRetryable,
-  reingestPaper,
-  type ImportOutcome,
-  type IngestDeps,
-  type ParseResult,
-} from '../../lib/paper/ingest'
+import { importPaper, isRetryable, reingestPaper, type ImportOutcome } from '../../lib/paper/ingest'
+import { createIngestDeps } from '../../lib/paper/ingestDeps'
+import { ingestQueue } from '../../lib/paper/ingestQueue'
 import { getPaperDb, type SyncMetaRow } from '../../lib/paper/repo/db'
 import { getRepos } from '../../lib/paper/repo/repos'
 import {
@@ -65,24 +59,6 @@ const fmtTime = (ts?: number): string =>
   ts ? new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'
 
 const isProcessing = (s: IngestStage) => s !== 'ready' && s !== 'failed'
-
-/**
- * 解析器按格式动态 import：pdfjs / mammoth / 两种 html 容器解码器都不进论文库入口 chunk，
- * 首次导入对应格式时才拉取。html 有两种源文件形态，由 parseHtmlBytes 按魔数再分流一次：
- * 网页原貌快照（webSnapshot.ts）与 URL 净化正文合集（urlBundle.ts）。
- */
-async function parseByFormat(input: { bytes: ArrayBuffer; format: PaperFormat }): Promise<ParseResult> {
-  if (input.format === 'pdf') {
-    const { parsePdfBytes } = await import('../../lib/paper/parsePdf')
-    return parsePdfBytes(input.bytes)
-  }
-  if (input.format === 'html') {
-    const { parseHtmlBytes } = await import('../../lib/paper/url/parseHtmlBytes')
-    return parseHtmlBytes(input.bytes)
-  }
-  const { parseDocxBytes } = await import('../../lib/paper/parseDocx')
-  return parseDocxBytes(input.bytes)
-}
 
 const hostnameOf = (url: string): string => {
   try {
@@ -148,7 +124,6 @@ export default function PapersPage() {
   const repo = getRepos().paper
   const authStatus = useAuthStore((s) => s.status)
   const userId = useAuthStore((s) => s.user?.id ?? null)
-  const queueRef = useRef(createSerialQueue())
   const inputRef = useRef<HTMLInputElement>(null)
   // 重复导入时暂存原始导入源（文件或 URL 列表），供「替换导入」重跑；
   // 串行队列保证同时只有一个待决项，两种来源互斥，泛化成联合类型统一处理
@@ -275,24 +250,23 @@ export default function PapersPage() {
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [authStatus, refresh])
 
+  // 导入依赖与工作台「重新解析」共用一份（ingestDeps.ts）：仓储走 getRepos() 门面，解析器按格式动态 import
   const depsFor = useCallback(
-    (jobId: string): IngestDeps => ({
-      repo,
-      hash: sha256Hex,
-      parse: parseByFormat,
-      onState: (s) => {
-        setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, stage: s.stage } : j)))
-        void refresh()
-      },
-    }),
-    [repo, refresh],
+    (jobId: string) =>
+      createIngestDeps({
+        onState: (s) => {
+          setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, stage: s.stage } : j)))
+          void refresh()
+        },
+      }),
+    [refresh],
   )
 
   const runImport = useCallback(
     (file: File) => {
       const jobId = `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
       setJobs((prev) => [...prev, { id: jobId, name: file.name, stage: 'queued' }])
-      void queueRef.current
+      void ingestQueue
         .enqueue(jobId, async () => {
           // 字节在任务内才读取：串行队列保证同一时刻只有一个文件的字节驻留内存
           const bytes = await file.arrayBuffer()
@@ -359,9 +333,8 @@ export default function PapersPage() {
         })
       }
       return {
-        repo,
-        hash: sha256Hex,
-        parse: parseByFormat,
+        // repo / hash / parse / onState 与文件导入同源（ingestDeps.ts，同一个 depsFor），这里只叠 URL 专属字段
+        ...depsFor(jobId),
         // 正文抓取遇到「名额被占，稍后再来」（取消后立刻再导一篇）短暂重试，见 fetchUrlWithBusyRetry
         fetchUrl: (url) => fetchUrlWithBusyRetry(url, { signal }),
         extract: extractFromFetchedHtml,
@@ -377,13 +350,9 @@ export default function PapersPage() {
           ),
         ensureStorage: (bytes) => ensureStorageFor(bytes),
         replaceFile: (id, input) => repo.replaceFile(id, input),
-        onState: (s) => {
-          setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, stage: s.stage } : j)))
-          void refresh()
-        },
       }
     },
-    [repo, refresh],
+    [repo, depsFor],
   )
 
   const runUrlImport = useCallback(
@@ -399,7 +368,7 @@ export default function PapersPage() {
       setUrlResult(null)
       setUrlProgress(urls.map((url, index) => ({ index, total: urls.length, url, phase: 'pending' })))
       urlJobIdRef.current = jobId
-      void queueRef.current
+      void ingestQueue
         .enqueue(jobId, async (signal) => {
           const [{ importFromUrls }, deps] = await Promise.all([
             import('../../lib/paper/url/urlImport'),
@@ -464,7 +433,7 @@ export default function PapersPage() {
       setUrlResult(null)
       setUrlProgress([{ index: 0, total: 1, url, phase: 'pending' }])
       urlJobIdRef.current = jobId
-      void queueRef.current
+      void ingestQueue
         .enqueue(jobId, async (signal) => {
           const [{ reimportUrlPaperInPlace }, deps] = await Promise.all([
             import('../../lib/paper/url/urlImport'),
@@ -512,7 +481,7 @@ export default function PapersPage() {
    */
   const cancelUrlJob = useCallback(() => {
     const id = urlJobIdRef.current
-    if (id) queueRef.current.cancel(id)
+    if (id) ingestQueue.cancel(id)
   }, [])
 
   /**
@@ -571,7 +540,7 @@ export default function PapersPage() {
     (paper: PaperRecord) => {
       const jobId = `retry-${paper.id}-${Date.now()}`
       setJobs((prev) => [...prev, { id: jobId, name: paper.fileName, stage: 'queued' }])
-      void queueRef.current
+      void ingestQueue
         .enqueue(jobId, async () => {
           const outcome = await reingestPaper(paper.id, depsFor(jobId))
           if (outcome.kind === 'failed') setNotice(`${paper.fileName}：${outcome.failure.message}`)

@@ -7,6 +7,7 @@ import type {
   IngestFailureKind,
   IngestStage,
   NormalizedBlock,
+  PaperBlock,
   PaperChunk,
   PaperFormat,
   PaperRecord,
@@ -200,6 +201,15 @@ export interface IngestDeps {
   parse: (input: { bytes: ArrayBuffer; format: PaperFormat }) => Promise<ParseResult>
   now?: () => number
   onState?: (s: IngestState) => void
+  /**
+   * 重解析后把块级派生物（译文 / 高亮）从旧序号搬到新序号（见 rekeyDerivatives.ts）。
+   * 只在 reingestPaper 里调用：saveBlocks 之前取旧块、之后调用；抛错只 warn，不翻转导入结果。
+   */
+  rekeyDerivatives?: (input: {
+    paperId: string
+    oldBlocks: readonly PaperBlock[]
+    newBlocks: readonly NormalizedBlock[]
+  }) => Promise<void>
 }
 
 export interface ImportFileInput {
@@ -222,6 +232,10 @@ function toFailure(e: unknown, at: number): IngestFailure {
 }
 
 const titleFromFileName = (name: string): string => name.replace(/\.[^.]+$/, '') || name
+
+/** 论文已有自己的标题：非空且不是导入时的文件名兜底（`titleFromFileName`） */
+const hasOwnTitle = (paper: Pick<PaperRecord, 'title' | 'fileName'>): boolean =>
+  paper.title.trim() !== '' && paper.title !== titleFromFileName(paper.fileName)
 
 export function countBlockChars(blocks: NormalizedBlock[]): number {
   let n = 0
@@ -384,8 +398,16 @@ export async function importPaper(file: ImportFileInput, deps: IngestDeps): Prom
 }
 
 /**
- * 失败重试：从 files 表取回原始字节重跑解析（不重新校验——字节在首次导入时已校验过）。
- * attempts 由 repo.retryPaper 累加。
+ * 失败重试 / 解析器升级后的重新解析：从 files 表取回原始字节重跑解析（不重新校验——字节在首次导入时已校验过）。
+ * attempts 由 repo.retryPaper 累加。有 rekeyDerivatives 时在落块前后把译文 / 高亮按文本相等搬到新序号。
+ *
+ * **对原本 ready 的论文做「升级重解析」**（旧版解析补版面几何）时，论文全程保持可读：
+ * - 不走 retryPaper / setStage——papers.status 不经过 queued / parsing / …，阶段只经 onState 报给调用方。
+ *   否则中途刷新页面 / 关掉标签（解析是 fire-and-forget，没有任何东西会把它续上）就把一篇本来能读的论文
+ *   永久卡在「正在解析中」（QA r1 D18）；进度写回（updateProgress 推整行快照）也会把 parsing 态推给别的设备。
+ * - 失败不 markFailed：旧块在 saveBlocks 之前原封未动，论文仍按旧块可读，失败只经返回值交给调用方
+ *   （工作台横幅显示错误 + 重试）。此前会把 ready 论文置为 failed，重开显示「还不能阅读」（QA r1 P1）。
+ * 失败重试（status=failed）与原地重导入（replaceFile 已置 queued）不是 ready，照旧走完整的状态机。
  */
 export async function reingestPaper(paperId: string, deps: IngestDeps): Promise<ImportOutcome> {
   const now = deps.now ?? Date.now
@@ -402,13 +424,19 @@ export async function reingestPaper(paperId: string, deps: IngestDeps): Promise<
     return { kind: 'failed', failure }
   }
 
+  /** 升级重解析：论文全程保持 ready（见函数注释），中间阶段不落库 */
+  const keepReadable = paper.status === 'ready'
+  const setStage = async (stage: IngestStage) => {
+    if (!keepReadable) await deps.repo.setStage(paperId, stage)
+  }
+
   try {
-    await deps.repo.retryPaper(paperId)
+    if (!keepReadable) await deps.repo.retryPaper(paperId)
     const file = await deps.repo.getFileBytes(paperId)
     if (!file) throw new IngestError('storage', '原始文件字节已丢失，请重新导入该文件')
 
     dispatch({ type: 'parse:start' })
-    await deps.repo.setStage(paperId, 'parsing')
+    await setStage('parsing')
 
     const parsed = await deps.parse({ bytes: file.bytes, format: paper.format })
     dispatch({ type: 'parse:ok' })
@@ -421,11 +449,22 @@ export async function reingestPaper(paperId: string, deps: IngestDeps): Promise<
       throw new IngestError('no-text-layer', '没有抽取到任何文字内容（可能是扫描件，首版不做 OCR）')
     }
 
-    await deps.repo.setStage(paperId, 'normalizing')
+    // 旧块要在 saveBlocks（先清后写）之前取：重打键只认「旧文本 → 新文本」的对应关系
+    const oldBlocks = deps.rekeyDerivatives ? await deps.repo.getBlocks(paperId) : []
+    await setStage('normalizing')
     await deps.repo.saveBlocks(paperId, parsed.blocks)
     dispatch({ type: 'normalize:ok' })
 
-    await deps.repo.setStage(paperId, 'indexing')
+    if (deps.rekeyDerivatives) {
+      try {
+        await deps.rekeyDerivatives({ paperId, oldBlocks, newBlocks: parsed.blocks })
+      } catch (e) {
+        // 派生物搬不动不是导入失败：未搬的译文靠 srcHash、高亮靠文本切片校验自然失效
+        console.warn('[ingest] 重解析后译文 / 高亮重打键失败，按旧行失效处理', e)
+      }
+    }
+
+    await setStage('indexing')
     await buildPaperIndex(paperId, parsed.blocks, deps.repo)
     dispatch({ type: 'index:ok' })
 
@@ -433,17 +472,23 @@ export async function reingestPaper(paperId: string, deps: IngestDeps): Promise<
       pageCount: parsed.pageCount,
       blockCount: parsed.blocks.length,
       charCount,
-      title: parsed.title,
+      // 升级重解析不改名：论文已有标题（导入时解析出的、或用户认得的那个）就不拿新解析的标题覆盖——
+      // PDF 元数据标题可能是坏的（主样本「AI R   D」），点一次「重新解析」不该把一篇好好的论文改名。
+      // 只有标题还是文件名兜底（当初没解析出标题）时才采用新标题。失败重试 / 原地重导入照旧采用解析标题。
+      title: keepReadable && hasOwnTitle(paper) ? undefined : parsed.title,
     })
     const ready = await deps.repo.getPaper(paperId)
     return { kind: 'ready', paper: ready ?? paper }
   } catch (e) {
     const failure = toFailure(e, now())
     dispatch({ type: 'fail', ...failure })
-    try {
-      await deps.repo.markFailed(paperId, failure)
-    } catch {
-      /* 已经在失败路径上，尽力而为 */
+    // 升级重解析失败：论文仍按旧块可读，不改状态（见函数注释）
+    if (!keepReadable) {
+      try {
+        await deps.repo.markFailed(paperId, failure)
+      } catch {
+        /* 已经在失败路径上，尽力而为 */
+      }
     }
     return { kind: 'failed', paper, failure }
   }

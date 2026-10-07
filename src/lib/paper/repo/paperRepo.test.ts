@@ -283,3 +283,18 @@ describe('createPaperRepository', () => {
     expect(await repo.listPapers()).toHaveLength(1)
   })
 })
+
+describe('markReady × PARSER_VERSION（重解析后记录不再停留在旧版本）', () => {
+  it('retryPaper 不碰 parserVersion；markReady 把它写成当前 PARSER_VERSION', async () => {
+    const { db, repo } = freshRepo()
+    const paper = await repo.createPaper(input())
+    await db.papers.update(paper.id, { parserVersion: 1 })
+
+    await repo.retryPaper(paper.id)
+    expect((await repo.getPaper(paper.id))?.parserVersion).toBe(1)
+
+    await repo.markReady(paper.id, { blockCount: 1, charCount: 1 })
+    expect((await repo.getPaper(paper.id))?.parserVersion).toBe(PARSER_VERSION)
+    expect(PARSER_VERSION).toBe(3)
+  })
+})

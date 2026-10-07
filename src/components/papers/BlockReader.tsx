@@ -1,11 +1,10 @@
 import { useEffect, useState, type RefObject } from 'react'
-import { Link } from 'react-router-dom'
 import type { LlmAuthCode } from '../../lib/llmClient'
 import { CURRENT_PAGE_EPSILON, blockDomId } from '../../lib/paper/anchors'
-import { splitByRanges, validRanges } from '../../lib/paper/highlight/highlightModel'
 import { sanitizeArticleHtml } from '../../lib/paper/sanitize'
 import { isTranslatableBlock } from '../../lib/paper/translate/translateBatch'
 import type { LangMode, PaperBlock, PaperHighlight } from '../../lib/paper/types'
+import { HlText, TranslationError, TranslationSkeleton } from './translationBits'
 
 /**
  * 语义化正文视图：PDF 的「文本视图」与 DOCX 的唯一视图都是它。
@@ -51,33 +50,6 @@ interface Props {
 const headingSize = (level: number | undefined): string => {
   const l = level ?? 2
   return l <= 1 ? 'text-xl' : l === 2 ? 'text-lg' : 'text-base'
-}
-
-/**
- * 宿主内文本渲染：快照校验 → 区间切分 → 逐段建节点（纯函数切分返回段数组，
- * 禁止 HTML 字符串注入）。rows 是该块的全部高亮行，按宿主语言在这里过滤——
- * 原文高亮只进原文宿主，译文高亮只进译文宿主。
- */
-function HlText({ text, rows, host }: { text: string; rows: readonly PaperHighlight[] | undefined; host: 'orig' | 'zh' }) {
-  const mine = rows?.length ? validRanges(text, rows.filter((r) => r.lang === host)) : []
-  if (!mine.length) return <>{text}</>
-  return (
-    <>
-      {splitByRanges(text, mine).map((seg, i) =>
-        seg.id !== undefined ? (
-          <mark
-            key={i}
-            data-highlight-id={seg.id}
-            className="cursor-pointer rounded-[3px] bg-amber/30 text-fg transition-colors hover:bg-amber/45"
-          >
-            {seg.text}
-          </mark>
-        ) : (
-          <span key={i}>{seg.text}</span>
-        ),
-      )}
-    </>
-  )
 }
 
 /**
@@ -235,45 +207,6 @@ function TranslatedBody({ block, text, rows }: { block: PaperBlock; text: string
   return (
     <p data-translated="zh" data-hl-host="zh" className="text-[0.95rem] leading-7 text-fg">
       <HlText text={text} rows={rows} host="zh" />
-    </p>
-  )
-}
-
-/** 骨架屏：两行灰条（不带 data-translated，无可选中文本） */
-function TranslationSkeleton() {
-  return (
-    <div className="mt-1.5 animate-pulse space-y-1.5">
-      <div className="h-3 rounded bg-panel-2" />
-      <div className="h-3 w-2/3 rounded bg-panel-2" />
-    </div>
-  )
-}
-
-function TranslationError({ onRetry, authIssue }: { onRetry?: (() => void) | undefined; authIssue?: LlmAuthCode | null }) {
-  return (
-    <p className="mt-1 flex items-center gap-2 text-[0.7rem]">
-      <span className="text-bad">
-        {authIssue === 'unauthenticated'
-          ? '登录已过期，请重新登录后重试翻译'
-          : authIssue
-            ? '该账号尚未配置 DeepSeek Key，无法翻译'
-            : '这一段翻译失败'}
-      </span>
-      {authIssue && authIssue !== 'unauthenticated' && (
-        // 与 AskDialog 的 no-user-key 分支同一引导：账号侧配置问题 → 设置页
-        <Link to="/settings" className="text-accent underline underline-offset-2 hover:text-accent">
-          去设置页配置
-        </Link>
-      )}
-      {onRetry && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="rounded border border-line px-1.5 py-0.5 text-accent transition-colors hover:bg-accent/10"
-        >
-          重试
-        </button>
-      )}
     </p>
   )
 }

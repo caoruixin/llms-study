@@ -12,6 +12,8 @@ export interface TranslationRepository {
   getTranslations(paperId: string): Promise<BlockTranslation[]>
   /** bulkPut：id 是确定性拼接键，重译/并发写都是幂等覆盖 */
   putTranslations(rows: BlockTranslation[]): Promise<void>
+  /** 按 id 删除（重解析后重打键删旧序号的行用）；不存在的 id 忽略 */
+  deleteTranslations(ids: readonly string[]): Promise<void>
   deleteByPaper(paperId: string): Promise<void>
 }
 
@@ -21,6 +23,10 @@ export function createTranslationRepository(db: PaperDb): TranslationRepository 
 
     async putTranslations(rows) {
       if (rows.length) await db.translations.bulkPut(rows)
+    },
+
+    async deleteTranslations(ids) {
+      if (ids.length) await db.translations.bulkDelete([...ids])
     },
 
     async deleteByPaper(paperId) {

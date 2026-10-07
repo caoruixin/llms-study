@@ -24,8 +24,12 @@ export const PAPER_DB_NAME = 'paper-copilot'
  * v2：URL 导入图片保留——normalize 行为变化（纯图表格从丢弃变保留 + 新增 image 块），
  * 同一 HTML 的 blockIndex 可能位移；存量论文不自动重解析，仅用户主动 reingest 时生效
  * （译文靠 srcHash 失配自动失效、高亮靠 text 快照校验兜底）。
+ * v3：PDF 块携带版面几何 `PaperBlock.layout`（每页每栏的行框，原版 PDF 就地译文的数据源）；
+ * PDF 解析规则修正（分栏检测忽略通栏行、去页眉页脚与「page N of M」、按字号 / 缩进断段），
+ * blockIndex 必然位移。存量论文不自动重解析：工作台原版视图切中文 / 对照时提示「重新解析」，
+ * 重解析后译文与高亮按文本相等重打键保留（rekeyDerivatives.ts）。markReady 会把该版本号写回记录。
  */
-export const PARSER_VERSION = 2
+export const PARSER_VERSION = 3
 
 // ---------------------------------------------------------------------------
 // P4 同步域本地表类型（v2 纯加法）

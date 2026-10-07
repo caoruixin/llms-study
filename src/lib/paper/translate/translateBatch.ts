@@ -50,6 +50,10 @@ const TRANSLATABLE_KINDS: ReadonlySet<PaperBlockKind> = new Set(['heading', 'par
 
 export const isTranslatableBlock = (kind: PaperBlockKind): boolean => TRANSLATABLE_KINDS.has(kind)
 
+/** 块会出译文（可译体裁且文本非空）：原版 PDF 的中文覆盖与段落对照流共用这一个判定（三态 / showTranslation） */
+export const hasTranslatableText = (block: { kind: PaperBlockKind; text: string }): boolean =>
+  isTranslatableBlock(block.kind) && block.text.trim() !== ''
+
 // ---------------------------------------------------------------------------
 // 长块切分
 // ---------------------------------------------------------------------------

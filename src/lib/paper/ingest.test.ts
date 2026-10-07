@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import {
   INITIAL_INGEST_STATE,
@@ -346,9 +346,153 @@ describe('reingestPaper', () => {
     expect(await repo.getChunks(paperId)).toHaveLength(1)
   })
 
+  it('ready 论文的升级重解析：全程 status 保持 ready（中途刷新不会卡在 parsing），阶段只经 onState 报告', async () => {
+    const repo = freshRepo()
+    const first = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = first.kind === 'ready' ? first.paper.id : ''
+    const statusDuringParse: (string | undefined)[] = []
+    const stages: string[] = []
+    const out = await reingestPaper(paperId, {
+      ...depsWith(repo, async () => {
+        statusDuringParse.push((await repo.getPaper(paperId))?.status)
+        return { blocks: [block(0, '新一段'), block(1, '新二段'), block(2, '新三段')], pageCount: 2 }
+      }),
+      onState: (s) => stages.push(s.stage),
+    })
+    expect(out.kind).toBe('ready')
+    expect(statusDuringParse).toEqual(['ready'])
+    expect(stages).toEqual(['parsing', 'normalizing', 'indexing', 'ready'])
+    const after = await repo.getPaper(paperId)
+    expect(after).toMatchObject({ status: 'ready', blockCount: 3 })
+  })
+
+  it('ready 论文的升级重解析不改名：已有标题保留（新解析的元数据标题可能是坏的）；只有文件名兜底的标题才换成解析标题', async () => {
+    const repo = freshRepo()
+    const first = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = first.kind === 'ready' ? first.paper.id : ''
+    expect((await repo.getPaper(paperId))?.title).toBe('解析出的标题')
+    const reparse = async (): Promise<ParseResult> => ({
+      blocks: [block(0, '新一段')],
+      pageCount: 2,
+      title: 'What if automating AI R   D triggers an intelligence explosion?',
+    })
+    expect((await reingestPaper(paperId, depsWith(repo, reparse))).kind).toBe('ready')
+    expect(await repo.getPaper(paperId)).toMatchObject({ status: 'ready', title: '解析出的标题', blockCount: 1 })
+
+    // 当初没解析出标题（title = 文件名兜底「b」）→ 重解析采用新标题
+    const untitled = await importPaper(
+      { name: 'b.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes('other') },
+      depsWith(repo, async () => ({ blocks: [block(0, '无题')], pageCount: 1 })),
+    )
+    const untitledId = untitled.kind === 'ready' ? untitled.paper.id : ''
+    expect((await repo.getPaper(untitledId))?.title).toBe('b')
+    await reingestPaper(untitledId, depsWith(repo, async () => ({ blocks: [block(0, '无题')], title: '真正的标题' })))
+    expect((await repo.getPaper(untitledId))?.title).toBe('真正的标题')
+  })
+
+  it('ready 论文的升级重解析失败：论文仍 ready、旧块原样可读，失败只经返回值交给调用方（QA r1 P1）', async () => {
+    const repo = freshRepo()
+    const first = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = first.kind === 'ready' ? first.paper.id : ''
+    const out = await reingestPaper(
+      paperId,
+      depsWith(repo, async () => {
+        throw new IngestError('corrupt', 'PDF 解析失败：worker 起不来')
+      }),
+    )
+    expect(out).toMatchObject({ kind: 'failed', failure: { kind: 'corrupt' } })
+    const after = await repo.getPaper(paperId)
+    expect(after?.status).toBe('ready')
+    expect(after?.failure).toBeUndefined()
+    expect((await repo.getBlocks(paperId)).map((b) => b.text)).toEqual(['第一段', '第二段'])
+  })
+
+  it('failed 论文的失败重试再失败：照旧 markFailed（重试路径的状态机不变）', async () => {
+    const repo = freshRepo()
+    const boom = async (): Promise<ParseResult> => {
+      throw new IngestError('storage', '磁盘满了')
+    }
+    const failing = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo, boom))
+    const paperId = failing.kind === 'failed' ? failing.paper!.id : ''
+    const out = await reingestPaper(paperId, depsWith(repo, boom))
+    expect(out.kind).toBe('failed')
+    expect((await repo.getPaper(paperId))?.status).toBe('failed')
+  })
+
   it('论文已被删除 → 返回 failed 而不是抛错', async () => {
     const repo = freshRepo()
     const out = await reingestPaper('not-exist', depsWith(repo))
     expect(out).toMatchObject({ kind: 'failed', failure: { kind: 'unknown' } })
+  })
+})
+
+describe('reingestPaper × rekeyDerivatives（解析器升级后的重新解析）', () => {
+  const oldOf = (b: { id: string; index: number; text: string }) => [b.id, b.index, b.text]
+
+  it('以 saveBlocks 之前的旧库块与新解析块调用 rekeyDerivatives，之后才建索引并 ready', async () => {
+    const repo = freshRepo()
+    const first = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = first.kind === 'ready' ? first.paper.id : ''
+
+    const seen: { oldBlocks: unknown[]; newBlocks: unknown[]; blocksInRepoAtCall: string[] }[] = []
+    const reparsed: ParseResult = { blocks: [block(0, '页眉'), block(1, '第一段'), block(2, '第二段')], pageCount: 2 }
+    const out = await reingestPaper(paperId, {
+      ...depsWith(repo, async () => reparsed),
+      rekeyDerivatives: async (input) => {
+        seen.push({
+          oldBlocks: input.oldBlocks.map(oldOf),
+          newBlocks: input.newBlocks.map((b) => [b.index, b.text]),
+          blocksInRepoAtCall: (await repo.getBlocks(paperId)).map((b) => b.text),
+        })
+      },
+    })
+
+    expect(out.kind).toBe('ready')
+    expect(seen).toHaveLength(1)
+    expect(seen[0].oldBlocks).toEqual([
+      [`${paperId}:0`, 0, '第一段'],
+      [`${paperId}:1`, 1, '第二段'],
+    ])
+    expect(seen[0].newBlocks).toEqual([
+      [0, '页眉'],
+      [1, '第一段'],
+      [2, '第二段'],
+    ])
+    // 调用时新块已落库（先 saveBlocks 再 rekey）
+    expect(seen[0].blocksInRepoAtCall).toEqual(['页眉', '第一段', '第二段'])
+    expect((await repo.getPaper(paperId))?.blockCount).toBe(3)
+  })
+
+  it('rekeyDerivatives 抛错：只 warn，论文仍 ready 且块为新解析结果', async () => {
+    const repo = freshRepo()
+    const first = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = first.kind === 'ready' ? first.paper.id : ''
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const out = await reingestPaper(paperId, {
+        ...depsWith(repo, async () => ({ blocks: [block(0, '新的一段')] })),
+        rekeyDerivatives: async () => {
+          throw new Error('rekey boom')
+        },
+      })
+      expect(out.kind).toBe('ready')
+      expect((await repo.getPaper(paperId))?.status).toBe('ready')
+      expect((await repo.getBlocks(paperId)).map((b) => b.text)).toEqual(['新的一段'])
+      expect(await repo.getChunks(paperId)).toHaveLength(1)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('没有 rekeyDerivatives 依赖时不读旧块（失败重试路径行为不变）', async () => {
+    const repo = freshRepo()
+    const first = await importPaper({ name: 'a.pdf', size: 20, type: 'application/pdf', bytes: pdfBytes() }, depsWith(repo))
+    const paperId = first.kind === 'ready' ? first.paper.id : ''
+    let reads = 0
+    const counting = { ...repo, getBlocks: (id: string) => (reads++, repo.getBlocks(id)) }
+    const out = await reingestPaper(paperId, depsWith(counting))
+    expect(out.kind).toBe('ready')
+    expect(reads).toBe(0)
   })
 })

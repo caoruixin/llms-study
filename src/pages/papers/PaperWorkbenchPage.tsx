@@ -1,20 +1,32 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import BlockReader from '../../components/papers/BlockReader'
 import ConsentDialog from '../../components/papers/ConsentDialog'
 import HighlightActions from '../../components/papers/HighlightActions'
 import OutlinePane, { buildOutline, type HighlightListItem, type OutlineTab } from '../../components/papers/OutlinePane'
-import PdfViewer from '../../components/papers/PdfViewer'
+import PdfViewer, { type PdfViewerApi } from '../../components/papers/PdfViewer'
 import SelectionActions, { type SelectionSource } from '../../components/papers/SelectionActions'
 import VoiceMicBall from '../../components/papers/VoiceMicBall'
 import WebSnapshotView, { type WebSnapshotApi } from '../../components/papers/WebSnapshotView'
 import { ReaderProvider, ReaderStyles, flashElement, type ReaderApi } from '../../components/papers/ReaderContext'
 import Drawer from '../../components/ui/Drawer'
 import SegmentedTabs from '../../components/ui/SegmentedTabs'
-import { buildAnchorContext, readerScrollTop, resolveAnchor, type ReaderMode, type ScrollTarget } from '../../lib/paper/anchors'
+import {
+  buildAnchorContext,
+  hasNativeScrollAnchoring,
+  pageDomId,
+  readerScrollTop,
+  resolveAnchor,
+  type ReaderMode,
+  type ScrollTarget,
+} from '../../lib/paper/anchors'
 import { describeFileFetchError } from '../../lib/paper/fetchErrors'
 import { briefCacheKey, type BriefData } from '../../lib/paper/briefPipeline'
-import { buildPaperIndex } from '../../lib/paper/ingest'
+import { buildPaperIndex, reingestPaper } from '../../lib/paper/ingest'
+import { createIngestDeps } from '../../lib/paper/ingestDeps'
+import { ingestQueue } from '../../lib/paper/ingestQueue'
+import { reparseStateOf, startReparse, subscribeReparse, type ReparseTaskState } from '../../lib/paper/reparseTasks'
+import { hasPdfLayout, needsLayoutReparse } from '../../lib/paper/pdfLayout'
 import { createRetrievalService, type SearchHit } from '../../lib/paper/retrieval'
 import { getPaperDb } from '../../lib/paper/repo/db'
 import { getRepos } from '../../lib/paper/repo/repos'
@@ -35,7 +47,7 @@ import {
   type BlockRange,
 } from '../../lib/paper/voice/viewportContext'
 import { formatUsd } from '../../lib/paper/usage'
-import type { LangMode, PaperBlock, PaperFormat, PaperRecord, SourceAnchor } from '../../lib/paper/types'
+import type { IngestStage, LangMode, PaperBlock, PaperFormat, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
   MAX_ASK_TEXT,
   PAPER_ASK_ACTIONS,
@@ -58,13 +70,6 @@ import { isHollow, needsRemotePull } from './workbenchLoad'
 /** 阅读进度写库节流 */
 const PROGRESS_DEBOUNCE_MS = 600
 const TOAST_MS = 2600
-
-/**
- * 浏览器有没有原生滚动锚定（overflow-anchor）：Chromium / Firefox 有，WebKit（Safari / iOS）没有。
- * 文本视图里回看块的译文落地会推走正文，只有原生锚定能兜住——据此决定翻译出包顺序（useTranslations.aheadFirst）
- */
-const HAS_NATIVE_SCROLL_ANCHORING =
-  typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('overflow-anchor', 'auto')
 
 /** Copilot 面板懒加载（§4.7）：react-markdown + KaTeX（JS/CSS/字体）只在首次展开面板时拉取 */
 const CopilotPanel = lazy(() => import('../../components/papers/CopilotPanel'))
@@ -138,10 +143,103 @@ const COPILOT_WIDTH_LABEL: Record<CopilotWidth, string> = {
 const COPILOT_CLAMP_WITH_OUTLINE = 'max-w-[calc(100vw-42.75rem)]'
 const COPILOT_CLAMP_NO_OUTLINE = 'max-w-[calc(100vw-26.25rem)]'
 
+/** 打开的论文还在导入 / 解析中（列表页任务在跑）：「还不能阅读」面板按这个间隔重读状态，转为可读即换上正文 */
+const IN_FLIGHT_POLL_MS = 1000
+
 interface Position {
   blockIndex: number
   page?: number
   section?: string
+}
+
+/** 「重新解析」（旧版解析的 PDF 补出版面几何）：空闲 / 进行中（ingest 阶段；waiting = 队列里还有别的任务在跑）/ 失败 */
+type ReparseState =
+  | { kind: 'idle' }
+  | { kind: 'busy'; stage: IngestStage; waiting: boolean }
+  | { kind: 'error'; message: string }
+
+/** 重新解析的阶段文案（同论文库导入进度的口径） */
+const REPARSE_STAGE_LABEL: Record<IngestStage, string> = {
+  queued: '准备中',
+  validating: '校验中',
+  parsing: '解析中',
+  normalizing: '整理段落',
+  indexing: '建索引',
+  ready: '完成',
+  failed: '失败',
+}
+
+/**
+ * 阅读区顶部的叠层提示（成本提示 / 旧版解析横幅）：零高度 sticky 宿主 + 绝对定位。
+ * **不占流内高度**——main 里正文上方不能有会变高变矮的流内元素：提示一出现 / 一关掉，正文整体位移，
+ * WebKit 没有原生滚动锚定兜底，续读对齐完又被推走一截（沿 WebSnapshotView 加载提示的同一理由）。
+ * sticky 让它始终停在窗格顶部：用户在第 5 页点「中文」也看得见，而不是挂在文档开头滚出视野。
+ */
+function ReaderNotices({ children }: { children: ReactNode }) {
+  return (
+    <div className="pointer-events-none sticky top-0 z-20 h-0">
+      <div className="absolute inset-x-0 top-0 flex flex-col gap-2">{children}</div>
+    </div>
+  )
+}
+
+/** 首次在本篇切非原文的一次性成本提示（文本视图、原版 PDF、网页原貌都叠在窗格顶部） */
+function CostNotice({ estimate, onDismiss }: { estimate: number; onDismiss: () => void }) {
+  return (
+    <div className="pointer-events-auto mx-auto flex w-full max-w-3xl items-start gap-2 rounded-lg border border-accent/30 bg-panel px-3 py-2 text-xs text-dim shadow-sm">
+      <span className="min-w-0 flex-1">
+        全文翻译按阅读位置逐段进行，整篇约 {formatUsd(estimate)}
+        （deepseek-v4-pro 估算）；已译段落本地缓存复用，不重复计费。
+      </span>
+      <button type="button" onClick={onDismiss} className="shrink-0 text-accent transition-colors hover:underline">
+        知道了
+      </button>
+    </div>
+  )
+}
+
+/**
+ * 旧版解析 PDF 的横幅（原版视图 + 中文 / 对照）：块没有版面几何，原版 PDF 里画不出译文。
+ * 两条出路：「重新解析」（一次性升级，译文与高亮按文本保留）/「先用文本视图看译文」。
+ */
+function LegacyPdfBanner({
+  state,
+  onReparse,
+  onUseText,
+}: {
+  state: ReparseState
+  onReparse: () => void
+  onUseText: () => void
+}) {
+  const busy = state.kind === 'busy'
+  const btn =
+    'min-h-9 shrink-0 rounded-lg border border-line bg-panel px-3 py-1 text-xs transition-colors hover:bg-panel-2 disabled:cursor-wait disabled:opacity-70 md:min-h-0'
+  return (
+    <div
+      role="status"
+      className="pointer-events-auto mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 rounded-lg border border-amber/40 bg-panel px-3 py-2 text-xs text-dim shadow-sm"
+    >
+      <span className="min-w-0 flex-1 basis-56">
+        {state.kind === 'error' ? (
+          <span className="text-bad">重新解析失败：{state.message}</span>
+        ) : busy ? (
+          state.waiting ? (
+            '排队中：论文库里还有导入任务在解析，完成后自动开始…'
+          ) : (
+            `正在重新解析（${REPARSE_STAGE_LABEL[state.stage]}）…可以继续阅读原文`
+          )
+        ) : (
+          '这篇 PDF 是旧版解析，原版 PDF 里暂时显示不了译文。重新解析后即可就地显示（已译段落与高亮保留）。'
+        )}
+      </span>
+      <button type="button" disabled={busy} onClick={onReparse} className={`${btn} text-accent`}>
+        {busy ? '重新解析中…' : state.kind === 'error' ? '重试' : '重新解析'}
+      </button>
+      <button type="button" onClick={onUseText} className={`${btn} text-fg`}>
+        先用文本视图看译文
+      </button>
+    </div>
+  )
 }
 
 export default function PaperWorkbenchPage() {
@@ -178,6 +276,7 @@ export default function PaperWorkbenchPage() {
   const [searchHits, setSearchHits] = useState<SearchHit[]>([])
   const [searchBusy, setSearchBusy] = useState(false)
   const [searchRan, setSearchRan] = useState(false)
+  const [reparse, setReparse] = useState<ReparseState>({ kind: 'idle' })
 
   const readerRef = useRef<HTMLElement | null>(null)
   const restoredFor = useRef<string | null>(null)
@@ -367,6 +466,32 @@ export default function PaperWorkbenchPage() {
     [copilotRepo, paperId],
   )
 
+  /**
+   * 论文在库里是中间态（queued / parsing / …：列表页的导入或失败重试正在跑）时打开了工作台：「还不能阅读」面板
+   * 自己不会刷新，用户只能退回论文库。每秒重读一次，转为 ready / failed 就换上新记录与正文（审查 P1-2）。
+   * 升级重解析（旧版解析补版面几何）本身不再写中间态（ingest.reingestPaper），这里兜的是导入 / 重试路径。
+   */
+  const paperStatus = paper?.status
+  useEffect(() => {
+    if (!paperId || !paperStatus || paperStatus === 'ready' || paperStatus === 'failed') return
+    const forPaper = paperId
+    let alive = true
+    const timer = setInterval(() => {
+      void (async () => {
+        const record = await repo.getPaper(forPaper)
+        if (!alive || !record || record.status === paperStatus) return
+        const list = record.status === 'ready' ? await repo.getBlocks(forPaper) : null
+        if (!alive || paperIdRef.current !== forPaper) return
+        setPaper(record)
+        if (list) setBlocks(list)
+      })().catch(() => undefined)
+    }, IN_FLIGHT_POLL_MS)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [paperId, paperStatus, repo])
+
   // 原版模式按需取原始字节（列表页不会因此把文件读进内存）；
   // 本地 miss 且已登录 → 从服务端懒拉原始文件写回 files 表（下次纯本地）
   useEffect(() => {
@@ -443,8 +568,26 @@ export default function PaperWorkbenchPage() {
   const isSnapshot = paper?.mime === WEB_SNAPSHOT_MIME
   const isSnapshotRef = useRef(isSnapshot)
   isSnapshotRef.current = isSnapshot
+  /**
+   * 原版 PDF 就地译文（PLAN-pdf-inline-translation §6）：块带版面几何（v3 解析）且语言不是「原文」时，
+   * 原版视图里直接显示译文（中文 = 原位覆盖，对照 = 段落对照流），位置跟踪 / 跳转都升到块精度。
+   * 与 PdfViewer 内部的 inPlace 同一判定——「原文」下 viewer 与工作台都走改动前的页级老路，逐像素不变。
+   */
+  const hasLayout = useMemo(() => hasPdfLayout(blocks), [blocks])
+  const isPlainPdf = paper?.format === 'pdf' && !isSnapshot
+  const pdfInPlace = isPlainPdf && hasLayout && langMode !== 'orig'
+  const pdfInPlaceRef = useRef(pdfInPlace)
+  pdfInPlaceRef.current = pdfInPlace
+  /** 旧版解析（块没有 layout）的 PDF：原版视图切中文 / 对照时提示「重新解析」 */
+  const legacyPdf = isPlainPdf && paper !== null && needsLayoutReparse(paper, blocks)
+  /** 实际驱动翻译的语言：旧版解析 PDF 的原版视图里画不出译文 → 按「原文」处理（横幅期间不发请求、不弹授权与成本提示） */
+  const translateLang: LangMode = mode === 'original' && legacyPdf ? 'orig' : langMode
+  /** 原版 PDF 的命令式 API（文档就绪后回传；viewer 卸载后调用返回 false，调用方回退页级） */
+  const pdfApiRef = useRef<PdfViewerApi | null>(null)
   const readerHiddenRef = useRef(readerHidden)
   readerHiddenRef.current = readerHidden
+  const paperIdRef = useRef(paperId)
+  paperIdRef.current = paperId
   /** 跳转触发的展开由 scrollToAnchor 自己接管滚动，别让「手动恢复正文」的重对齐再抢一次 */
   const jumpExpandRef = useRef(false)
 
@@ -481,9 +624,12 @@ export default function PaperWorkbenchPage() {
   const scrollToAnchor = useCallback((anchor: Partial<SourceAnchor> | null | undefined): ScrollTarget => {
     // 网页原貌：块精度（快照的块与文本视图同一套），滚动交给 iframe 视图的 API；mode 仍报 original
     const snapshotOriginal = modeRef.current === 'original' && isSnapshotRef.current
-    const target = snapshotOriginal
-      ? { ...resolveAnchor(anchor, anchorCtxRef.current, 'text'), mode: 'original' as const }
-      : resolveAnchor(anchor, anchorCtxRef.current, modeRef.current)
+    // 原版 PDF 就地译文：块有几何，同样升到块精度（以 'text' 解析、报 original），滚动交给 PdfViewer 的 API
+    const pdfBlockOriginal = modeRef.current === 'original' && pdfInPlaceRef.current
+    const target =
+      snapshotOriginal || pdfBlockOriginal
+        ? { ...resolveAnchor(anchor, anchorCtxRef.current, 'text'), mode: 'original' as const }
+        : resolveAnchor(anchor, anchorCtxRef.current, modeRef.current)
     const domId = target.domId
     // 专注陪读下正文是 display:none：目标元素没有布局，必须先展开、等两帧排版完成再滚
     const expanding = readerHiddenRef.current
@@ -498,6 +644,16 @@ export default function PaperWorkbenchPage() {
         if (expanding) requestAnimationFrame(() => requestAnimationFrame(go))
         else go()
       }
+    } else if (pdfBlockOriginal) {
+      const idx = target.blockIndex
+      const page = target.page
+      const go = () => {
+        if (idx !== undefined && pdfApiRef.current?.scrollToBlock(idx, { flash: true, behavior: 'smooth' })) return
+        // 该块没有几何 / viewer 未就绪：回退页级（与改动前的原版视图同一精度）
+        if (page !== undefined) scrollAndFlash(pageDomId(page))
+      }
+      if (expanding) requestAnimationFrame(() => requestAnimationFrame(go))
+      else go()
     } else if (domId) {
       if (expanding) requestAnimationFrame(() => requestAnimationFrame(() => scrollAndFlash(domId)))
       else scrollAndFlash(domId)
@@ -526,11 +682,25 @@ export default function PaperWorkbenchPage() {
   const alignToPosition = useCallback(() => {
     const pos = positionRef.current
     const snapshotOriginal = modeRef.current === 'original' && isSnapshotRef.current
+    const pdfBlockOriginal = modeRef.current === 'original' && pdfInPlaceRef.current
     const target = resolveAnchor(
       { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
       anchorCtxRef.current,
-      snapshotOriginal ? 'text' : modeRef.current,
+      snapshotOriginal || pdfBlockOriginal ? 'text' : modeRef.current,
     )
+    if (pdfBlockOriginal) {
+      const idx = target.blockIndex
+      const page = target.page ?? pos.page
+      // 两帧后再滚：等占位页完成首次布局；块对齐失败（无几何）回退页顶
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (idx !== undefined && pdfApiRef.current?.scrollToBlock(idx, { behavior: 'auto' })) return
+          const el = page !== undefined ? document.getElementById(pageDomId(page)) : null
+          if (el) scrollReaderTo(el, 'auto')
+        })
+      })
+      return
+    }
     if (snapshotOriginal) {
       const idx = target.blockIndex
       if (idx === undefined) return
@@ -567,21 +737,15 @@ export default function PaperWorkbenchPage() {
   }, [])
 
   /**
-   * 语言切换（与视图正交）：PDF 原版视图下点中文/对照自动转文本视图——译文只在语义化视图渲染；
-   * 网页原貌视图能就地挂译文（WebSnapshotView 的 applyLangState），不切视图。
+   * 语言切换（与视图正交），**不切视图**：网页原貌就地挂译文（WebSnapshotView 的 applyLangState）；
+   * 原版 PDF 有版面几何时就地渲染（中文覆盖 / 段落对照流），旧版解析没有几何时仍停在原版视图显示原文 +
+   * 「重新解析」横幅——用户看着原文自己选（重新解析 / 先用文本视图），比被动切走更清楚。
    */
-  const changeLang = useCallback(
-    (next: LangMode) => {
-      setLangMode(next)
-      if (next === 'orig') return
-      setCostNotice((s) => (s === 'unseen' ? 'show' : s))
-      if (modeRef.current === 'original' && !isSnapshotRef.current) {
-        changeMode('text')
-        setToast('已切换到文本视图显示译文')
-      }
-    },
-    [changeMode],
-  )
+  const changeLang = useCallback((next: LangMode) => {
+    setLangMode(next)
+    if (next === 'orig') return
+    setCostNotice((s) => (s === 'unseen' ? 'show' : s))
+  }, [])
 
   // 全文翻译：整表缓存 + 懒翻译窗口调度；deepseek 授权对话框由本页渲染（复用 ConsentDialog）
   const {
@@ -593,11 +757,14 @@ export default function PaperWorkbenchPage() {
   } = useTranslations({
     paper,
     blocks,
-    langMode,
+    // 旧版解析 PDF 停在原版视图时只显示原文 + 横幅：译文没有地方显示，翻译窗口不该启动（授权框、计费请求都白费，
+    // 审查 P1-1）；「先用文本视图看译文」切到文本视图后按真实语言激活
+    langMode: translateLang,
     currentBlockIndex: position.blockIndex,
     // 「当前块起往后在前、回看在后」只在有锚定兜底时用：网页原貌视图有跨 iframe 锚定（PLAN 2.1），
+    // 原版 PDF 中文覆盖页高恒定、对照流在 WebKit 由 PdfViewer 自己补偿（compensateScroll），
     // 文本视图靠浏览器原生 overflow-anchor；其余场合（WebKit 的文本视图）保持文档顺序，别让位移挪到读一半才跳
-    aheadFirst: (mode === 'original' && isSnapshot) || HAS_NATIVE_SCROLL_ANCHORING,
+    aheadFirst: (mode === 'original' && (isSnapshot || pdfInPlace)) || hasNativeScrollAnchoring,
   })
   const translationEstimate = useMemo(() => estimateTranslationCost(blocks, DEEPSEEK_V4_PRO.pricing), [blocks])
 
@@ -620,9 +787,14 @@ export default function PaperWorkbenchPage() {
     wasReaderHidden.current = readerHidden
   }, [readerHidden, alignToPosition])
 
-  const handlePdfLoaded = useCallback(() => {
-    if (paperId) alignOnce(`${paperId}:original`)
-  }, [alignOnce, paperId])
+  /** 原版 PDF 文档就绪：记下 API，再把阅读位置接上（就地译文时按块对齐，否则按页） */
+  const handlePdfReady = useCallback(
+    (api: PdfViewerApi) => {
+      pdfApiRef.current = api
+      if (paperId) alignOnce(`${paperId}:original`)
+    },
+    [alignOnce, paperId],
+  )
 
   /** 快照 iframe 文档就绪：记下 API，再把阅读位置接上（与 PDF 的 onLoaded 同一 aligned 键） */
   const handleSnapshotReady = useCallback(
@@ -663,6 +835,11 @@ export default function PaperWorkbenchPage() {
   }, [])
 
   const handleVisiblePage = useCallback((page: number) => {
+    // 就地译文：块级位置由 handlePdfVisibleBlock 维护，这里只跟页码——别把 blockIndex 冲回页首块
+    if (pdfInPlaceRef.current) {
+      setPosition((prev) => (prev.page === page ? prev : { ...prev, page }))
+      return
+    }
     const blockIndex = anchorCtxRef.current.firstBlockOfPage[page]
     setPosition((prev) => {
       if (prev.page === page) return prev
@@ -671,6 +848,93 @@ export default function PaperWorkbenchPage() {
     })
     if (blockIndex !== undefined) setMaxBlockIndex((m) => (blockIndex > m ? blockIndex : m))
   }, [])
+
+  /** 原版 PDF 就地译文的当前块（PdfViewer 按观察带几何判定）：块精度的位置 → 翻译窗口跟着段落走 */
+  const handlePdfVisibleBlock = useCallback((blockIndex: number, page: number) => {
+    const section = blockByIndexRef.current[blockIndex]?.anchor.section
+    setPosition((prev) =>
+      prev.blockIndex === blockIndex && prev.page === page && prev.section === section
+        ? prev
+        : { blockIndex, page, section },
+    )
+    setMaxBlockIndex((m) => (blockIndex > m ? blockIndex : m))
+  }, [])
+
+  /**
+   * 原版 PDF 的渲染形态：原文页（含旧版解析）/ 中文覆盖 / 段落对照流。覆盖与原文页高相同，滚动位置天然接得上；
+   * 对照流整页换成另一套 DOM（页变高），浏览器的原生锚点随旧节点一起被删——进出对照流都按阅读位置重新对齐。
+   * 用 layout effect **同步**对齐（新 DOM 提交后、绘制与 scroll 事件之前）：若等两帧，scrollTop 先停在新文档里
+   * 毫不相干的位置，当前块 / 当前页测量会把那里报上来，「已读」进度被冲高（对照流 → 原文时页变矮，尤其明显）。
+   */
+  const pdfRenderMode = !pdfInPlace ? 'pages' : langMode === 'both' ? 'flow' : 'overlay'
+  const prevRenderModeRef = useRef(pdfRenderMode)
+  useLayoutEffect(() => {
+    const prev = prevRenderModeRef.current
+    prevRenderModeRef.current = pdfRenderMode
+    if (prev === pdfRenderMode || mode !== 'original' || isSnapshot || !bytes) return
+    if (prev !== 'flow' && pdfRenderMode !== 'flow') return
+    // 块有几何时按块（原文页也行）；viewer 未就绪 / 无几何 → 两帧后按阅读位置对齐
+    if (!pdfApiRef.current?.scrollToBlock(positionRef.current.blockIndex, { behavior: 'auto' })) alignToPosition()
+  }, [pdfRenderMode, mode, isSnapshot, bytes, alignToPosition])
+
+  // 视图 / 渲染形态一换，上一种形态上报的可见区间就不再成立：清掉，等新形态重新上报（期间语音按阅读位置兜底）
+  useEffect(() => {
+    visibleRangeRef.current = null
+  }, [mode, pdfRenderMode])
+
+  /**
+   * 旧版解析的 PDF 一次性升级（PLAN §4 / §6）：任务登记在模块级 reparseTasks（按论文 id 去重、跨挂载可订阅），
+   * 走全局导入队列（列表页正在导入时只排队，不会两个 pdf.js 解析并行），reingestPaper 重跑解析并按文本把
+   * 译文 / 高亮重打键到新块序号。升级重解析期间论文在库里始终是 ready（中途刷新 / 离开都不会卡在「解析中」），
+   * 内存里的 paper / bytes 不变 → PdfViewer 不卸载，用户可以继续读原文。
+   * 完成（本挂载订阅到 done）：重读 paper / blocks → 位置按「当前页首块」重设（块序号已漂移）→ 检索缓存失效 →
+   * 派发 paper-sync-pulled 让译文 / 高亮两个 hook 重读重打键后的行（复用同步引擎的失效契约）。
+   * 解析中离开再回来：新挂载订阅到的是同一个在途任务（横幅继续显示阶段、按钮禁用），完成时由它刷新。
+   */
+  useEffect(() => {
+    if (!paperId) return
+    const forPaper = paperId
+    const toBanner = (s: ReparseTaskState): ReparseState =>
+      s.kind === 'busy' ? s : s.kind === 'error' ? { kind: 'error', message: s.message } : { kind: 'idle' }
+    setReparse(toBanner(reparseStateOf(forPaper)))
+    let alive = true
+    const onDone = async () => {
+      const [record, list] = await Promise.all([repo.getPaper(forPaper), repo.getBlocks(forPaper)])
+      if (!alive || paperIdRef.current !== forPaper) return
+      if (record) setPaper(record)
+      setBlocks(list)
+      // 块序号随解析规则漂移：位置按当前页的首块重设，越界的已读进度钳回去
+      const ctx = buildAnchorContext(list, record?.pageCount)
+      const prev = positionRef.current
+      const fromPage = prev.page !== undefined ? ctx.firstBlockOfPage[prev.page] : undefined
+      const blockIndex = fromPage ?? Math.max(0, Math.min(prev.blockIndex, list.length - 1))
+      const nextBlock = list.find((b) => b.index === blockIndex)
+      setPosition({ blockIndex, page: prev.page ?? nextBlock?.anchor.page, section: nextBlock?.anchor.section })
+      setMaxBlockIndex((m) => Math.max(0, Math.min(m, list.length - 1)))
+      retrieval.invalidate(forPaper)
+      window.dispatchEvent(
+        new CustomEvent('paper-sync-pulled', { detail: { paperIds: [forPaper], tables: ['translations', 'highlights'] } }),
+      )
+      setToast('已重新解析，原版 PDF 可显示译文')
+    }
+    const off = subscribeReparse(forPaper, (s) => {
+      if (!alive) return
+      setReparse(toBanner(s))
+      if (s.kind === 'error') console.error('[pdf] 重新解析失败', s.message)
+      if (s.kind === 'done') void onDone().catch((e: unknown) => console.error('[pdf] 重新解析后重读失败', e))
+    })
+    return () => {
+      alive = false
+      off()
+    }
+  }, [paperId, repo, retrieval])
+
+  const runReparse = useCallback(() => {
+    if (!paperId) return
+    const forPaper = paperId
+    // 已有在途任务（含别的挂载发起的）→ startReparse 返回 false，不重复排队；横幅状态由上面的订阅驱动
+    startReparse(forPaper, ingestQueue, (onState) => reingestPaper(forPaper, createIngestDeps({ onState })))
+  }, [paperId])
 
   const totalBlocks = blocks.length
   const ratio = totalBlocks ? Math.min(1, (maxBlockIndex + 1) / totalBlocks) : 0
@@ -826,7 +1090,8 @@ export default function PaperWorkbenchPage() {
   /**
    * 语音转写完成 → 发送瞬间快照上下文（不是录音瞬间：说话期间用户可能还在滚动）：
    * 划词选区（若有）+ 屏幕可见正文区间 → requestVoiceAsk 交给 CopilotPanel 消费。
-   * PDF 原版视图没有块级观察器，用当前页反查块区间；再兜底为阅读位置附近的窗口。
+   * PDF 原版视图：就地译文时 viewer 按几何上报可见块区间（同文本视图走 visibleRangeRef）；
+   * 原文 / 旧版解析没有块级测量，用当前页反查块区间；再兜底为阅读位置附近的窗口。
    */
   const handleVoiceTranscript = useCallback(
     (text: string) => {
@@ -834,7 +1099,7 @@ export default function PaperWorkbenchPage() {
       const pos = positionRef.current
       const blockList = blockByIndexRef.current
       let range: BlockRange | null =
-        modeRef.current === 'original' && formatRef.current === 'pdf'
+        modeRef.current === 'original' && formatRef.current === 'pdf' && !pdfInPlaceRef.current
           ? pos.page !== undefined
             ? pageBlockRange(anchorCtxRef.current.firstBlockOfPage, pos.page, blockList.length)
             : null
@@ -1168,6 +1433,15 @@ export default function PaperWorkbenchPage() {
               mode === 'original' && isSnapshot && bytes ? 'p-0 overflow-x-hidden' : 'p-2 md:p-4'
             }`}
           >
+            {/* 叠层提示：首次切非原文的成本提示、旧版解析 PDF 的「重新解析」横幅（零流内高度，见 ReaderNotices） */}
+            <ReaderNotices>
+              {costNotice === 'show' && translateLang !== 'orig' && (
+                <CostNotice estimate={translationEstimate.cost} onDismiss={() => setCostNotice('dismissed')} />
+              )}
+              {mode === 'original' && langMode !== 'orig' && legacyPdf && (
+                <LegacyPdfBanner state={reparse} onReparse={runReparse} onUseText={() => changeMode('text')} />
+              )}
+            </ReaderNotices>
             {/*
               空心论文（papers 行说「可读」、本地一个正文块都没有）：原设备还没把 blocks 推上服务端。
               渲染解释面板而不是空白阅读器/「0 段」——「重新拉取」每次打开都能再试（判定已不锁存），
@@ -1222,7 +1496,17 @@ export default function PaperWorkbenchPage() {
                     bytes={bytes}
                     containerRef={readerRef}
                     onVisiblePage={handleVisiblePage}
-                    onLoaded={handlePdfLoaded}
+                    blocks={blocks}
+                    langMode={langMode}
+                    translations={translations}
+                    failedTranslations={failedTranslations}
+                    translationAuthIssue={translationAuthIssue}
+                    onRetryTranslation={retryBlock}
+                    highlights={highlightsByBlock}
+                    onVisibleBlock={handlePdfVisibleBlock}
+                    onVisibleRange={handleVisibleRange}
+                    onReady={handlePdfReady}
+                    compensateScroll={!hasNativeScrollAnchoring}
                   />
                 )
               ) : bytesError ? (
@@ -1258,22 +1542,6 @@ export default function PaperWorkbenchPage() {
               )
             ) : (
               <>
-                {/* 首次切非原文的一次性成本提示（内联在阅读区顶部，不挡正文） */}
-                {costNotice === 'show' && langMode !== 'orig' && (
-                  <div className="mx-auto mb-2 flex max-w-3xl items-start gap-2 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-xs text-dim">
-                    <span className="min-w-0 flex-1">
-                      全文翻译按阅读位置逐段进行，整篇约 {formatUsd(translationEstimate.cost)}
-                      （deepseek-v4-pro 估算）；已译段落本地缓存复用，不重复计费。
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setCostNotice('dismissed')}
-                      className="shrink-0 text-accent transition-colors hover:underline"
-                    >
-                      知道了
-                    </button>
-                  </div>
-                )}
                 <BlockReader
                   blocks={blocks}
                   containerRef={readerRef}
@@ -1346,8 +1614,9 @@ export default function PaperWorkbenchPage() {
           containerRef={readerRef}
           anchorFromElement={anchorFromElement}
           onAction={handleAskAction}
-          // 文本视图与网页原貌支持高亮（块级宿主 + 字符偏移）；原版 PDF 的锚点只到页，捕获不出块内偏移
-          onHighlight={mode === 'text' || isSnapshot ? handleHighlight : undefined}
+          // 文本视图、网页原貌、原版 PDF 就地译文支持高亮（块级宿主 + 字符偏移：译文块 / 对照流译文 div 带 data-hl-host）；
+          // 原文模式的 PDF 文字层没有宿主（锚点只到页），捕获不出块内偏移
+          onHighlight={mode === 'text' || isSnapshot || pdfInPlace ? handleHighlight : undefined}
           getSources={getSelectionSources}
         />
         <HighlightActions onRemove={removeHighlight} getSources={getSelectionSources} />

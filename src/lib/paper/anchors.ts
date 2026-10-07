@@ -195,6 +195,20 @@ export interface PageEdges {
 export const CURRENT_PAGE_EPSILON = 8
 
 /**
+ * 「当前块」观察带占阅读窗格高度的比例：带 = `[viewportTop + CURRENT_PAGE_EPSILON, viewportTop + clientHeight × 0.25]`。
+ * 这是 BlockReader 用 IntersectionObserver `rootMargin: '-8px 0px -75% 0px'` 的几何等价物——
+ * 原版 PDF 视图没有逐块元素可观察（覆盖模式块边是纯几何），只能在 rAF 测量里按同一口径算。
+ */
+export const CURRENT_BLOCK_BAND_RATIO = 0.25
+
+/**
+ * 浏览器有没有原生滚动锚定（overflow-anchor）：Chromium / Firefox 有，WebKit（Safari / iOS）没有。
+ * 文本视图里回看块的译文落地会推走正文，只有原生锚定能兜住——据此决定翻译出包顺序（useTranslations.aheadFirst）
+ */
+export const hasNativeScrollAnchoring =
+  typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('overflow-anchor', 'auto')
+
+/**
  * 从页矩形数组求「当前页」= **盖住滚动容器顶边的那一页**。
  *
  * 语义之所以要单独定义：原版 PDF 的渲染窗口用 IntersectionObserver + `rootMargin: '20% 0px'`

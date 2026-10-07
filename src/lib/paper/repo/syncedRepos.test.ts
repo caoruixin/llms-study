@@ -457,3 +457,62 @@ describe('createSyncedHighlightRepository（§1.6）', () => {
     expect(await db.outbox.count()).toBe(0)
   })
 })
+
+describe('createSyncedTranslationRepository.deleteTranslations（重打键墓碑）', () => {
+  const tr = (paperId: string, blockIndex: number): BlockTranslation => ({
+    id: `${paperId}:${blockIndex}:zh`,
+    paperId,
+    blockIndex,
+    blockId: `${paperId}:${blockIndex}`,
+    targetLang: 'zh',
+    promptVersion: 'v1',
+    model: 'm',
+    srcHash: 'h',
+    text: `译${blockIndex}`,
+    createdAt: 1,
+    updatedAt: 2,
+  })
+
+  it('每个存在的 id 一条墓碑（paperId 从该行反查）；不存在的 id 不入队；空参不入队', async () => {
+    const db = freshDb()
+    const repo = createSyncedTranslationRepository(db, always)
+    await repo.putTranslations([tr('p1', 0), tr('p1', 1), tr('p2', 0)])
+    await db.outbox.clear()
+
+    await repo.deleteTranslations(['p1:0:zh', 'p2:0:zh', 'p1:404:zh'])
+    expect((await repo.getTranslations('p1')).map((r) => r.id)).toEqual(['p1:1:zh'])
+    expect(await repo.getTranslations('p2')).toEqual([])
+    const queue = await db.outbox.toArray()
+    expect(queue.map((i) => [i.op, i.tbl, i.recordId, i.paperId, i.deleted])).toEqual([
+      ['record', 'translations', 'p1:0:zh', 'p1', true],
+      ['record', 'translations', 'p2:0:zh', 'p2', true],
+    ])
+
+    await repo.deleteTranslations([])
+    expect(await db.outbox.count()).toBe(2)
+  })
+
+  it('先删后写的重打键序列：墓碑排在新行 record 之前（另一台设备不会拉回旧 id 的行）', async () => {
+    const db = freshDb()
+    const repo = createSyncedTranslationRepository(db, always)
+    await repo.putTranslations([tr('p1', 5)])
+    await db.outbox.clear()
+
+    await repo.deleteTranslations(['p1:5:zh'])
+    await repo.putTranslations([{ ...tr('p1', 5), id: 'p1:6:zh', blockIndex: 6, blockId: 'p1:6' }])
+    const queue = await db.outbox.toArray()
+    expect(queue.map((i) => [i.recordId, i.deleted ?? false])).toEqual([
+      ['p1:5:zh', true],
+      ['p1:6:zh', false],
+    ])
+  })
+
+  it('shouldQueue=false：本地删照常，零入队', async () => {
+    const db = freshDb()
+    const repo = createSyncedTranslationRepository(db, never)
+    await repo.putTranslations([tr('p1', 0)])
+    await repo.deleteTranslations(['p1:0:zh'])
+    expect(await db.translations.count()).toBe(0)
+    expect(await db.outbox.count()).toBe(0)
+  })
+})
