@@ -22,6 +22,7 @@ import {
 } from '../../lib/paper/anchors'
 import { ensurePdfCompat } from '../../lib/paper/pdfCompat'
 import {
+  groupBlocksByPage,
   hasPdfLayout,
   insertionPushesReader,
   partitionPageFlow,
@@ -553,22 +554,11 @@ export default function PdfViewer({
     [pageSizes, doc],
   )
 
-  /** 页 → 在该页有 seg 的块（文档序） */
-  const blocksByPage = useMemo(() => {
-    const m = new Map<number, PaperBlock[]>()
-    if (!blocks || !hasLayout) return m
-    for (const b of blocks) {
-      let last = -1
-      for (const seg of b.layout?.segs ?? []) {
-        if (seg.page === last) continue
-        last = seg.page
-        const list = m.get(seg.page)
-        if (!list) m.set(seg.page, [b])
-        else if (list[list.length - 1] !== b) list.push(b)
-      }
-    }
-    return m
-  }, [blocks, hasLayout])
+  /** 页 → 在该页有 seg 的块（文档序）；与导出内核共用 groupBlocksByPage（isLabelLike 的页级上下文才一致） */
+  const blocksByPage = useMemo(
+    () => (blocks && hasLayout ? groupBlocksByPage(blocks) : new Map<number, PaperBlock[]>()),
+    [blocks, hasLayout],
+  )
   const blockByIndex = useMemo(() => {
     const m = new Map<number, PaperBlock>()
     for (const b of blocks ?? []) m.set(b.index, b)

@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   assignPointsToStrips,
+  buildPieces,
   columnExtents,
+  groupBlocksByPage,
   hasPdfLayout,
+  pieceText,
   isLabelLike,
   isProseLayout,
   labelContextOf,
@@ -948,5 +951,95 @@ describe('splitTranslation', () => {
     expect(splitTranslation('。。。', [1, 1, 1])).toEqual(['。', '。', '。'])
     expect(splitTranslation('ab', [1, 1, 1])).toEqual(['a', 'b', ''])
     expect(splitTranslation('😀😀😀😀', [1, 1])).toEqual(['😀😀', '😀😀'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 覆盖片（buildPieces / pieceText）与按页分组（导出内核与覆盖层共用）
+// ---------------------------------------------------------------------------
+
+describe('buildPieces', () => {
+  const PROSE = 'This is an ordinary English paragraph with enough words to look like running prose text.'
+  // 行框 [x0, yTop, x1, h]（用户空间，y 向上），yTop 带小数：取整与不取整的差别才看得见
+  const segsOf = (n: number, x0 = 60.4, x1 = 290.3, yTop = 700.6): PdfLayoutSeg[] => [
+    { page: 1, col: 'left', lines: Array.from({ length: n }, (_, i) => [x0, yTop - i * 14, x1, 12.2] as PdfLineBox) },
+  ]
+  const blocks: PaperBlock[] = [
+    block(0, 'paragraph', PROSE, segsOf(3)),
+    block(1, 'paragraph', PROSE, [{ page: 1, col: 'right', lines: [[320, 700, 540, 12]] }]),
+    block(2, 'formula', 'E = mc^2', [{ page: 1, col: 'left', lines: [[120, 600, 230, 12]] }]),
+  ]
+  const geom: PageGeom = { pageX: 0, pageY: 0, pageWidth: 600, pageHeight: 800 }
+  const blockOf = (i: number) => blocks.find((b) => b.index === i)
+
+  it('round（缺省）：scaleRect 四边取整 + 外扩取整；round:false：直接 r × scale、外扩保留小数', () => {
+    const portions = segmentsOnPage(blocks, 1, geom)
+    const rounded = buildPieces(portions, blockOf, 1)
+    const exact = buildPieces(portions, blockOf, 1, { round: false })
+    expect(rounded.map((p) => p.key)).toEqual(['0:0', '1:0'])
+    expect(exact.map((p) => p.key)).toEqual(['0:0', '1:0'])
+    const r = rounded[0].box
+    const e = exact[0].box
+    // 行框并集：x 60.4 → 取整 60，外扩 1 → 59；精确 59.4
+    expect(r.x).toBe(59)
+    expect(e.x).toBeCloseTo(59.4)
+    expect(Number.isInteger(r.y) && Number.isInteger(r.w) && Number.isInteger(r.h)).toBe(true)
+    // 精确口径：顶 = (800 − 700.6) − 0.1 × 12.2 = 98.18
+    expect(e.y).toBeCloseTo(99.4 - 1.22)
+    expect(e.w).toBeCloseTo(290.3 - 60.4 + 2)
+    // 其余参数两种口径一致
+    expect(exact[0].f0).toBeCloseTo(rounded[0].f0)
+    expect(exact[0].lh0).toBeCloseTo(rounded[0].lh0)
+    expect(exact[0].fMin).toBeCloseTo(rounded[0].fMin)
+    expect(exact[0].center).toBe(rounded[0].center)
+  })
+
+  it('scale 放大：round:false 的框是 scale = 1 框的等比放大', () => {
+    const portions = segmentsOnPage(blocks, 1, geom)
+    const one = buildPieces(portions, blockOf, 1, { round: false })[0]
+    const two = buildPieces(portions, blockOf, 2, { round: false })[0]
+    expect(two.box.w).toBeCloseTo(one.box.w * 2 - 2)
+    expect(two.f0).toBeCloseTo(one.f0 * 2)
+    expect(two.lh0).toBeCloseTo(one.lh0 * 2)
+  })
+})
+
+describe('pieceText', () => {
+  const b = block(7, 'paragraph', 'x', [
+    { page: 1, col: 'left', lines: [[0, 100, 10, 10], [0, 88, 10, 10]] },
+    { page: 1, col: 'right', lines: [[0, 100, 10, 10], [0, 88, 10, 10]] },
+  ])
+  const portionOf = (segIndex: number, segCount: number) => ({ blockIndex: 7, segIndex, segCount, col: 'left' as const, rect: { x: 0, y: 0, w: 1, h: 1 }, lines: [], prose: true, label: false })
+
+  it('跨 seg 按行数比例拆（切在标点后），单片块整段原样', () => {
+    const text = '第一句。第二句。'
+    expect(pieceText({ portion: portionOf(0, 2), block: b }, text)).toBe('第一句。')
+    expect(pieceText({ portion: portionOf(1, 2), block: b }, text)).toBe('第二句。')
+    expect(pieceText({ portion: portionOf(0, 1), block: b }, text)).toBe(text)
+  })
+
+  it('seg 数与 layout 对不上 → 退回整段', () => {
+    expect(pieceText({ portion: portionOf(0, 3), block: b }, '一二三')).toBe('一二三')
+  })
+})
+
+describe('groupBlocksByPage', () => {
+  it('页 → 本页有 seg 的块（文档序）；跨页块出现在每一页、同页多 seg 只出现一次；无 layout 的块不出现', () => {
+    const blocks: PaperBlock[] = [
+      block(0, 'heading', 'A', [{ page: 1, col: 'full', lines: [[0, 10, 10, 10]] }]),
+      block(1, 'paragraph', 'B', [
+        { page: 1, col: 'left', lines: [[0, 10, 10, 10]] },
+        { page: 1, col: 'right', lines: [[0, 10, 10, 10]] },
+        { page: 2, col: 'left', lines: [[0, 10, 10, 10]] },
+      ]),
+      block(2, 'paragraph', 'C'),
+      block(3, 'paragraph', 'D', [{ page: 3, col: 'full', lines: [[0, 10, 10, 10]] }]),
+    ]
+    const m = groupBlocksByPage(blocks)
+    expect([...m.keys()]).toEqual([1, 2, 3])
+    expect(m.get(1)!.map((b) => b.index)).toEqual([0, 1])
+    expect(m.get(2)!.map((b) => b.index)).toEqual([1])
+    expect(m.get(3)!.map((b) => b.index)).toEqual([3])
+    expect(groupBlocksByPage([]).size).toBe(0)
   })
 })

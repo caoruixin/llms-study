@@ -74,9 +74,25 @@ import type {
   SourceAnchor,
   StoredCiteEntry,
 } from '../../lib/paper/types'
-import { usePaperUi, type PaperAskAction, type PendingAsk } from '../../pages/papers/paperUiStore'
+import { usePaperUi, type PendingAsk } from '../../pages/papers/paperUiStore'
+import {
+  askTemplate,
+  composeAskTurn,
+  historyTextOf,
+  nextQueuedAsk,
+  rejectedAskNotice,
+  rejectedComposerNotice,
+  replayTurnOf,
+  shouldPauseQueue,
+  type MessageQuote,
+  type SendResult,
+  type TurnRejectReason,
+} from '../../lib/paper/askCompose'
+import { MQ, useMediaQuery } from '../../lib/useMediaQuery'
 import type { ChatMessage } from '../../lib/llmClient'
+import ComposerAsks from './ComposerAsks'
 import CopilotMessageView from './CopilotMessage'
+import QuoteBlock from './CopilotQuote'
 import ConsentDialog from './ConsentDialog'
 import VoiceConsentDialog from './VoiceConsentDialog'
 import CostConfirm, { type CostConfirmInfo } from './CostConfirm'
@@ -85,9 +101,9 @@ import ProfileChip from './ProfileChip'
 import TurnFeedback from './TurnFeedback'
 
 /**
- * Paper Copilot 面板（Phase 3 真实现）：会话消息、流式轮次、pendingAsks 消费、
- * 引导模式入口（本阶段仅「论文速览」）、论文地图管线、授权与成本确认、usage 显示。
- * 竞态模型：turnEngine 的代数/所有权 runner + 面板侧 rAF 批量刷新。
+ * Paper Copilot 面板（Phase 3 真实现）：会话消息、流式轮次、选区动作队列（空闲立即发起 / 忙时排队续发）、
+ * 输入框引用 chip、引导模式入口、论文地图管线、授权与成本确认、usage 显示。
+ * 竞态模型：turnEngine 的代数/所有权 runner + 面板侧 rAF 批量刷新 + sendTurn 的同步 occupiedRef 门闸。
  */
 
 interface Props {
@@ -96,9 +112,6 @@ interface Props {
   retrieval: RetrievalService
   position: { blockIndex: number; page?: number; section?: string }
   sectionTitles: readonly string[]
-  asks: PendingAsk[]
-  onRemoveAsk: (id: string) => void
-  onClearAsks: () => void
   onJumpAnchor: (anchor: SourceAnchor) => ScrollTarget
   onClose: () => void
   onToggleSensitive: (sensitive: boolean) => void
@@ -106,6 +119,12 @@ interface Props {
 
 /** 本轮任务档位：chat/deep/deepAlt 均走 DeepSeek（用户决策 2026-08-13）；deepAlt 为显式点击的深度解释重发 */
 type TurnTask = 'chat' | 'deep' | 'deepAlt'
+
+/** 深度解释重放「只有引用、查不到模板」的轮次时的兜底问题 */
+const DEEP_QUOTE_FALLBACK = '请就我引用的内容给出更深入的解释'
+
+/** heldIds 的空值（引用稳定：解除暂停时不必每次新建） */
+const NO_HELD: ReadonlySet<string> = new Set()
 
 interface SendParams {
   question: string
@@ -116,8 +135,10 @@ interface SendParams {
   task: TurnTask
   planIsland: boolean
   label?: string
-  /** 落库与展示用的用户消息文本（含引用的选区） */
+  /** 落库与展示用的用户消息正文（只放用户输入的问题；引用走 quotes，快捷动作为空串） */
   displayText: string
+  /** 随问题落库的引用块：气泡里渲染为可回跳的 QuoteBlock，历史给模型时由 historyTextOf 拼回 */
+  quotes?: MessageQuote[]
   /** 逐轮附加指令（引导步脚本 / learner / verdict 岛要求） */
   extraDirectives?: readonly string[]
   /** teach-back 轮：verdict 岛回写画像时的概念 */
@@ -133,23 +154,10 @@ type GateRequest =
   | { kind: 'voice-consent'; resolve: (ok: boolean) => void }
   | { kind: 'cost'; info: CostConfirmInfo; resolve: (ok: boolean) => void }
 
-const ASK_TEMPLATES: Record<Exclude<PaperAskAction, 'queue'>, { question: string; task: TurnTask }> = {
-  explain: { question: '请解释我选中的这段论文内容。', task: 'chat' },
-  simpler: {
-    question: '请用更简单的方式解释我选中的这段内容：假设我是入门读者，先给直觉和类比，再给必要术语。',
-    task: 'chat',
-  },
-  derive: { question: '请逐步推导/拆解我选中的这段中的公式或方法：给出每一步的依据与每个符号的含义。', task: 'deep' },
-  example: { question: '请举一个具体的例子帮助理解我选中的这段内容。', task: 'chat' },
-}
-
 const PROVIDER_KEY_LABEL: Record<PaperProviderId, string> = {
   deepseek: 'DeepSeek',
   kimi: 'Kimi (Moonshot)',
 }
-
-/** 选区来自应用内译文时注入 question 最前（displayText 不带，用户不可见）：模型须回到英文原文语义作答 */
-const TRANSLATED_ASK_NOTE = '以下引用是应用内生成的中文译文，原文为英文，请以原文语义为准。'
 
 /**
  * 错误文案（§QA D-10）：底层 message 已经中文化过一次，这里再套前缀就成了
@@ -185,9 +193,6 @@ export default function CopilotPanel({
   retrieval,
   position,
   sectionTitles,
-  asks,
-  onRemoveAsk,
-  onClearAsks,
   onJumpAnchor,
   onClose,
   onToggleSensitive,
@@ -203,9 +208,43 @@ export default function CopilotPanel({
   const [errorProvider, setErrorProvider] = useState<PaperProviderId>('deepseek')
   const [gate, setGate] = useState<GateRequest | null>(null)
   const [input, setInput] = useState('')
-  const [attachedAsk, setAttachedAsk] = useState<PendingAsk | null>(null)
   const [profiles, setProfiles] = useState<ConceptProfile[]>([])
   const [guided, setGuided] = useState<GuidedRun | null>(null)
+
+  // 选区动作队列 / 输入框引用 / 滚动（B.5）
+  /** 同步单飞门闸：busy 要等 live 第一帧（ensureConsent 之后）才为真，两次快速发起会各插一条孤儿气泡 */
+  const occupiedRef = useRef(false)
+  /** 已发起过的队列项 id：StrictMode / 重渲染下 drain effect 的幂等守卫 */
+  const firedRef = useRef(new Set<string>())
+  /** 真正排过队（忙时入队）的 id：只有它们发起时才播「已发送排队中的…」，空闲即时发起没有排队感 */
+  const waitedRef = useRef(new Set<string>())
+  /** 已为其记过快捷键画像证据的 id：被拒放回后再发起不重复记 */
+  const evidencedRef = useRef(new Set<string>())
+  const [drainTick, setDrainTick] = useState(0)
+  /**
+   * 暂停冻结的动作 id（用户按过「■ 停止」或上一轮非正常结束那一刻已在队里的）：它们不再自动续发，chip 留着手动点；
+   * 之后新点的动作不受影响——空闲时照常立即发起（暂停不能一直粘着，把之后每次快捷操作都停成 chip）。
+   */
+  const [heldIds, setHeldIds] = useState<ReadonlySet<string>>(NO_HELD)
+  /**
+   * heldIds 的同步真值（drain 读它）：放回被拒动作走 zustand（useSyncExternalStore 同步车道），可能先于
+   * setHeldIds 单独渲染一次——只看 state 的 drain 会把刚放回、本该暂停的那条立刻再发一遍。
+   */
+  const heldRef = useRef<ReadonlySet<string>>(NO_HELD)
+  const setHeld = useCallback((ids: ReadonlySet<string>) => {
+    heldRef.current = ids
+    setHeldIds(ids)
+  }, [])
+  const [queueNotice, setQueueNotice] = useState('')
+  /** 流式期间的第二次提交（§QA P1-2）：不排队，不清空输入，aria-live 提示 */
+  const [sendBlocked, setSendBlocked] = useState(false)
+  const [atBottom, setAtBottom] = useState(true)
+  /** 用户上翻期间有新内容到达：显示「↓ 最新」浮钮 */
+  const [hasNew, setHasNew] = useState(false)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const listRef = useRef<HTMLDivElement | null>(null)
+  /** 粘底状态：用户上翻后不再抢滚动；任何发起路径（sendTurn）都复位 */
+  const stickRef = useRef(true)
 
   const {
     briefUi,
@@ -213,6 +252,14 @@ export default function CopilotPanel({
     briefRequestTick,
     setBriefUi,
     setBriefData,
+    pendingAsks,
+    composerQuotes,
+    removePendingAsk,
+    restorePendingAsk,
+    removeComposerQuote,
+    clearComposerQuotes,
+    restoreComposerQuotes,
+    copilotOpen,
     voiceAsk,
     consumeVoiceAsk,
     setVoiceTurnPhase,
@@ -222,6 +269,13 @@ export default function CopilotPanel({
     voiceTtsEngine,
     voiceTtsVoice,
   } = usePaperUi()
+
+  /** 本论文的动作队列 / 引用 chip（useMemo：store 数组不变时引用稳定，effect 不空转） */
+  const queued = useMemo(() => pendingAsks.filter((a) => a.paperId === paper.id), [pendingAsks, paper.id])
+  const quotes = useMemo(() => composerQuotes.filter((q) => q.paperId === paper.id), [composerQuotes, paper.id])
+  /** 队里还有被暂停冻结的动作（chip 行显示「已暂停自动发送」）；冻结的都发完 / 取消了自然解除 */
+  const queuePaused = useMemo(() => queued.some((a) => heldIds.has(a.id)), [queued, heldIds])
+  const isMdUp = useMediaQuery(MQ.md)
 
   // 渲染期同步 ref（事件回调不重挂）
   const paperRef = useRef(paper)
@@ -398,8 +452,13 @@ export default function CopilotPanel({
     setMessages([])
     setLive(null)
     setError(null)
-    setAttachedAsk(null)
     setGuided(null)
+    firedRef.current = new Set()
+    waitedRef.current = new Set()
+    evidencedRef.current = new Set()
+    heldRef.current = NO_HELD
+    setHeldIds(NO_HELD)
+    setQueueNotice('')
     void (async () => {
       const s = await repo.getOrCreateSession(paper.id, paper.title)
       if (!alive) return
@@ -437,12 +496,16 @@ export default function CopilotPanel({
   const busy = live !== null && live.phase !== 'done' && live.phase !== 'error'
 
   const runSendTurn = useCallback(
-    async (params: SendParams) => {
+    async (params: SendParams): Promise<SendResult> => {
+      // 用户消息落库（repo.addMessage）之前的每个出口都是 rejected：什么都没写，调用方负责放回带走的动作 / 引用
       const s = sessionRefState.current
-      if (!s || getRunner().busy()) return
+      // 会话属于上一篇（切论文那一拍 session 状态还没复位）也算未就绪：不能把新论文的提问写进旧会话
+      if (!s || s.paperId !== paperRef.current.id || getRunner().busy()) {
+        return { status: 'rejected', reason: 'not-ready' }
+      }
       if (paperRef.current.sensitive) {
         setError({ message: '这篇论文已标记为敏感：远程模型调用被禁用，仅可本地阅读与检索', kind: 'sensitive-blocked' })
-        return
+        return { status: 'rejected', reason: 'blocked' }
       }
       setError(null)
       lastParamsRef.current = params
@@ -455,16 +518,16 @@ export default function CopilotPanel({
           message: `未授权 ${provider === 'kimi' ? 'Moonshot (Kimi)' : 'DeepSeek'}：需要先授权才能发送论文片段`,
           kind: 'no-consent',
         })
-        return
+        return { status: 'rejected', reason: 'blocked' }
       }
 
-      // 历史快照（在插入本轮用户消息之前取，SelectionAsk 先例）
+      // 历史快照（在插入本轮用户消息之前取，SelectionAsk 先例）；引用从 quotes 拼回，模型才看得到
       const turnsSinceMemo = s.turnsSinceMemo ?? 0
       const keepPairs = s.rollingSummary
         ? Math.min(MAX_LIVE_TURN_PAIRS, KEEP_PAIRS_AFTER_FOLD + turnsSinceMemo)
         : MAX_LIVE_TURN_PAIRS
       const history: ChatMessage[] = trimHistoryPairs(
-        messagesRef.current.map(({ role, content }) => ({ role, content })),
+        messagesRef.current.map((m) => ({ role: m.role, content: historyTextOf(m) })),
         keepPairs,
       )
       const memoIsland = shouldRequestMemo(turnsSinceMemo)
@@ -475,6 +538,7 @@ export default function CopilotPanel({
         content: params.displayText,
         createdAt: Date.now(),
         actionLabel: params.label,
+        ...(params.quotes && params.quotes.length > 0 ? { quotes: params.quotes } : {}),
       })
       setMessages((m) => [...m, userMsg])
 
@@ -506,14 +570,16 @@ export default function CopilotPanel({
         },
         pushLive,
       )
-      if (!outcome) return // 被 discard / 已有轮次
+      // 以下用户消息已落库：失败一律 failed（成本确认被拒也在 run 里，气泡留着「重新发送」）
+      if (!outcome) return { status: 'failed' } // 被 discard / 已有轮次
 
       const st = outcome.state
       if (st.phase === 'error' && !st.text) {
         setError(st.error)
         setLive(null)
-        return
+        return { status: 'failed' }
       }
+      let result: SendResult = { status: 'ok' }
 
       const assistantMsg = await repo.addMessage({
         sessionId: s.id,
@@ -538,6 +604,7 @@ export default function CopilotPanel({
           : undefined,
       })
       if (st.phase === 'error') {
+        result = { status: 'failed' }
         setError({
           message: `响应中断：${friendlyTurnError(st.error!, provider)}（已保留部分内容）`,
           kind: st.error!.kind,
@@ -576,65 +643,176 @@ export default function CopilotPanel({
       setSession((prev) => (prev && prev.id === s.id ? { ...prev, ...patch } : prev))
       setMessages((m) => [...m, assistantMsg])
       setLive(null)
+      return result
     },
     [briefData, ensureConsent, getRunner, pushLive, recordEvidence, repo],
   )
 
-  /** runSendTurn 的兜底外壳：持久化等意外失败不留下无响应的挂起态 */
+  /** 暂停自动续发：冻结此刻本论文队里的全部动作（读 store 现值，含刚放回的被拒动作） */
+  const pauseQueue = useCallback(() => {
+    const paperId = paperRef.current.id
+    setHeld(new Set(usePaperUi.getState().pendingAsks.filter((a) => a.paperId === paperId).map((a) => a.id)))
+  }, [setHeld])
+
+  /**
+   * 发起一轮的**唯一入口**（输入框 / 语音 / 引导 / teach-back / deepAlt / 重发 / 重试 / 动作队列都走这里）：
+   * 进入即同步置位 occupiedRef（单飞门闸）并复位粘底；结束后按结局决定队列是否继续自动续发，
+   * 再 tick 一下让 drain effect 重新审视队列。runSendTurn 抛错（持久化等意外）也不留下挂起态。
+   * onRejected：用户消息落库前就被挡下时回调，调用方在这里放回带走的动作 / 引用——
+   * 必须先于暂停：暂停冻结的是放回之后的队列，否则放回的那条会被 drain 立刻再发一遍。
+   */
   const sendTurn = useCallback(
-    async (params: SendParams) => {
+    async (params: SendParams, onRejected?: (reason: TurnRejectReason) => void): Promise<SendResult> => {
+      if (occupiedRef.current) {
+        // 已有轮次在飞（含 busy 尚未为真的窗口期）：保持单飞，不插孤儿气泡；本轮结束后 drain 会再来
+        onRejected?.('not-ready')
+        return { status: 'rejected', reason: 'not-ready' }
+      }
+      occupiedRef.current = true
+      stickRef.current = true
+      setAtBottom(true)
+      setHasNew(false)
+      const startedPaper = paperRef.current.id
+      let result: SendResult = { status: 'failed' }
       try {
-        await runSendTurn(params)
+        result = await runSendTurn(params)
       } catch (e) {
         setError({ message: e instanceof Error ? e.message : '本轮处理失败，请重试', kind: null })
         setLive(null)
+      } finally {
+        occupiedRef.current = false
+        setSendBlocked(false)
+        if (result.status === 'rejected') onRejected?.(result.reason)
+        // 出错 / 被拦截：不自动续发，免得把队列全砸在同一个错上；中途切了论文的迟到结局别去暂停新论文的队列
+        if (shouldPauseQueue(result) && paperRef.current.id === startedPaper) pauseQueue()
+        setDrainTick((t) => t + 1)
       }
+      return result
     },
-    [runSendTurn],
+    [pauseQueue, runSendTurn],
   )
 
-  const sendFree = useCallback(
-    (text: string) => {
-      const sel = attachedAsk?.text ?? null
-      const fromTranslation = attachedAsk?.translated === true
-      setAttachedAsk(null)
-      if (attachedAsk) onRemoveAsk(attachedAsk.id)
-      void sendTurn({
-        question: fromTranslation ? `${TRANSLATED_ASK_NOTE}\n${text}` : text,
-        selection: sel,
-        task: 'chat',
-        planIsland: true,
-        extraDirectives: [LEARNER_DIRECTIVE],
-        userAuthored: true,
-        displayText: sel ? `"""\n${sel.slice(0, 600)}\n"""\n${text}` : text,
-      })
-    },
-    [attachedAsk, onRemoveAsk, sendTurn],
-  )
-
-  const consumeAsk = useCallback(
+  /**
+   * 发起一条选区动作：先出队再发（store 同步更新，drain 不会再取到它；firedRef 兜住重复 effect）。
+   * 被拒（什么都没落库：会话未就绪 / 敏感 / 未授权）就原样放回队首、允许再次发起——不能静默丢掉；
+   * 未就绪不暂停，会话就绪后 drain 自动重发；被拦截由 sendTurn 暂停，等用户点 chip。
+   */
+  const fireAsk = useCallback(
     (ask: PendingAsk) => {
-      if (busy) return
-      if (ask.action === 'queue') {
-        setAttachedAsk(ask)
+      if (occupiedRef.current) return // 在飞：留在队列里，本轮结束后 drain 会再来
+      firedRef.current.add(ask.id)
+      removePendingAsk(ask.id)
+      const tpl = askTemplate(ask.action)
+      // L1 证据（§6.2）：「更简单 / 推导」这两个快捷键本身就是层级信号（被拒放回后再发起不重复记）
+      if (!evidencedRef.current.has(ask.id)) {
+        evidencedRef.current.add(ask.id)
+        const shortcut = evidenceFromShortcut(ask.action, lastTurnConceptsRef.current, Date.now())
+        if (shortcut) recordEvidence(shortcut)
+      }
+      void sendTurn(
+        {
+          ...composeAskTurn([ask], tpl.question),
+          task: tpl.task,
+          planIsland: false, // (b) 类：意图由按钮完全确定，无 plan 岛，TTFT 最快
+          label: ask.label,
+          displayText: '', // 小签 + 引用块就是全部内容
+        },
+        (reason) => {
+          // 已离开这篇论文：工作台已清掉它的队列，别把动作放回去（回来时会被意外自动发起）
+          if (paperRef.current.id !== ask.paperId) return
+          firedRef.current.delete(ask.id)
+          restorePendingAsk(ask)
+          setQueueNotice(rejectedAskNotice(ask.label, reason))
+        },
+      )
+    },
+    [recordEvidence, removePendingAsk, restorePendingAsk, sendTurn],
+  )
+
+  /** 点排队 chip 手动发起：解除暂停、清掉上一轮错误（「重试」与 chip 并存只会让人困惑） */
+  const fireNow = useCallback(
+    (ask: PendingAsk) => {
+      if (occupiedRef.current || busy) return
+      if (sessionRefState.current?.paperId !== paperRef.current.id) {
+        // 会话还在装载（手机 sheet 刚重开 / 刚切论文）：动作原样留在队里，会话就绪后 drain 自动发起
+        setQueueNotice(rejectedAskNotice(ask.label, 'not-ready'))
         return
       }
-      const tpl = ASK_TEMPLATES[ask.action]
-      onRemoveAsk(ask.id)
-      // L1 证据（§6.2）：「更简单 / 推导」这两个快捷键本身就是层级信号
-      const shortcut = evidenceFromShortcut(ask.action, lastTurnConceptsRef.current, Date.now())
-      if (shortcut) recordEvidence(shortcut)
-      void sendTurn({
-        question: ask.translated ? `${TRANSLATED_ASK_NOTE}\n${tpl.question}` : tpl.question,
-        selection: ask.text,
-        task: tpl.task,
-        planIsland: false, // (b) 类：意图由按钮完全确定，无 plan 岛，TTFT 最快
-        label: ask.label,
-        displayText: `【${ask.label}】\n"""\n${ask.text.slice(0, 600)}\n"""`,
-      })
+      setHeld(NO_HELD)
+      setError(null)
+      fireAsk(ask)
     },
-    [busy, onRemoveAsk, recordEvidence, sendTurn],
+    [busy, fireAsk, setHeld],
   )
+
+  /** 输入框发送：带上本论文的引用 chip（读 store 现值），发送即清空 chip；被拒则问题与引用原样放回 */
+  const sendComposer = useCallback(
+    (text: string) => {
+      const paperId = paperRef.current.id
+      const qs = usePaperUi.getState().composerQuotes.filter((q) => q.paperId === paperId)
+      if (qs.length > 0) clearComposerQuotes(paperId)
+      void sendTurn(
+        {
+          ...composeAskTurn(qs, text),
+          task: 'chat',
+          planIsland: true,
+          extraDirectives: [LEARNER_DIRECTIVE],
+          userAuthored: true,
+          displayText: text,
+        },
+        (reason) => {
+          // 引用按 id 放回所属论文（草稿语义，切走也保留）；问题只在仍是这篇论文且输入框还空着时放回，不覆盖新打的字
+          const back = qs.length > 0 ? restoreComposerQuotes(qs) : 0
+          if (paperRef.current.id !== paperId) return
+          setInput((cur) => (cur.trim() === '' ? text : cur))
+          setQueueNotice(rejectedComposerNotice(reason, back))
+        },
+      )
+    },
+    [clearComposerQuotes, restoreComposerQuotes, sendTurn],
+  )
+
+  // 忙时新入队的播报；记下它们等过队，发起时才播「已发送排队中的…」
+  const seenQueuedRef = useRef<string[]>([])
+  useEffect(() => {
+    const seen = seenQueuedRef.current
+    const added = queued.filter((a) => !seen.includes(a.id))
+    seenQueuedRef.current = queued.map((a) => a.id)
+    if (added.length === 0) return
+    // 空闲：drain 马上发（新来的不受暂停冻结；放回的被拒动作由 fireAsk 自己播报），不需要排队播报
+    if (!occupiedRef.current && !busy) return
+    for (const a of added) waitedRef.current.add(a.id)
+    setQueueNotice(`已排队：${added[added.length - 1].label}（回答结束后自动发送）`)
+  }, [queued, busy])
+
+  /**
+   * 队列 drain：会话就绪、无轮次在飞（occupiedRef 同步值 + busy）时取第一条未被暂停冻结的发起。
+   * 读 store 现值而不是闭包里的 queued：removePendingAsk 之后同一批 effect 不会再取到旧队头。
+   */
+  useEffect(() => {
+    // 会话装载后本 effect 因 session 变化自动重跑（与语音 effect 同序）；切论文那一拍 session 还是上一篇的
+    if (session === null || session.paperId !== paper.id) return
+    if (occupiedRef.current || busy) return
+    const head = nextQueuedAsk(usePaperUi.getState().pendingAsks, paper.id, firedRef.current, heldRef.current)
+    if (!head) return
+    if (waitedRef.current.delete(head.id)) setQueueNotice(`已发送排队中的「${head.label}」`)
+    fireAsk(head)
+  }, [queued, session, busy, drainTick, heldIds, paper.id, fireAsk]) // heldIds：解除暂停后重跑
+
+  // 排队播报 4 s 后清空（aria-live 行只播一次，不常驻）
+  useEffect(() => {
+    if (!queueNotice) return
+    const timer = setTimeout(() => setQueueNotice(''), 4000)
+    return () => clearTimeout(timer)
+  }, [queueNotice])
+
+  // 「加入提问」后聚焦输入框（桌面 / 平板；手机 sheet 弹键盘会盖住正文，不抢）
+  const quoteCountRef = useRef(quotes.length)
+  useEffect(() => {
+    const grew = quotes.length > quoteCountRef.current
+    quoteCountRef.current = quotes.length
+    if (grew && isMdUp && copilotOpen) textareaRef.current?.focus()
+  }, [quotes.length, isMdUp, copilotOpen])
 
   // -----------------------------------------------------------------------
   // 引导模式（§3.4 七入口 / §6.1c 每步 1 调用）
@@ -715,14 +893,18 @@ export default function CopilotPanel({
   const resendOrphan = useCallback(
     (msg: StoredMessage) => {
       if (busy) return
+      // 与首发同口径：引用走 selection、问题单独放（快捷动作按小签还原模板问题）；旧消息的引用本就烤在 content 里，原样重发
+      const turn = replayTurnOf(msg)
       void sendTurn({
-        question: msg.content,
+        question: turn.question,
+        selection: turn.selection,
         task: 'chat',
         planIsland: true,
         extraDirectives: [LEARNER_DIRECTIVE],
-        userAuthored: true,
+        userAuthored: turn.userAuthored, // 模板问题不是读者信号，不做抽象度画像
         displayText: msg.content,
         ...(msg.actionLabel ? { label: msg.actionLabel } : {}),
+        ...(turn.quotes ? { quotes: turn.quotes } : {}),
       })
     },
     [busy, sendTurn],
@@ -761,16 +943,21 @@ export default function CopilotPanel({
       if (busy) return
       const list = messagesRef.current
       const idx = list.findIndex((m) => m.id === msg.id)
-      const question = [...list.slice(0, idx === -1 ? list.length : idx)].reverse().find((m) => m.role === 'user')?.content
-      if (!question) return
+      const prevUser = [...list.slice(0, idx === -1 ? list.length : idx)].reverse().find((m) => m.role === 'user')
+      if (!prevUser) return
+      // 引用走 selection（按条配额）、问题单独放：拼进 question 再截 1500 字，多段引用会把真正的问题截掉
+      const turn = replayTurnOf(prevUser, DEEP_QUOTE_FALLBACK)
+      if (!turn.question) return
       void sendTurn({
-        question: `请换一种讲法，给出更有深度的解释（可以补充推导、边界条件与相关方法差异）：\n${question.slice(0, 1500)}`,
-        retrievalQuery: question.slice(0, 300),
+        question: `请换一种讲法，给出更有深度的解释（可以补充推导、边界条件与相关方法差异）：\n${turn.question.slice(0, 1500)}`,
+        retrievalQuery: turn.bareQuestion.slice(0, 300),
+        selection: turn.selection,
         task: 'deepAlt',
         planIsland: false,
         label: '深度解释',
         sourceLabel: 'deepseek-v4-pro · 深度解释',
         displayText: '【换一种深度解释】',
+        ...(turn.quotes ? { quotes: turn.quotes } : {}),
       })
     },
     [busy, sendTurn],
@@ -918,8 +1105,10 @@ export default function CopilotPanel({
 
   const stopTurn = useCallback(() => {
     runnerRef.current?.stop()
+    pauseQueue() // 用户主动停：此刻排着的动作不再自动续发，chip 留着手动点
+    setQueueNotice('') // 「已排队…（回答结束后自动发送）」与暂停提示正相反，别再挂到 4 s 超时
     if (speakingId === 'live') stopSpeaking() // Stop 生成时同时清空未读队列
-  }, [speakingId, stopSpeaking])
+  }, [pauseQueue, speakingId, stopSpeaking])
 
   // 听写输入：云端 ASR（原 webkitSpeechRecognition 依赖 Google 服务，大陆环境实际不可用，
   // 见 PLAN-voice-copilot.md）。转写结果仍只追加进输入框、由用户确认后发送——自动发送
@@ -1002,7 +1191,7 @@ export default function CopilotPanel({
 
   const retryLast = useCallback(() => {
     const params = lastParamsRef.current
-    if (params && !busy) void sendTurn(params)
+    if (params && !busy && !occupiedRef.current) void sendTurn(params)
   }, [busy, sendTurn])
 
   /** 未登录（401）分支：弹全局登录 gate，成功后用 lastParamsRef 自动重试本轮 */
@@ -1177,7 +1366,7 @@ export default function CopilotPanel({
     }
     if (session === null) return // 会话装载后本 effect 因 session 变化自动重跑
     consumeVoiceAsk()
-    if (getRunner().busy()) {
+    if (occupiedRef.current || getRunner().busy()) {
       setVoiceTurnPhase('error', '回答进行中，说完这轮再问')
       return
     }
@@ -1187,7 +1376,6 @@ export default function CopilotPanel({
     voiceTurnSpeakRef.current = voiceAsk.speak
     pendingLiveSpeakRef.current = voiceAsk.speak
     setVoiceTurnPhase('thinking')
-    stickRef.current = true
     void sendTurn({
       question: voiceAsk.text,
       selection: voiceAsk.selection,
@@ -1213,14 +1401,35 @@ export default function CopilotPanel({
   }, [voiceStopSpeakTick, stopSpeaking])
 
   // -----------------------------------------------------------------------
-  // 滚动粘底（AskDialog 48px 阈值先例）
+  // 滚动粘底（AskDialog 48px 阈值先例）+「↓ 最新」浮钮
   // -----------------------------------------------------------------------
-  const listRef = useRef<HTMLDivElement | null>(null)
-  const stickRef = useRef(true)
   useEffect(() => {
     const el = listRef.current
     if (el && stickRef.current) el.scrollTop = el.scrollHeight
   }, [messages, live])
+
+  // 新内容到达（消息条数 / 轮次阶段 / 流式文本）而用户上翻中 → 亮「↓ 最新」；反馈、作答等元数据更新不算新内容
+  const tailKey = `${messages.length}:${live?.phase ?? ''}:${live?.text.length ?? -1}`
+  useEffect(() => {
+    if (!stickRef.current) setHasNew(true)
+  }, [tailKey])
+
+  const onListScroll = useCallback(() => {
+    const el = listRef.current
+    if (!el) return
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 48
+    stickRef.current = near
+    setAtBottom(near)
+    if (near) setHasNew(false)
+  }, [])
+
+  const jumpToLatest = useCallback(() => {
+    const el = listRef.current
+    if (el) el.scrollTop = el.scrollHeight
+    stickRef.current = true
+    setAtBottom(true)
+    setHasNew(false)
+  }, [])
 
   const jumpEntry = useCallback((entry: StoredCiteEntry) => onJumpAnchor(entry.anchor), [onJumpAnchor])
 
@@ -1228,7 +1437,6 @@ export default function CopilotPanel({
    * 流式期间的第二次提交（§QA P1-2）：不排队（保持单飞语义），但**不清空输入**、
    * 给一行 aria-live 提示。修复前问题会被静默吞掉——输入框清空、没有任何反馈。
    */
-  const [sendBlocked, setSendBlocked] = useState(false)
   useEffect(() => {
     if (!busy) setSendBlocked(false)
   }, [busy])
@@ -1236,22 +1444,21 @@ export default function CopilotPanel({
   const submit = useCallback(() => {
     const value = input.trim()
     if (!value) return
-    if (busy) {
+    if (busy || occupiedRef.current) {
       setSendBlocked(true)
       return
     }
     if (dictation !== 'idle') stopDictation()
     setInput('')
     setSendBlocked(false)
-    stickRef.current = true
+    setHeld(NO_HELD) // 用户亲自发一条 = 继续陪读：排队的动作在这轮之后自动续发
     // 「打字提问也朗读」偏好：同一条挂起标记，live 就绪后自动开跟读（不回写语音阶段）
     if (voiceSpeakTypedTurns && ttsSupported) pendingLiveSpeakRef.current = true
-    sendFree(value)
-  }, [busy, input, dictation, sendFree, stopDictation, voiceSpeakTypedTurns, ttsSupported])
+    sendComposer(value)
+  }, [busy, input, dictation, sendComposer, setHeld, stopDictation, voiceSpeakTypedTurns, ttsSupported])
 
   const sessionCost = session?.costTotal ?? 0
   const lastUsage = live?.usage ?? null
-  const paperAsks = asks.filter((a) => a.paperId === paper.id)
 
   // -----------------------------------------------------------------------
   // 渲染
@@ -1291,240 +1498,222 @@ export default function CopilotPanel({
         </button>
       </div>
 
-      <div
-        ref={listRef}
-        onScroll={() => {
-          const el = listRef.current
-          if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48
-        }}
-        className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1"
-      >
-        {/* 论文地图入口（首次展开提示） */}
-        {!hasBrief && !briefRunning && (
-          <div className="rounded-lg border border-dashed border-line p-3">
-            <p className="mb-1 text-xs font-medium text-fg">还没有论文地图</p>
-            <p className="mb-2 text-[0.7rem] leading-relaxed text-dim">
-              生成后左栏会展示一句话结论、贡献、方法与推荐阅读路径。预计 {briefEstimate.calls} 次调用、约{' '}
-              {formatTokens(briefEstimate.inputTokens)} tokens 输入（≈{formatUsd(briefEstimate.cost)}）。
-            </p>
-            <button
-              type="button"
-              onClick={() => void startBrief()}
-              disabled={paper.sensitive || !units.length}
-              className="rounded-lg bg-accent px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
-            >
-              生成论文地图
-            </button>
-          </div>
-        )}
-        {briefRunning && briefUi && (
-          <div className="rounded-lg border border-line bg-panel-2 p-3 text-xs text-dim">
-            正在生成论文地图：{briefUi.done}/{briefUi.total} 单元完成…（中断或刷新后会从缓存续跑）
-          </div>
-        )}
-        {briefUi?.status === 'error' && briefUi.paperId === paper.id && (
-          <div className="rounded-lg border border-bad/40 bg-panel-2 p-3 text-xs">
-            <p className="mb-1 text-bad">{briefUi.error}</p>
-            <button type="button" onClick={() => void startBrief()} className="text-accent underline underline-offset-2">
-              重试（已完成单元不重复调用）
-            </button>
-          </div>
-        )}
-
-        {/* 待提问队列 */}
-        {paperAsks.length > 0 && (
-          <section>
-            <div className="mb-1.5 flex items-center justify-between">
-              <p className="text-xs font-medium text-fg">待提问（{paperAsks.length}）· 点击发起</p>
-              <button type="button" onClick={onClearAsks} className="text-xs text-dim transition-colors hover:text-fg">
-                清空
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div ref={listRef} onScroll={onListScroll} className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+          {/* 论文地图入口（首次展开提示） */}
+          {!hasBrief && !briefRunning && (
+            <div className="rounded-lg border border-dashed border-line p-3">
+              <p className="mb-1 text-xs font-medium text-fg">还没有论文地图</p>
+              <p className="mb-2 text-[0.7rem] leading-relaxed text-dim">
+                生成后左栏会展示一句话结论、贡献、方法与推荐阅读路径。预计 {briefEstimate.calls} 次调用、约{' '}
+                {formatTokens(briefEstimate.inputTokens)} tokens 输入（≈{formatUsd(briefEstimate.cost)}）。
+              </p>
+              <button
+                type="button"
+                onClick={() => void startBrief()}
+                disabled={paper.sensitive || !units.length}
+                className="rounded-lg bg-accent px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
+              >
+                生成论文地图
               </button>
             </div>
-            <ul className="space-y-1.5">
-              {paperAsks.map((ask) => (
-                // 整卡可点：只有小标签可点时，用户会以为卡片本身没有动作（§QA D-6）
-                <li key={ask.id} className="relative rounded-lg border border-line bg-panel-2">
+          )}
+          {briefRunning && briefUi && (
+            <div className="rounded-lg border border-line bg-panel-2 p-3 text-xs text-dim">
+              正在生成论文地图：{briefUi.done}/{briefUi.total} 单元完成…（中断或刷新后会从缓存续跑）
+            </div>
+          )}
+          {briefUi?.status === 'error' && briefUi.paperId === paper.id && (
+            <div className="rounded-lg border border-bad/40 bg-panel-2 p-3 text-xs">
+              <p className="mb-1 text-bad">{briefUi.error}</p>
+              <button type="button" onClick={() => void startBrief()} className="text-accent underline underline-offset-2">
+                重试（已完成单元不重复调用）
+              </button>
+            </div>
+          )}
+
+          {/* 引导模式入口（七入口全开；每步 1 次调用，由用户点击推进） */}
+          {!guided && !busy && (
+            <section>
+              <p className="mb-1.5 text-xs font-medium text-fg">引导模式</p>
+              <div className="flex flex-wrap gap-1.5">
+                {GUIDED_MODE_DEFS.map((m) => (
                   <button
+                    key={m.id}
                     type="button"
                     disabled={busy}
-                    onClick={() => consumeAsk(ask)}
-                    title={busy ? '回答进行中，完成后可发起' : '点击发起这条提问'}
-                    className="block w-full rounded-lg border border-transparent p-2 pr-12 text-left transition-colors hover:border-accent/40 hover:bg-accent/5 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-transparent disabled:hover:bg-transparent"
+                    title={m.hint}
+                    onClick={() => startGuidedMode(m.id)}
+                    className="rounded-lg border border-accent/40 px-2.5 py-1 text-xs text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
                   >
-                    <span className="mb-1 inline-block rounded border border-accent/40 px-1.5 py-0.5 text-[0.65rem] text-accent">
-                      {ask.action === 'queue' ? '引用并提问' : ask.label}
-                    </span>
-                    {ask.translated && (
-                      <span className="mb-1 ml-1 inline-block rounded border border-accent-2/40 bg-accent-2/10 px-1.5 py-0.5 text-[0.65rem] text-accent-2">
-                        译文
-                      </span>
-                    )}
-                    <span className="line-clamp-2 block text-[0.7rem] leading-relaxed text-fg">{ask.text}</span>
+                    {m.label}
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => onRemoveAsk(ask.id)}
-                    className="absolute top-2 right-2 text-[0.7rem] text-dim transition-colors hover:text-bad"
-                  >
-                    移除
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
-        {/* 引导模式入口（七入口全开；每步 1 次调用，由用户点击推进） */}
-        {!guided && !busy && (
-          <section>
-            <p className="mb-1.5 text-xs font-medium text-fg">引导模式</p>
-            <div className="flex flex-wrap gap-1.5">
-              {GUIDED_MODE_DEFS.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  disabled={busy}
-                  title={m.hint}
-                  onClick={() => startGuidedMode(m.id)}
-                  className="rounded-lg border border-accent/40 px-2.5 py-1 text-xs text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
-                >
-                  {m.label}
-                </button>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {/* 历史消息 */}
-        {messages.map((m) =>
-          m.role === 'user' ? (
-            <div key={m.id} className="flex flex-col items-end">
-              {/* 提问来源标签（语音提问 / 选段快捷键等）：与 assistant 侧 sourceLabel 徽章同族 */}
-              {m.actionLabel && (
-                <p className="mb-0.5 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[0.65rem] text-accent">
-                  {m.actionLabel}
-                </p>
-              )}
-              {/* 超宽档下 92% 会拉出一条极长的单行气泡，再加 36rem 绝对上限保住可读行长 */}
-              <div className="max-w-[min(92%,36rem)] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
-                {m.content}
+                ))}
               </div>
-              {orphanIds.has(m.id) && (
-                <p className="mt-0.5 flex items-center gap-2 text-[0.65rem] text-warn">
-                  已中断（这条提问没有得到回答）
-                  <button
-                    type="button"
-                    onClick={() => resendOrphan(m)}
-                    disabled={busy}
-                    className="rounded border border-line px-1.5 py-0.5 text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
-                  >
-                    重新发送
-                  </button>
+            </section>
+          )}
+
+          {/* 历史消息 */}
+          {messages.map((m) =>
+            m.role === 'user' ? (
+              <div key={m.id} className="flex flex-col items-end">
+                {/* 提问来源标签（语音提问 / 选段快捷键等）：与 assistant 侧 sourceLabel 徽章同族 */}
+                {m.actionLabel && (
+                  <p className="mb-0.5 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[0.65rem] text-accent">
+                    {m.actionLabel}
+                  </p>
+                )}
+                {/* 随问题落库的引用块（可回跳原文）；旧消息的引用以 """ 烤在 content 里，照常走下面的气泡 */}
+                {m.quotes?.map((q, i) => {
+                  const anchor = q.anchor
+                  return (
+                    <QuoteBlock
+                      key={i}
+                      quote={q}
+                      className="mb-1 max-w-[min(92%,36rem)]"
+                      {...(anchor
+                        ? {
+                            onJump: () => {
+                              onJumpAnchor(anchor)
+                            },
+                          }
+                        : {})}
+                    />
+                  )
+                })}
+                {/* 超宽档下 92% 会拉出一条极长的单行气泡，再加 36rem 绝对上限保住可读行长；快捷动作正文为空不出气泡 */}
+                {m.content !== '' && (
+                  <div className="max-w-[min(92%,36rem)] rounded-lg bg-accent/15 px-3 py-2 text-xs break-words whitespace-pre-wrap text-fg">
+                    {m.content}
+                  </div>
+                )}
+                {orphanIds.has(m.id) && (
+                  <p className="mt-0.5 flex items-center gap-2 text-[0.65rem] text-warn">
+                    已中断（这条提问没有得到回答）
+                    <button
+                      type="button"
+                      onClick={() => resendOrphan(m)}
+                      disabled={busy}
+                      className="rounded border border-line px-1.5 py-0.5 text-accent transition-colors hover:bg-accent/10 disabled:opacity-40"
+                    >
+                      重新发送
+                    </button>
+                  </p>
+                )}
+              </div>
+            ) : (
+              <div key={m.id}>
+                {m.sourceLabel && (
+                  <p className="mb-0.5 inline-block rounded-full border border-accent-2/40 bg-accent-2/10 px-2 py-0.5 text-[0.65rem] text-accent-2">
+                    {m.sourceLabel}
+                  </p>
+                )}
+                <CopilotMessageView
+                  content={m.content}
+                  done
+                  citeMap={m.citeMap ?? []}
+                  badges={m.auditBadges ?? null}
+                  interrupted={m.interrupted}
+                  thinkingDowngraded={m.thinkingDowngraded}
+                  insufficient={m.insufficient}
+                  onJumpCite={jumpEntry}
+                  onEvidence={recordEvidence}
+                  onTeachBack={sendTeachBack}
+                  busy={busy}
+                  {...(m.blockStates ? { blockStates: m.blockStates } : {})}
+                  onBlockState={(key, patch) => updateBlockState(m.id, key, patch)}
+                />
+                {m.usage && (
+                  <p className="mt-0.5 text-[0.65rem] text-dim">
+                    {formatTokens(m.usage.inputTokens)} in / {formatTokens(m.usage.outputTokens)} out ·{' '}
+                    {formatUsd(m.usage.cost)}
+                    {m.usage.estimated ? '（估算）' : ''}
+                  </p>
+                )}
+                <TurnFeedback
+                  {...(m.feedback ? { value: m.feedback } : {})}
+                  onFeedback={(kind) => giveFeedback(m, kind)}
+                  onDeepAlt={m.sourceLabel ? undefined : () => deepAlternative(m)}
+                  disabled={busy}
+                  speech={
+                    ttsSupported ? { label: speakingId === m.id ? '停止朗读' : '朗读本条', onClick: () => speakMessage(m) } : null
+                  }
+                />
+              </div>
+            ),
+          )}
+
+          {/* 进行中的轮次 */}
+          {live && live.phase !== 'done' && live.phase !== 'error' && (
+            <div>
+              {live.phase === 'retrieving' && <p className="animate-pulse text-xs text-dim">检索原文片段…</p>}
+              {live.phase !== 'retrieving' && live.text === '' && (
+                <p className="animate-pulse text-xs text-dim">
+                  {live.waitMs !== null
+                    ? `请求排队中（约 ${Math.ceil(live.waitMs / 1000)}s）…`
+                    : live.retrying
+                      ? '正在自动重试…'
+                      : live.reasoning
+                        ? '正在深入分析…'
+                        : live.evidenceRetry
+                          ? '证据不足，扩大检索后重试…'
+                          : '等待回答…'}
                 </p>
               )}
-            </div>
-          ) : (
-            <div key={m.id}>
-              {m.sourceLabel && (
-                <p className="mb-0.5 inline-block rounded-full border border-accent-2/40 bg-accent-2/10 px-2 py-0.5 text-[0.65rem] text-accent-2">
-                  {m.sourceLabel}
-                </p>
+              {live.text !== '' && (
+                <CopilotMessageView
+                  content={live.text}
+                  done={false}
+                  citeMap={live.citeMap}
+                  badges={null}
+                  onJumpCite={jumpEntry}
+                  busy
+                />
               )}
-              <CopilotMessageView
-                content={m.content}
-                done
-                citeMap={m.citeMap ?? []}
-                badges={m.auditBadges ?? null}
-                interrupted={m.interrupted}
-                thinkingDowngraded={m.thinkingDowngraded}
-                insufficient={m.insufficient}
-                onJumpCite={jumpEntry}
-                onEvidence={recordEvidence}
-                onTeachBack={sendTeachBack}
-                busy={busy}
-                {...(m.blockStates ? { blockStates: m.blockStates } : {})}
-                onBlockState={(key, patch) => updateBlockState(m.id, key, patch)}
-              />
-              {m.usage && (
+              {lastUsage && (
                 <p className="mt-0.5 text-[0.65rem] text-dim">
-                  {formatTokens(m.usage.inputTokens)} in / {formatTokens(m.usage.outputTokens)} out ·{' '}
-                  {formatUsd(m.usage.cost)}
-                  {m.usage.estimated ? '（估算）' : ''}
+                  本轮 {formatTokens(lastUsage.inputTokens)} in / {formatTokens(lastUsage.outputTokens)} out ·{' '}
+                  {formatUsd(lastUsage.cost)}
                 </p>
               )}
-              <TurnFeedback
-                {...(m.feedback ? { value: m.feedback } : {})}
-                onFeedback={(kind) => giveFeedback(m, kind)}
-                onDeepAlt={m.sourceLabel ? undefined : () => deepAlternative(m)}
-                disabled={busy}
-                speech={
-                  ttsSupported ? { label: speakingId === m.id ? '停止朗读' : '朗读本条', onClick: () => speakMessage(m) } : null
-                }
-              />
             </div>
-          ),
-        )}
+          )}
 
-        {/* 进行中的轮次 */}
-        {live && live.phase !== 'done' && live.phase !== 'error' && (
-          <div>
-            {live.phase === 'retrieving' && <p className="animate-pulse text-xs text-dim">检索原文片段…</p>}
-            {live.phase !== 'retrieving' && live.text === '' && (
-              <p className="animate-pulse text-xs text-dim">
-                {live.waitMs !== null
-                  ? `请求排队中（约 ${Math.ceil(live.waitMs / 1000)}s）…`
-                  : live.retrying
-                    ? '正在自动重试…'
-                    : live.reasoning
-                      ? '正在深入分析…'
-                      : live.evidenceRetry
-                        ? '证据不足，扩大检索后重试…'
-                        : '等待回答…'}
+          {/* 引导模式进度与推进（每次点击 = 1 次调用） */}
+          {guided && (
+            <div className="rounded-lg border border-accent/30 bg-panel-2 p-2.5 text-xs">
+              <p className="mb-1.5 text-dim">
+                {GUIDED_MODE_DEFS.find((m) => m.id === guided.modeId)?.label} · 第 {guided.stepIndex + 1}/{guided.total} 步
               </p>
-            )}
-            {live.text !== '' && (
-              <CopilotMessageView
-                content={live.text}
-                done={false}
-                citeMap={live.citeMap}
-                badges={null}
-                onJumpCite={jumpEntry}
-                busy
-              />
-            )}
-            {lastUsage && (
-              <p className="mt-0.5 text-[0.65rem] text-dim">
-                本轮 {formatTokens(lastUsage.inputTokens)} in / {formatTokens(lastUsage.outputTokens)} out ·{' '}
-                {formatUsd(lastUsage.cost)}
-              </p>
-            )}
-          </div>
-        )}
-
-        {/* 引导模式进度与推进（每次点击 = 1 次调用） */}
-        {guided && (
-          <div className="rounded-lg border border-accent/30 bg-panel-2 p-2.5 text-xs">
-            <p className="mb-1.5 text-dim">
-              {GUIDED_MODE_DEFS.find((m) => m.id === guided.modeId)?.label} · 第 {guided.stepIndex + 1}/{guided.total} 步
-            </p>
-            <div className="flex flex-wrap gap-1.5">
-              <button
-                type="button"
-                onClick={nextGuidedStep}
-                disabled={busy}
-                className="rounded-lg bg-accent px-2.5 py-1 text-[0.7rem] font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
-              >
-                {guided.stepIndex + 1 >= guided.total ? '完成引导' : '继续下一步'}
-              </button>
-              <button
-                type="button"
-                onClick={() => setGuided(null)}
-                className="rounded-lg border border-line px-2.5 py-1 text-[0.7rem] text-dim transition-colors hover:text-fg"
-              >
-                退出引导
-              </button>
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  onClick={nextGuidedStep}
+                  disabled={busy}
+                  className="rounded-lg bg-accent px-2.5 py-1 text-[0.7rem] font-semibold text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
+                >
+                  {guided.stepIndex + 1 >= guided.total ? '完成引导' : '继续下一步'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGuided(null)}
+                  className="rounded-lg border border-line px-2.5 py-1 text-[0.7rem] text-dim transition-colors hover:text-fg"
+                >
+                  退出引导
+                </button>
+              </div>
             </div>
-          </div>
+          )}
+        </div>
+        {/* 上翻期间有新内容：一键回到底部并重新粘底 */}
+        {!atBottom && hasNew && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="absolute right-3 bottom-2 rounded-full border border-line bg-panel px-3 py-1 text-xs text-accent shadow-md transition-colors hover:bg-panel-2"
+          >
+            ↓ 最新
+          </button>
         )}
       </div>
 
@@ -1588,15 +1777,19 @@ export default function CopilotPanel({
             )}
           </p>
         )}
-        {attachedAsk && (
-          <div className="mb-1.5 flex items-start gap-2 border-l-2 border-accent bg-panel-2 px-2 py-1.5 text-[0.7rem] text-dim">
-            <span className="line-clamp-2 min-w-0 flex-1">已引用选区：{attachedAsk.text}</span>
-            <button type="button" onClick={() => setAttachedAsk(null)} className="shrink-0 hover:text-bad">
-              移除
-            </button>
-          </div>
-        )}
+        {/* 排队中的选区动作 + 输入框引用 chip（放 store：手机 sheet 收起卸载面板也不丢） */}
+        <ComposerAsks
+          queued={queued}
+          quotes={quotes}
+          busy={busy || occupiedRef.current}
+          paused={queuePaused}
+          onFire={fireNow}
+          onRemoveQueued={removePendingAsk}
+          onRemoveQuote={removeComposerQuote}
+          focusFallbackRef={textareaRef}
+        />
         <textarea
+          ref={textareaRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
@@ -1607,12 +1800,14 @@ export default function CopilotPanel({
             }
           }}
           rows={2}
-          placeholder="围绕这篇论文提问，Enter 发送 / Shift+Enter 换行"
+          placeholder={
+            quotes.length > 0 ? `针对引用的 ${quotes.length} 段内容提问…` : '围绕这篇论文提问，Enter 发送 / Shift+Enter 换行'
+          }
           className="w-full resize-y rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-sm leading-relaxed"
         />
-        {/* 常驻于 DOM（aria-live 区域先存在才会播报），空时不占高度 */}
+        {/* 唯一的 aria-live 行（常驻于 DOM，区域先存在才会播报），按优先级：发送被挡 > 排队播报 > 语音提示 */}
         <p aria-live="polite" className="mt-0.5 text-[0.65rem] text-warn">
-          {sendBlocked && busy ? '回答进行中，完成后可发送（问题已保留在输入框）' : voiceNotice || null}
+          {sendBlocked ? '回答进行中，完成后可发送（问题已保留在输入框）' : queueNotice || voiceNotice || null}
         </p>
         <div className="mt-1.5 flex items-center justify-between gap-2">
           <span className="min-w-0 flex-1 truncate text-[0.65rem] text-dim">

@@ -21,6 +21,9 @@ import {
   type ScrollTarget,
 } from '../../lib/paper/anchors'
 import { describeFileFetchError } from '../../lib/paper/fetchErrors'
+// 导出：页面只静态引轻模块（版本判定 / 错误类型），对话框与导出内核都按需懒加载
+import { exportFlavorFor, FLAVOR_LABEL } from '../../lib/paper/export/exportFlavor'
+import { ExportError, type ExportFlavor } from '../../lib/paper/export/exportTypes'
 import { briefCacheKey, type BriefData } from '../../lib/paper/briefPipeline'
 import { buildPaperIndex, reingestPaper } from '../../lib/paper/ingest'
 import { createIngestDeps } from '../../lib/paper/ingestDeps'
@@ -50,6 +53,7 @@ import { formatUsd } from '../../lib/paper/usage'
 import type { IngestStage, LangMode, PaperBlock, PaperFormat, PaperRecord, SourceAnchor } from '../../lib/paper/types'
 import {
   MAX_ASK_TEXT,
+  MAX_COMPOSER_QUOTES,
   PAPER_ASK_ACTIONS,
   allowedCopilotWidths,
   effectiveCopilotWidth,
@@ -73,6 +77,8 @@ const TOAST_MS = 2600
 
 /** Copilot 面板懒加载（§4.7）：react-markdown + KaTeX（JS/CSS/字体）只在首次展开面板时拉取 */
 const CopilotPanel = lazy(() => import('../../components/papers/CopilotPanel'))
+/** 导出 PDF 对话框懒加载：只有点「导出 PDF」才拉；导出内核（pdf-lib / 字体）再由对话框按需动态 import */
+const ExportDialog = lazy(() => import('../../components/papers/ExportDialog'))
 
 const MODE_TABS = [
   { id: 'original', label: '原版 PDF' },
@@ -296,6 +302,8 @@ export default function PaperWorkbenchPage() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   // 手机：Copilot 底部面板可切全屏（长回答 + 交互块在 390px 下需要整屏）
   const [sheetFull, setSheetFull] = useState(false)
+  /** 导出 PDF 对话框：打开时冻结论文与版本；null = 关闭（换论文后 paperId 对不上即卸载、中止） */
+  const [exportOpen, setExportOpen] = useState<{ paperId: string; flavor: ExportFlavor } | null>(null)
 
   const isDesktop = useMediaQuery(MQ.xl)
   const isTablet = useMediaQuery(MQ.md)
@@ -305,7 +313,6 @@ export default function PaperWorkbenchPage() {
     outlineOpen,
     copilotWidth,
     readerCollapsed,
-    pendingAsks,
     briefUi,
     briefData,
     voiceBallHidden,
@@ -315,8 +322,8 @@ export default function PaperWorkbenchPage() {
     setCopilotWidth,
     setReaderCollapsed,
     addPendingAsk,
-    removePendingAsk,
-    clearPendingAsks,
+    dropPendingAsks,
+    attachQuote,
     setBriefData,
     setBriefUi,
     requestBrief,
@@ -754,6 +761,7 @@ export default function PaperWorkbenchPage() {
     authIssue: translationAuthIssue,
     retryBlock,
     consentAsk,
+    translateAll,
   } = useTranslations({
     paper,
     blocks,
@@ -1026,22 +1034,41 @@ export default function PaperWorkbenchPage() {
     [addCaptured],
   )
 
+  /**
+   * 选区快捷操作：「加入提问」进输入框引用 chip（同论文最多 MAX_COMPOSER_QUOTES 条，满了拒绝并提示）；
+   * 解释类动作进动作队列，CopilotPanel 空闲立即发起、忙时排队——对话里的气泡 / 排队 chip 就是反馈，不再 toast。
+   */
   const handleAskAction = useCallback(
     (action: PaperAskAction, text: string, anchor: SourceAnchor | null, opts: { translated: boolean }) => {
       if (!paperId) return
       const pos = positionRef.current
-      addPendingAsk({
+      const quote = {
         paperId,
-        action,
-        label: PAPER_ASK_ACTIONS.find((a) => a.id === action)?.label ?? '加入提问',
         text: text.slice(0, MAX_ASK_TEXT),
         anchor: anchor ?? { kind: formatRef.current, blockIndex: pos.blockIndex, page: pos.page, section: pos.section },
         ...(opts.translated ? { translated: true } : {}),
-      })
+      }
+      if (action === 'queue') {
+        if (!attachQuote(quote)) {
+          setToast(`最多引用 ${MAX_COMPOSER_QUOTES} 段，请先发送或移除后再添加`)
+          return
+        }
+        setCopilotOpen(true)
+        setToast('已引用到 Copilot 输入框')
+        return
+      }
+      addPendingAsk({ ...quote, action, label: PAPER_ASK_ACTIONS.find((a) => a.id === action)?.label ?? '解释这段' })
       setCopilotOpen(true)
-      setToast('已加入 Copilot 待提问，在右栏点击即可发起')
     },
-    [addPendingAsk, paperId, setCopilotOpen],
+    [addPendingAsk, attachQuote, paperId, setCopilotOpen],
+  )
+
+  // 离开论文清掉它的动作队列（未发起的「解释这段」不该在下次打开时突然冒出来）；引用 chip 是草稿，有意保留
+  useEffect(
+    () => () => {
+      if (paperId) dropPendingAsks(paperId)
+    },
+    [paperId, dropPendingAsks],
   )
 
   useEffect(() => {
@@ -1213,6 +1240,31 @@ export default function PaperWorkbenchPage() {
     )
   }
 
+  /**
+   * 导出 PDF（PLAN A.7）：版本随当前视图 + 实际翻译语言（旧版解析 PDF 的原版视图按原文处理 → 不给导出）；
+   * 敏感 / 空壳 / 无块不给入口（status 在上面已收口为 ready）
+   */
+  const exportFlavor = exportFlavorFor({ mode, pdfInPlace, langMode: translateLang })
+  const canExport =
+    exportFlavor !== null && !paper.sensitive && blocks.length > 0 && !isHollow(paper, blocks.length)
+  const openExport = () => {
+    if (canExport) setExportOpen({ paperId: paper.id, flavor: exportFlavor })
+  }
+  /** 原版两种版本要原始字节：已加载 → 本机 files 表 → 已登录从服务端懒拉（沿原版视图取字节的同一条路） */
+  const getExportBytes = async (): Promise<ArrayBuffer> => {
+    if (bytes) return bytes
+    try {
+      let file = await repo.getFileBytes(paper.id)
+      if (!file && useAuthStore.getState().status === 'authed') {
+        file = (await fetchRemoteFileToLocal(getPaperDb(), paper.id)) ?? undefined
+      }
+      if (file) return file.bytes
+    } catch (e) {
+      throw new ExportError('bytes', describeFileFetchError(e), { cause: e })
+    }
+    throw new ExportError('bytes', '原始文件不在本机且无法从服务端拉取')
+  }
+
   const outlinePane = (
     <OutlinePane
       outline={outline}
@@ -1245,9 +1297,6 @@ export default function PaperWorkbenchPage() {
         retrieval={retrieval}
         position={position}
         sectionTitles={outline.map((o) => o.text)}
-        asks={pendingAsks.filter((a) => a.paperId === paperId)}
-        onRemoveAsk={removePendingAsk}
-        onClearAsks={clearPendingAsks}
         onJumpAnchor={jumpToAnchor}
         onClose={() => {
           setCopilotOpen(false)
@@ -1324,6 +1373,17 @@ export default function PaperWorkbenchPage() {
                 <SegmentedTabs tabs={isTablet ? LANG_TABS : LANG_TABS_SHORT} value={langMode} onChange={changeLang} />
               </div>
             </div>
+            {/* 导出 PDF：md+ 工具行；手机工具行无预算，入口在目录抽屉顶部 */}
+            {canExport && (
+              <button
+                type="button"
+                onClick={openExport}
+                title={`导出${FLAVOR_LABEL[exportFlavor]} PDF`}
+                className="hidden rounded-lg border border-line bg-panel px-3 py-1.5 text-sm text-dim transition-colors hover:bg-panel-2 md:block"
+              >
+                导出 PDF
+              </button>
+            )}
             {!isDesktop && (
               <button
                 type="button"
@@ -1572,7 +1632,25 @@ export default function PaperWorkbenchPage() {
             同层且 DOM 靠后时，手机上抽屉会被面板整片盖住） */}
         {showOutlineDrawer && (
           <Drawer open={showOutlineDrawer} onClose={() => setDrawerOpen(false)} title="目录与搜索">
-            {outlinePane}
+            {canExport ? (
+              // 手机导出入口：抽屉顶部整行（md+ 走工具行按钮，这里隐藏）；先关抽屉再开对话框
+              <div className="flex h-full flex-col gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawerOpen(false)
+                    openExport()
+                  }}
+                  title={`导出${FLAVOR_LABEL[exportFlavor]} PDF`}
+                  className="min-h-11 w-full shrink-0 rounded-lg border border-line bg-panel px-3 py-2 text-sm text-fg transition-colors hover:bg-panel-2 md:hidden"
+                >
+                  导出 PDF <span className="text-dim">· {FLAVOR_LABEL[exportFlavor]}</span>
+                </button>
+                <div className="min-h-0 flex-1">{outlinePane}</div>
+              </div>
+            ) : (
+              outlinePane
+            )}
           </Drawer>
         )}
 
@@ -1599,6 +1677,23 @@ export default function PaperWorkbenchPage() {
             {/* 全屏改 flex 吃剩余高：固定公式 100dvh-3.5rem 没算 safe-area，刘海机上会溢出 */}
             <div className={sheetFull ? 'min-h-0 flex-1' : 'h-[min(60dvh,32rem)]'}>{copilotPane}</div>
           </div>
+        )}
+
+        {/* 导出 PDF：须在 ConsentDialog 之前（同为 fixed inset-0 z-50，补译中弹出的授权框靠 DOM 序压在上面）；
+            也在 toast 之前，完成提示不被遮罩盖住 */}
+        {exportOpen && exportOpen.paperId === paper.id && (
+          <Suspense fallback={null}>
+            <ExportDialog
+              paper={paper}
+              blocks={blocks}
+              flavor={exportOpen.flavor}
+              texts={translations}
+              translateAll={translateAll}
+              getBytes={getExportBytes}
+              onClose={() => setExportOpen(null)}
+              onDone={(r) => setToast(`已导出 ${r.fileName}`)}
+            />
+          </Suspense>
         )}
 
         {toast && (

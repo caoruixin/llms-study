@@ -184,6 +184,7 @@ describe('persist：白名单落盘与恢复', () => {
       text: 'hello',
       anchor: { kind: 'pdf', blockIndex: 3 },
     })
+    store.getState().attachQuote({ paperId: 'p1', text: 'quoted', anchor: { kind: 'pdf', blockIndex: 4 } })
     store.getState().setBriefUi({ paperId: 'p1', status: 'running', done: 1, total: 4 })
     store.getState().requestVoiceAsk({
       paperId: 'p1',
@@ -211,6 +212,7 @@ describe('persist：白名单落盘与恢复', () => {
     expect(raw.state?.copilotWidth).toBe('max')
     // 运行时状态仍在内存里，只是不落盘
     expect(store.getState().pendingAsks).toHaveLength(1)
+    expect(store.getState().composerQuotes).toHaveLength(1)
     expect(store.getState().voiceAsk?.text).toBe('这段怎么理解')
   })
 
@@ -301,5 +303,115 @@ describe('persist：白名单落盘与恢复', () => {
     const { store } = await loadStore(seedOf({ copilotOpen: true }))
     expect(typeof store.getState().setReaderCollapsed).toBe('function')
     expect(typeof store.getState().requestBrief).toBe('function')
+  })
+})
+
+describe('选区动作队列与输入框引用（运行时，不落盘）', () => {
+  const anchor = { kind: 'pdf', blockIndex: 1 } as const
+  const quote = (paperId: string, text = 'q') => ({ paperId, text, anchor })
+
+  it('attachQuote：同论文到 5 条后第 6 条返回 false 且不写；译文标记原样保留', async () => {
+    const { store } = await loadStore()
+    for (let i = 0; i < 5; i++) expect(store.getState().attachQuote(quote('p1', `q${i}`))).toBe(true)
+    expect(store.getState().attachQuote(quote('p1', 'q5'))).toBe(false)
+    expect(store.getState().composerQuotes).toHaveLength(5)
+    expect(store.getState().composerQuotes.map((q) => q.text)).toEqual(['q0', 'q1', 'q2', 'q3', 'q4'])
+    expect(store.getState().attachQuote({ ...quote('p2'), translated: true })).toBe(true)
+    const last = store.getState().composerQuotes.at(-1)
+    expect(last).toMatchObject({ paperId: 'p2', translated: true })
+    expect(typeof last?.id).toBe('string')
+    expect(typeof last?.at).toBe('number')
+  })
+
+  it('配额按论文计：p1 满了不影响 p2', async () => {
+    const { store } = await loadStore()
+    for (let i = 0; i < 5; i++) store.getState().attachQuote(quote('p1'))
+    expect(store.getState().attachQuote(quote('p2'))).toBe(true)
+    expect(store.getState().composerQuotes.filter((q) => q.paperId === 'p2')).toHaveLength(1)
+  })
+
+  it('removeComposerQuote 按 id 移除；clearComposerQuotes 只清本论文', async () => {
+    const { store } = await loadStore()
+    store.getState().attachQuote(quote('p1', 'a'))
+    store.getState().attachQuote(quote('p1', 'b'))
+    store.getState().attachQuote(quote('p2', 'c'))
+    const idA = store.getState().composerQuotes.find((q) => q.text === 'a')!.id
+    store.getState().removeComposerQuote(idA)
+    expect(store.getState().composerQuotes.map((q) => q.text)).toEqual(['b', 'c'])
+    store.getState().clearComposerQuotes('p1')
+    expect(store.getState().composerQuotes.map((q) => q.text)).toEqual(['c'])
+  })
+
+  it('动作队列 FIFO：addPendingAsk 追加，removePendingAsk 按 id，dropPendingAsks 只清本论文', async () => {
+    const { store } = await loadStore()
+    const add = (paperId: string, text: string) =>
+      store.getState().addPendingAsk({ paperId, action: 'explain', label: '解释这段', text, anchor })
+    add('p1', 'one')
+    add('p1', 'two')
+    add('p2', 'other')
+    expect(store.getState().pendingAsks.map((a) => a.text)).toEqual(['one', 'two', 'other'])
+    store.getState().removePendingAsk(store.getState().pendingAsks[0].id)
+    expect(store.getState().pendingAsks.map((a) => a.text)).toEqual(['two', 'other'])
+    store.getState().dropPendingAsks('p1')
+    expect(store.getState().pendingAsks.map((a) => a.text)).toEqual(['other'])
+    // 引用 chip 不受动作队列清理影响（草稿语义）
+    store.getState().attachQuote(quote('p1'))
+    store.getState().dropPendingAsks('p1')
+    expect(store.getState().composerQuotes).toHaveLength(1)
+  })
+})
+
+describe('被拒轮次的放回（restorePendingAsk / restoreComposerQuotes）', () => {
+  const anchor = { kind: 'pdf', blockIndex: 1 } as const
+
+  it('restorePendingAsk：同 id 插回队首、别的论文不动；已在队里则不重复（幂等）', async () => {
+    const { store } = await loadStore()
+    const add = (paperId: string, text: string) =>
+      store.getState().addPendingAsk({ paperId, action: 'explain', label: '解释这段', text, anchor })
+    add('p1', 'one')
+    add('p2', 'other')
+    add('p1', 'two')
+    const head = store.getState().pendingAsks[0]
+    store.getState().removePendingAsk(head.id)
+    store.getState().restorePendingAsk(head)
+    expect(store.getState().pendingAsks.map((a) => a.text)).toEqual(['one', 'other', 'two'])
+    expect(store.getState().pendingAsks[0]).toBe(head) // 同 id、同对象，firedRef / waitedRef 的记账照常对得上
+    store.getState().restorePendingAsk(head)
+    expect(store.getState().pendingAsks).toHaveLength(3)
+    // 放回的是排在后面的那条：照样到队首（被拒的那条本来就是正要发起的队头）
+    const two = store.getState().pendingAsks[2]
+    store.getState().removePendingAsk(two.id)
+    store.getState().restorePendingAsk(two)
+    expect(store.getState().pendingAsks.map((a) => a.text)).toEqual(['two', 'one', 'other'])
+  })
+
+  it('restoreComposerQuotes：同 id、保持原顺序插到本论文引用最前，返回放回条数；重复放回为 0（幂等）', async () => {
+    const { store } = await loadStore()
+    store.getState().attachQuote({ paperId: 'p1', text: 'a', anchor })
+    store.getState().attachQuote({ paperId: 'p1', text: 'b', anchor, translated: true })
+    store.getState().attachQuote({ paperId: 'p2', text: 'x', anchor })
+    const taken = store.getState().composerQuotes.filter((q) => q.paperId === 'p1')
+    store.getState().clearComposerQuotes('p1')
+    store.getState().attachQuote({ paperId: 'p1', text: 'later', anchor })
+    expect(store.getState().restoreComposerQuotes(taken)).toBe(2)
+    const p1 = store.getState().composerQuotes.filter((q) => q.paperId === 'p1')
+    expect(p1.map((q) => q.text)).toEqual(['a', 'b', 'later'])
+    expect(p1.slice(0, 2).map((q) => q.id)).toEqual(taken.map((q) => q.id))
+    expect(p1[1].translated).toBe(true)
+    expect(store.getState().composerQuotes.filter((q) => q.paperId === 'p2').map((q) => q.text)).toEqual(['x'])
+    expect(store.getState().restoreComposerQuotes(taken)).toBe(0)
+    expect(store.getState().composerQuotes).toHaveLength(4)
+  })
+
+  it('restoreComposerQuotes 受 5 条上限约束：现存 chip 不挤掉，放不下的放回项按顺序丢尾部', async () => {
+    const { store } = await loadStore()
+    for (let i = 0; i < 3; i++) store.getState().attachQuote({ paperId: 'p1', text: `old${i}`, anchor })
+    const taken = store.getState().composerQuotes.slice()
+    store.getState().clearComposerQuotes('p1')
+    for (let i = 0; i < 4; i++) store.getState().attachQuote({ paperId: 'p1', text: `new${i}`, anchor })
+    expect(store.getState().restoreComposerQuotes(taken)).toBe(1)
+    expect(store.getState().composerQuotes.map((q) => q.text)).toEqual(['old0', 'new0', 'new1', 'new2', 'new3'])
+    expect(store.getState().attachQuote({ paperId: 'p1', text: 'over', anchor })).toBe(false)
+    expect(store.getState().restoreComposerQuotes(taken)).toBe(0)
   })
 })
