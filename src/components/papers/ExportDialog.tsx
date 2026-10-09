@@ -352,6 +352,9 @@ export default function ExportDialog(props: ExportDialogProps) {
             {FLAVOR_LABEL[r.flavor]} · 共 {r.pageCount} 页
           </p>
           {r.untranslated > 0 && <p className="text-warn">{r.untranslated} 段未译，已保留原文</p>}
+          {/* 浏览器拦下脚本触发的第二次自动下载时页面收不到任何信号（生产复验实测：同一页第二次导出静默无文件），
+              只能提示用户用「再次下载」（真实点击）或在地址栏放行本站多文件下载 */}
+          <p className="text-xs text-dim">浏览器没有开始下载？点「再次下载」，或在地址栏允许本站自动下载多个文件。</p>
           {/* 回退提示是内核拼好的整句（原因 + 「已改为导出 X」），原样显示 */}
           {r.fellBackToText && <p className="text-warn">{r.fellBackToText}</p>}
         </div>
