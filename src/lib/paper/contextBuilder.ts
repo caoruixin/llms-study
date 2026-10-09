@@ -141,7 +141,9 @@ function buildFinalUser(
   const parts: string[] = []
   const selection = (input.selection ?? '').slice(0, opts.selectionChars)
   if (selection.trim()) {
-    parts.push(`我选中了论文中的这段内容：\n"""\n${selection}\n"""`)
+    // 多段引用（askCompose.composeSelection 以 --- 连接）换一句引导语，模型才知道分隔符的意思
+    const lead = selection.includes('\n---\n') ? '我选中了论文中的这些内容（多段以 --- 分隔）：' : '我选中了论文中的这段内容：'
+    parts.push(`${lead}\n"""\n${selection}\n"""`)
   }
   const viewport = opts.dropViewport ? '' : (input.viewportContext ?? '').slice(0, opts.viewportChars)
   if (viewport.trim()) {

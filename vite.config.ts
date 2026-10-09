@@ -155,6 +155,9 @@ export default defineConfig(({ mode }) => {
             if (/node_modules\/(recharts|victory-vendor|d3-[a-z-]+)\//.test(id)) return 'vendor-charts'
             if (/node_modules\/katex\//.test(id)) return 'vendor-katex'
             if (/node_modules\/(framer-motion|motion-dom|motion-utils)\//.test(id)) return 'vendor-motion'
+            // 导出 PDF 内核(动态 import 才会加载):只点 pdf-lib 与 @pdf-lib/*,
+            // 它依赖的 pako/tslib 与 mammoth/jszip 共用,不能卷进来
+            if (/node_modules\/(pdf-lib|@pdf-lib\/[a-z-]+)\//.test(id)) return 'vendor-pdflib'
             if (/node_modules\/(react|react-dom|scheduler|react-router|react-router-dom|zustand)\//.test(id))
               return 'vendor-react'
             return undefined

@@ -6,6 +6,8 @@ import {
   CIRCUIT_RESUME_SLACK_MS,
   createTranslationScheduler,
   isPulledFor,
+  type TranslateAllProgress,
+  type TranslateAllResult,
   type TranslationSchedulerDeps,
   type TranslationSnapshot,
 } from './useTranslations'
@@ -677,6 +679,292 @@ describe('createTranslationScheduler', () => {
       await settleFake()
       expect(h.calls).toHaveLength(2)
       expect(h.snapshot.texts.size).toBe(2)
+    })
+  })
+})
+
+// PLAN A.1：导出前全篇补全——同一条 drain，规划改按文档顺序不裁窗口；结果 / 进度 / 停机原因给导出对话框
+describe('translateAll（全篇补全）', () => {
+  /** 每块 1800 字符 ≈ 600 token → 每包 3 条 */
+  const bigBlocks = (n: number) => Array.from({ length: n }, (_, i) => blk(i, `text-${i} `.padEnd(1800, 'x')))
+
+  /** 把第 call 包的网关响应挂起，release 后才成功；其余包直接成功 */
+  const gateCall = (call: number) => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const respond: Responder = (req, i) => (i === call ? gate.then(() => okRaw(req)) : okRaw(req))
+    return { respond, release }
+  }
+
+  it('文档顺序把全部缺译块译完：跳过缓存命中、不看阅读位置、进度单调、结果带译文快照', async () => {
+    const blocks = bigBlocks(30)
+    const h = makeHarness({
+      blocks,
+      cached: [remoteRow(5, blocks[5].text, '缓存5'), remoteRow(6, blocks[6].text, '缓存6')],
+    })
+    h.scheduler.setWindow(10) // 阅读位置只影响窗口模式
+    const progress: TranslateAllProgress[] = []
+
+    const result = await h.scheduler.translateAll({ onProgress: (p) => progress.push(p) })
+
+    expect(result).toMatchObject({ outcome: 'done', translated: 30, failed: [], total: 30 })
+    expect(result.halt).toBeUndefined()
+    expect(result.texts.size).toBe(30)
+    expect(result.texts.get(5)).toBe('缓存5')
+    expect(result.texts.get(7)).toBe('译7#-')
+    // 28 条 / 3 = 10 包，文档顺序从头起，缓存命中的 5、6 不翻
+    expect(h.calls).toHaveLength(10)
+    expect(h.maxConcurrent).toBe(1)
+    expect(h.calls.flatMap(requestedIndices)).toEqual(Array.from({ length: 30 }, (_, i) => i).filter((i) => i !== 5 && i !== 6))
+    expect(h.saved.flat()).toHaveLength(28)
+    // 进度：开工先报一次（缓存命中数），之后每包递增，最后 30/30
+    expect(progress[0]).toEqual({ done: 2, total: 30, failed: 0, pausedUntil: null })
+    for (let i = 1; i < progress.length; i++) expect(progress[i].done).toBeGreaterThanOrEqual(progress[i - 1].done)
+    expect(progress.at(-1)).toEqual({ done: 30, total: 30, failed: 0, pausedUntil: null })
+    expect(progress).toHaveLength(11)
+  })
+
+  it('已全部译好（不可译块不计）：立即 done、零请求、不问授权', async () => {
+    const blocks = [blk(0, 'a'), { ...blk(1, 'const x'), kind: 'code' as const }, blk(2, 'b')]
+    const h = makeHarness({ blocks, cached: [remoteRow(0, 'a', '甲'), remoteRow(2, 'b', '乙')] })
+    const progress: TranslateAllProgress[] = []
+
+    const result = await h.scheduler.translateAll({ onProgress: (p) => progress.push(p) })
+
+    expect(result).toEqual({
+      outcome: 'done',
+      texts: new Map([
+        [0, '甲'],
+        [2, '乙'],
+      ]),
+      translated: 2,
+      failed: [],
+      total: 2,
+    })
+    expect(h.calls).toHaveLength(0)
+    expect(h.consentAsks).toBe(0)
+    expect(progress).toEqual([{ done: 2, total: 2, failed: 0, pausedUntil: null }])
+  })
+
+  it('中途 abort：立即 aborted（快照是拷贝）、在飞的包仍落库，之后 setWindow 只按窗口出包', async () => {
+    const blocks = bigBlocks(30)
+    const { respond, release } = gateCall(0)
+    const h = makeHarness({ blocks, respond })
+    const ac = new AbortController()
+
+    const promise = h.scheduler.translateAll({ signal: ac.signal })
+    await h.settle()
+    expect(h.calls).toHaveLength(1)
+    expect(requestedIndices(h.calls[0])).toEqual([0, 1, 2]) // 全篇模式：文档顺序从头起
+
+    ac.abort()
+    const result = await promise
+    expect(result).toMatchObject({ outcome: 'aborted', translated: 0, failed: [], total: 30 })
+    expect(result.texts.size).toBe(0)
+
+    // 回窗口模式：阅读位置在 20，窗口 [16, 36]，当前块起往后在前
+    h.scheduler.setWindow(20)
+    release()
+    await h.settle()
+    for (const i of [0, 1, 2]) expect(h.snapshot.texts.get(i)).toBe(`译${i}#-`) // 在飞的包照常落地
+    expect(h.saved[0].map((r) => r.blockIndex)).toEqual([0, 1, 2]) // 并且落库
+    expect(result.texts.size).toBe(0) // resolve 时的快照不随后续落库变化
+    const later = h.calls.slice(1).map(requestedIndices)
+    expect(later[0]).toEqual([20, 21, 22])
+    expect(later.flat().every((i) => i >= 16 && i <= 29)).toBe(true)
+    expect(h.calls).toHaveLength(1 + 5) // 窗口内 14 块 → 5 包，不再补全篇
+    for (let i = 3; i <= 15; i++) expect(h.snapshot.texts.has(i)).toBe(false)
+  })
+
+  it('signal 已中止 / 已 dispose：直接 aborted，不碰网关', async () => {
+    const h = makeHarness({ blocks: [blk(0, 'a')] })
+    const ac = new AbortController()
+    ac.abort()
+    expect(await h.scheduler.translateAll({ signal: ac.signal })).toMatchObject({ outcome: 'aborted', total: 1 })
+    h.scheduler.dispose()
+    expect(await h.scheduler.translateAll()).toMatchObject({ outcome: 'aborted' })
+    await h.settle()
+    expect(h.calls).toHaveLength(0)
+  })
+
+  it('进行中 dispose → aborted；在飞的包回来后不再出包', async () => {
+    const { respond, release } = gateCall(0)
+    const h = makeHarness({ blocks: bigBlocks(6), respond })
+
+    const promise = h.scheduler.translateAll()
+    await h.settle()
+    expect(h.calls).toHaveLength(1)
+
+    h.scheduler.dispose()
+    expect(await promise).toMatchObject({ outcome: 'aborted', translated: 0, total: 6 })
+    release()
+    await h.settle()
+    expect(h.calls).toHaveLength(1)
+  })
+
+  it('进行中重复调用返回同一 promise；结束后再调用是新的一次（已齐备 → 零请求 done）', async () => {
+    const { respond, release } = gateCall(0)
+    const h = makeHarness({ blocks: [blk(0, 'a'), blk(1, 'b')], respond })
+
+    const p1 = h.scheduler.translateAll()
+    const p2 = h.scheduler.translateAll()
+    expect(p2).toBe(p1)
+    await h.settle()
+    release()
+    expect(await p1).toMatchObject({ outcome: 'done', translated: 2 })
+
+    const p3 = h.scheduler.translateAll()
+    expect(p3).not.toBe(p1)
+    expect(await p3).toMatchObject({ outcome: 'done', translated: 2, total: 2 })
+    expect(h.calls).toHaveLength(1)
+  })
+
+  it('拒绝授权 → halted/consent：零请求、骨架保留不标失败', async () => {
+    const h = makeHarness({ blocks: [blk(0, 'a'), blk(1, 'b')], consent: () => Promise.resolve(false) })
+
+    const result = await h.scheduler.translateAll()
+
+    expect(result).toMatchObject({ outcome: 'halted', halt: 'consent', translated: 0, failed: [], total: 2 })
+    expect(h.consentAsks).toBe(1)
+    expect(h.calls).toHaveLength(0)
+    expect(h.snapshot.failed.size).toBe(0)
+  })
+
+  it('账号 auth 失败 → halted/auth：failed 列出该包的块，authIssue 记码', async () => {
+    const h = makeHarness({
+      blocks: [blk(0, 'a'), blk(1, 'b')],
+      respond: () => {
+        const e = new LlmError('auth', '该账号尚未配置此服务商的 API key')
+        e.code = 'no-user-key'
+        return e
+      },
+    })
+    const progress: TranslateAllProgress[] = []
+
+    const result = await h.scheduler.translateAll({ onProgress: (p) => progress.push(p) })
+
+    expect(result).toMatchObject({ outcome: 'halted', halt: 'auth', translated: 0, failed: [0, 1], total: 2 })
+    expect(h.snapshot.authIssue).toBe('no-user-key')
+    expect(h.calls).toHaveLength(1) // 停机，不刷 403
+    expect(progress.at(-1)).toEqual({ done: 0, total: 2, failed: 2, pausedUntil: null })
+  })
+
+  it.each(['no-consent', 'sensitive-blocked'] as const)('网关拒绝（%s）→ halted/blocked：骨架保留不标失败', async (kind) => {
+    const h = makeHarness({ blocks: [blk(0, 'a'), blk(1, 'b')], respond: () => new GatewayError(kind, 'deepseek', '拒绝') })
+
+    const result = await h.scheduler.translateAll()
+
+    expect(result).toMatchObject({ outcome: 'halted', halt: 'blocked', translated: 0, failed: [], total: 2 })
+    expect(h.calls).toHaveLength(1)
+    expect(h.snapshot.failed.size).toBe(0)
+  })
+
+  it('敏感论文 → halted/sensitive：不碰网关也不问授权', async () => {
+    const h = makeHarness({ blocks: [blk(0, 'secret')], sensitive: true })
+
+    const result = await h.scheduler.translateAll()
+
+    expect(result).toMatchObject({ outcome: 'halted', halt: 'sensitive', translated: 0, total: 1 })
+    expect(h.calls).toHaveLength(0)
+    expect(h.consentAsks).toBe(0)
+  })
+
+  it('此前失败的块在全篇模式下恰好再试一次：再失败仍落回 failed，不风暴', async () => {
+    const h = makeHarness({ blocks: [blk(0, 'a'), blk(1, 'b'), blk(2, 'c')], respond: () => new Error('boom') })
+
+    await h.scheduler.activate()
+    h.scheduler.setWindow(0)
+    await h.settle()
+    expect([...h.snapshot.failed].sort()).toEqual([0, 1, 2])
+    expect(h.calls).toHaveLength(1)
+
+    const result = await h.scheduler.translateAll()
+
+    expect(result).toMatchObject({ outcome: 'done', translated: 0, failed: [0, 1, 2], total: 3 })
+    expect(h.calls).toHaveLength(2) // 恰好再试一次
+    expect([...h.snapshot.failed].sort()).toEqual([0, 1, 2])
+  })
+
+  it('窗口出包进行中调用：同一条 drain 接着按全篇文档顺序出包，不并发', async () => {
+    const { respond, release } = gateCall(0)
+    const h = makeHarness({ blocks: bigBlocks(30), respond })
+
+    h.scheduler.setWindow(10)
+    await h.scheduler.activate()
+    await h.settle()
+    expect(h.calls).toHaveLength(1)
+    expect(requestedIndices(h.calls[0])).toEqual([10, 11, 12]) // 窗口模式首包
+
+    const promise = h.scheduler.translateAll()
+    release()
+    const result = await promise
+
+    expect(result).toMatchObject({ outcome: 'done', translated: 30, failed: [], total: 30 })
+    expect(h.maxConcurrent).toBe(1)
+    expect(requestedIndices(h.calls[1])).toEqual([0, 1, 2]) // 在飞的窗口包落地后切到全篇：从头起
+    expect(h.calls.slice(1).flatMap(requestedIndices)).toEqual(
+      Array.from({ length: 30 }, (_, i) => i).filter((i) => i < 10 || i > 12),
+    )
+  })
+
+  describe('熔断暂停（假时钟）', () => {
+    beforeEach(() => vi.useFakeTimers())
+    afterEach(() => vi.useRealTimers())
+
+    it('中途熔断：进度报 pausedUntil、不标失败；冷却到点自动续跑直至 done', async () => {
+      let open = true
+      const h = makeHarness({
+        blocks: bigBlocks(6), // 2 包
+        respond: (req, call) => (call >= 1 && open ? circuitOpen(60_000) : okRaw(req)),
+      })
+      const progress: TranslateAllProgress[] = []
+      const results: TranslateAllResult[] = []
+
+      void h.scheduler.translateAll({ onProgress: (p) => progress.push(p) }).then((r) => results.push(r))
+      await settleFake()
+
+      expect(h.calls).toHaveLength(2) // 首包成功，次包撞熔断
+      expect(results).toHaveLength(0) // 暂停不是结束
+      expect(h.snapshot.failed.size).toBe(0)
+      expect(progress.at(-1)).toEqual({ done: 3, total: 6, failed: 0, pausedUntil: 1_700_000_000 + 60_000 + CIRCUIT_RESUME_SLACK_MS })
+      expect(vi.getTimerCount()).toBe(1) // 只剩暂停定时器
+
+      await vi.advanceTimersByTimeAsync(60_000 - 1_000)
+      expect(h.calls).toHaveLength(2)
+      expect(results).toHaveLength(0)
+
+      open = false
+      await vi.advanceTimersByTimeAsync(1_000 + CIRCUIT_RESUME_SLACK_MS + 100)
+      await settleFake()
+      expect(h.calls).toHaveLength(3)
+      expect(results[0]).toMatchObject({ outcome: 'done', translated: 6, failed: [], total: 6 })
+      expect(progress.at(-1)).toEqual({ done: 6, total: 6, failed: 0, pausedUntil: null })
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('暂停期间 abort：清掉定时器，立即 aborted；到点不再出包', async () => {
+      const h = makeHarness({ blocks: bigBlocks(3), respond: () => circuitOpen(60_000) })
+      const ac = new AbortController()
+      const results: TranslateAllResult[] = []
+
+      void h.scheduler.translateAll({ signal: ac.signal }).then((r) => results.push(r))
+      await settleFake()
+      expect(h.calls).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(1)
+
+      ac.abort()
+      await settleFake()
+      expect(results[0]).toMatchObject({ outcome: 'aborted', translated: 0, total: 3 })
+      // abort 只结束全篇补全：暂停定时器留给窗口模式（熔断语义不变），到点按窗口续一次、再撞熔断再暂停，
+      // 不会再 resolve 第二次
+      expect(vi.getTimerCount()).toBe(1)
+      await vi.advanceTimersByTimeAsync(60_000 + CIRCUIT_RESUME_SLACK_MS + 100)
+      await settleFake()
+      expect(h.calls).toHaveLength(2)
+      expect(results).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(1)
     })
   })
 })

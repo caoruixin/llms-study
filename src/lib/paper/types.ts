@@ -284,6 +284,11 @@ export interface CopilotMessage {
   usage?: { provider: string; model: string; inputTokens: number; outputTokens: number; estimated: boolean; cost: number }
   /** user：来自选区快捷操作时的标签（解释这段/更简单/…） */
   actionLabel?: string
+  /**
+   * user：随问题一起发送的引用块（选区快捷操作 / 输入框引用 chip）。`content` 只放用户输入的问题，
+   * 快捷动作为空串；旧行没有此字段（引用以 `"""` 烤在 content 里）。同步到服务端是不透明 JSON，加字段安全。
+   */
+  quotes?: { text: string; anchor?: SourceAnchor; translated?: boolean }[]
   /** Phase 4：assistant 消息的来源标注（如「kimi-k3 深度解释」并列展示时） */
   sourceLabel?: string
   /** Phase 4：用户对这条回答的深度反馈（太浅/刚好/太深），刷新后仍显示已选态 */

@@ -60,6 +60,15 @@ describe('assembleContext · 五层排布', () => {
     expect(last).toContain('- 输出 plan 岛')
   })
 
+  it('多段引用（--- 分隔）换成多段引导语；单段引导语不变', () => {
+    const multi = assembleContext(baseInput({ selection: '第一段\n---\n第二段' }))
+    const last = multi.messages[multi.messages.length - 1].content
+    expect(last).toContain('我选中了论文中的这些内容（多段以 --- 分隔）：\n"""\n第一段\n---\n第二段\n"""')
+    expect(last).not.toContain('我选中了论文中的这段内容')
+    const single = assembleContext(baseInput({ selection: '只有一段' }))
+    expect(single.messages[single.messages.length - 1].content).toContain('我选中了论文中的这段内容：\n"""\n只有一段\n"""')
+  })
+
   it('选区超限按 SelectionAsk 先例截 4000', () => {
     const { messages, report } = assembleContext(baseInput({ selection: 'x'.repeat(9000), inputBudgetTokens: 12_000 }))
     const last = messages[messages.length - 1].content

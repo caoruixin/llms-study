@@ -8,7 +8,7 @@ import type { BriefData } from '../../lib/paper/briefPipeline'
  * 有意**不并入 src/store.ts**：store.ts 从 main.tsx 静态可达，一旦在那里 import paper 类型/模块，
  * 整条 paper 依赖链就会被拉进首页主 chunk，违反 §11.4 的包体约束。
  *
- * 持久化范围只有四个**布局偏好**（见 LayoutPrefs）：阅读位置、待提问队列、论文地图等
+ * 持久化范围只有四个**布局偏好**（见 LayoutPrefs）：阅读位置、选区动作队列 / 输入框引用、论文地图等
  * 运行时状态要么已在 Dexie 里，要么本就该随会话丢弃，一律不进 localStorage。
  */
 
@@ -21,8 +21,10 @@ export interface PendingDuplicate {
   fileName: string
 }
 
-/** 选区快捷操作（§3.3）。Phase 2 只入队，Phase 3 由 Copilot 消费 */
+/** 选区快捷操作（§3.3）：解释类立即在 Copilot 对话末尾发起（忙时排队），queue 进输入框引用 chip */
 export type PaperAskAction = 'explain' | 'simpler' | 'derive' | 'example' | 'queue'
+/** 会直接发起一轮对话的动作（queue 只是引用，不发起） */
+export type PaperAskFire = Exclude<PaperAskAction, 'queue'>
 
 export const PAPER_ASK_ACTIONS: readonly { id: PaperAskAction; label: string }[] = [
   { id: 'explain', label: '解释这段' },
@@ -35,17 +37,34 @@ export const PAPER_ASK_ACTIONS: readonly { id: PaperAskAction; label: string }[]
 /** 选区文本上限沿 SelectionAsk 先例：4000 字符 */
 export const MAX_ASK_TEXT = 4000
 
-export interface PendingAsk {
-  id: string
-  paperId: string
-  action: PaperAskAction
-  label: string
+/** 一段带锚点的选区引用：动作队列与输入框引用的共同载荷 */
+export interface AskQuote {
   text: string
   anchor: SourceAnchor
-  at: number
-  /** 选区来自应用内生成的中文译文：队列卡片加「译文」徽章，消费时提示模型以原文语义为准 */
+  /** 选区来自应用内生成的中文译文：chip / 引用块加「译文」徽章，发送时提示模型以原文语义为准 */
   translated?: boolean
 }
+
+/**
+ * 选区动作 FIFO 队列的一项（解释这段 / 更简单 / 推导公式 / 举例）：CopilotPanel 空闲时立即发起，
+ * 回答进行中则排在输入框上方等本轮结束。放 store 而不是面板 state：手机端 sheet 收起即卸载面板。
+ */
+export interface PendingAsk extends AskQuote {
+  id: string
+  paperId: string
+  action: PaperAskFire
+  label: string
+  at: number
+}
+
+/** 输入框上方的引用 chip（「加入提问」）：随下一条问题一起发送；同论文最多 MAX_COMPOSER_QUOTES 条 */
+export interface ComposerQuote extends AskQuote {
+  id: string
+  paperId: string
+  at: number
+}
+
+export const MAX_COMPOSER_QUOTES = 5
 
 // ---------------------------------------------------------------------------
 // 语音陪读（voice copilot）
@@ -201,8 +220,10 @@ interface PaperUiState extends LayoutPrefs, VoicePrefs {
   filter: PaperFilter
   pendingDuplicate: PendingDuplicate | null
   confirmDeleteId: string | null
-  /** 待提问队列：由 Copilot 会话消费 */
+  /** 选区动作队列（FIFO）：CopilotPanel 按序发起；不落盘 */
   pendingAsks: PendingAsk[]
+  /** 输入框引用 chip（草稿语义：离开论文也保留，发送后清空）；不落盘 */
+  composerQuotes: ComposerQuote[]
   briefUi: BriefUiState | null
   briefData: BriefDataState | null
   /** OutlinePane 的「生成论文地图」入口 → CopilotPanel 监听 tick 发起管线（面板收起时先展开） */
@@ -225,7 +246,19 @@ interface PaperUiState extends LayoutPrefs, VoicePrefs {
   setConfirmDeleteId: (confirmDeleteId: string | null) => void
   addPendingAsk: (ask: Omit<PendingAsk, 'id' | 'at'>) => void
   removePendingAsk: (id: string) => void
-  clearPendingAsks: () => void
+  /** 放回一条被拒（什么都没落库）的动作：同 id 插回队首；已在队列里则不动（幂等） */
+  restorePendingAsk: (ask: PendingAsk) => void
+  /** 离开论文时清掉该论文的动作队列（别的论文的不动） */
+  dropPendingAsks: (paperId: string) => void
+  /** 加入引用：同论文已满 MAX_COMPOSER_QUOTES 条时返回 false 且不写（不静默丢旧的） */
+  attachQuote: (quote: Omit<ComposerQuote, 'id' | 'at'>) => boolean
+  removeComposerQuote: (id: string) => void
+  clearComposerQuotes: (paperId: string) => void
+  /**
+   * 放回被拒那一轮带走的引用：同 id、保持原顺序插到所属论文引用的最前（它们比现存的更早加入）；
+   * 已在的跳过（幂等）；受 MAX_COMPOSER_QUOTES 约束——现存 chip 不挤掉，放不下的放回项丢弃。返回实际放回条数。
+   */
+  restoreComposerQuotes: (quotes: readonly ComposerQuote[]) => number
   setBriefUi: (briefUi: BriefUiState | null) => void
   setBriefData: (briefData: BriefDataState | null) => void
   requestBrief: () => void
@@ -245,7 +278,7 @@ const askId = (): string =>
 
 export const usePaperUi = create<PaperUiState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       sortBy: 'lastRead',
       filter: 'all',
       ...DEFAULT_LAYOUT,
@@ -253,6 +286,7 @@ export const usePaperUi = create<PaperUiState>()(
       pendingDuplicate: null,
       confirmDeleteId: null,
       pendingAsks: [],
+      composerQuotes: [],
       briefUi: null,
       briefData: null,
       briefRequestTick: 0,
@@ -275,7 +309,36 @@ export const usePaperUi = create<PaperUiState>()(
       addPendingAsk: (ask) =>
         set((s) => ({ pendingAsks: [...s.pendingAsks, { ...ask, id: askId(), at: Date.now() }] })),
       removePendingAsk: (id) => set((s) => ({ pendingAsks: s.pendingAsks.filter((a) => a.id !== id) })),
-      clearPendingAsks: () => set({ pendingAsks: [] }),
+      restorePendingAsk: (ask) =>
+        set((s) => (s.pendingAsks.some((a) => a.id === ask.id) ? s : { pendingAsks: [ask, ...s.pendingAsks] })),
+      dropPendingAsks: (paperId) => set((s) => ({ pendingAsks: s.pendingAsks.filter((a) => a.paperId !== paperId) })),
+      attachQuote: (quote) => {
+        const mine = get().composerQuotes.filter((q) => q.paperId === quote.paperId)
+        if (mine.length >= MAX_COMPOSER_QUOTES) return false
+        set((s) => ({ composerQuotes: [...s.composerQuotes, { ...quote, id: askId(), at: Date.now() }] }))
+        return true
+      },
+      removeComposerQuote: (id) => set((s) => ({ composerQuotes: s.composerQuotes.filter((q) => q.id !== id) })),
+      clearComposerQuotes: (paperId) =>
+        set((s) => ({ composerQuotes: s.composerQuotes.filter((q) => q.paperId !== paperId) })),
+      restoreComposerQuotes: (quotes) => {
+        const current = get().composerQuotes
+        const present = new Set(current.map((q) => q.id))
+        // 按论文分别计配额：同一批通常只属一篇，但不依赖这个假设
+        const room = new Map<string, number>()
+        const back: ComposerQuote[] = []
+        for (const q of quotes) {
+          if (present.has(q.id)) continue
+          const left =
+            room.get(q.paperId) ?? MAX_COMPOSER_QUOTES - current.filter((c) => c.paperId === q.paperId).length
+          if (left <= 0) continue
+          room.set(q.paperId, left - 1)
+          present.add(q.id)
+          back.push(q)
+        }
+        if (back.length > 0) set((s) => ({ composerQuotes: [...back, ...s.composerQuotes] }))
+        return back.length
+      },
       setBriefUi: (briefUi) => set({ briefUi }),
       setBriefData: (briefData) => set({ briefData }),
       requestBrief: () => set((s) => ({ briefRequestTick: s.briefRequestTick + 1, copilotOpen: true })),
@@ -295,7 +358,7 @@ export const usePaperUi = create<PaperUiState>()(
     {
       name: 'paper-ui-layout',
       version: 1,
-      // 仿 src/store.ts 先例：白名单式 partialize，运行时状态（pendingAsks/briefData/voiceAsk/…）绝不落盘
+      // 仿 src/store.ts 先例：白名单式 partialize，运行时状态（pendingAsks/composerQuotes/briefData/voiceAsk/…）绝不落盘
       partialize: (s): LayoutPrefs & VoicePrefs => ({
         copilotOpen: s.copilotOpen,
         outlineOpen: s.outlineOpen,

@@ -11,7 +11,7 @@ import { promisify } from 'node:util'
 
 const gz = promisify(gzip)
 const DIST = path.resolve(process.cwd(), 'dist')
-const EXT = new Set(['.js', '.css', '.html', '.json', '.svg', '.txt', '.xml', '.wasm', '.mjs'])
+const EXT = new Set(['.js', '.css', '.html', '.json', '.svg', '.txt', '.xml', '.wasm', '.mjs', '.ttf'])
 const MIN_BYTES = 1024 // 小文件压缩收益抵不过一次额外 stat
 
 async function* walk(dir) {

@@ -1,3 +1,4 @@
+import { hasTranslatableText } from './translate/translateBatch'
 import type { PaperBlock, PaperBlockKind, PaperRecord, PdfColumn } from './types'
 
 /**
@@ -879,4 +880,152 @@ export function splitTranslation(text: string, weights: readonly number[]): stri
   }
   pieces.push(chars.slice(start).join(''))
   return pieces
+}
+
+// ---------------------------------------------------------------------------
+// 中文覆盖：段落片的版式参数（覆盖层 PdfZhOverlay 与导出内核共用同一份几何）
+// ---------------------------------------------------------------------------
+
+/** 覆盖框外扩：上 0.1 行高、下 0.15 行高（pdf.js height 是字号不是字形包围盒，下伸部要多留）、左右 1px */
+const PAD_TOP_RATIO = 0.1
+const PAD_BOTTOM_RATIO = 0.15
+/** 初始字号 = 0.92 × 原行高；字号下限 = max(0.6 × 初始, 6px) */
+const FONT_START_RATIO = 0.92
+const FONT_MIN_RATIO = 0.6
+const FONT_MIN_PX = 6
+/** 单行块的行距兜底：1.25 × 行高 */
+const SINGLE_LINE_PITCH = 1.25
+/** 首行缩进 > 0.5 行高才还原（避免亚像素抖动被当成缩进） */
+const INDENT_MIN_RATIO = 0.5
+/** 居中判定：中心偏差 < 3% 栏宽且左缩进 > 8% 栏宽 */
+const CENTER_TOL = 0.03
+const CENTER_MIN_INDENT = 0.08
+
+/** 一个覆盖片的全部版式参数（scale 后的页面局部 CSS px；导出用 scale = 1 即 PDF pt） */
+export interface Piece {
+  key: string
+  portion: PortionRect
+  block: PaperBlock
+  box: Rect
+  /** 字号拟合起点 / 下限与对应行高 */
+  f0: number
+  lh0: number
+  fMin: number
+  indent: number
+  center: boolean
+  /** 背景取样点（页面局部 CSS px），取最亮者 */
+  samples: { x: number; y: number }[]
+}
+
+/**
+ * 段落片 → 覆盖片：只给「版面像正文 ∧ 不是图内标签 ∧ 块可译」的片（对照流的 showTranslation 同样排除标签）。
+ * `round`（缺省 true）：DOM 用 `scaleRect` 四边取整 + 外扩量取整（相邻块共享边界不出 1px 缝）；
+ * 导出传 `round: false`——行框有 0.1 pt 精度，直接 `r × scale`、外扩量不取整。两种口径下其余参数完全相同。
+ */
+export function buildPieces(
+  portions: readonly PortionRect[],
+  blockOf: (i: number) => PaperBlock | undefined,
+  scale: number,
+  opts?: { round?: boolean },
+): Piece[] {
+  const round = opts?.round ?? true
+  const ext = columnExtents(portions)
+  // full / span 片与单栏页：栏宽取全页行框 x 并集
+  let bx0 = Infinity
+  let bx1 = -Infinity
+  for (const p of portions) {
+    bx0 = Math.min(bx0, p.rect.x)
+    bx1 = Math.max(bx1, p.rect.x + p.rect.w)
+  }
+  const out: Piece[] = []
+  for (const portion of portions) {
+    const block = blockOf(portion.blockIndex)
+    if (!block || !portion.prose || portion.label || !hasTranslatableText(block)) continue
+    const lines = [...portion.lines].sort((a, b) => a.y - b.y)
+    const lineH = median(lines.map((l) => l.h)) * scale
+    const r = portion.rect
+    const s = round ? scaleRect(r, scale) : { x: r.x * scale, y: r.y * scale, w: r.w * scale, h: r.h * scale }
+    const padTop = PAD_TOP_RATIO * lineH
+    const padBottom = PAD_BOTTOM_RATIO * lineH
+    const top = s.y - (round ? Math.round(padTop) : padTop)
+    const bottom = s.y + s.h + (round ? Math.round(padBottom) : padBottom)
+    const box = { x: s.x - 1, y: top, w: s.w + 2, h: bottom - top }
+    const pitch =
+      lines.length >= 2 ? ((lines[lines.length - 1].y - lines[0].y) / (lines.length - 1)) * scale : SINGLE_LINE_PITCH * lineH
+    const f0 = FONT_START_RATIO * lineH
+    // 首行缩进：首行 x0 比其余行最左多出的量
+    const restMin = lines.length >= 2 ? Math.min(...lines.slice(1).map((l) => l.x)) : lines[0].x
+    const indentPx = (lines[0].x - restMin) * scale
+    // 栏内居中的单 / 双行（图注、短标题）居中排，其余两端对齐
+    const [c0, c1] = ext && portion.col === 'left' ? ext.left : ext && portion.col === 'right' ? ext.right : [bx0, bx1]
+    const colW = c1 - c0
+    const lx0 = Math.min(...lines.map((l) => l.x))
+    const lx1 = Math.max(...lines.map((l) => l.x + l.w))
+    const center =
+      lines.length <= 2 &&
+      colW > 0 &&
+      Math.abs((lx0 + lx1) / 2 - (c0 + c1) / 2) < CENTER_TOL * colW &&
+      lx0 - c0 > CENTER_MIN_INDENT * colW
+    // 取样：多行块取行间隙（块自己的底色里），单行块取行左侧与行顶上方；都在字形之外
+    const samples: { x: number; y: number }[] = []
+    if (lines.length >= 2) {
+      for (let k = 0; k < Math.min(3, lines.length - 1); k += 1) {
+        const a = lines[k]
+        const b = lines[k + 1]
+        const gapY = ((a.y + a.h + b.y) / 2) * scale
+        const x0 = a.x * scale
+        const w = a.w * scale
+        samples.push({ x: x0 + 2, y: gapY }, { x: x0 + w * 0.35, y: gapY }, { x: x0 + w * 0.7, y: gapY })
+      }
+    } else {
+      const l = lines[0]
+      samples.push({ x: l.x * scale - 3, y: (l.y + l.h / 2) * scale }, { x: (l.x + l.w / 2) * scale, y: l.y * scale - 1.5 })
+    }
+    out.push({
+      key: `${portion.blockIndex}:${portion.segIndex}`,
+      portion,
+      block,
+      box,
+      f0,
+      lh0: pitch,
+      fMin: Math.max(FONT_MIN_RATIO * f0, FONT_MIN_PX),
+      indent: indentPx > INDENT_MIN_RATIO * lineH ? indentPx : 0,
+      center,
+      samples,
+    })
+  }
+  return out
+}
+
+/**
+ * 一片实际显示的译文：跨栏 / 跨页块按各 seg 行数比例拆分（`splitTranslation`），单片块整段原样。
+ * seg 数与 layout 对不上（不该发生）时退回整段，宁可重复也不丢字。
+ */
+export function pieceText(piece: Pick<Piece, 'portion' | 'block'>, fullText: string): string {
+  const segs = piece.block.layout?.segs ?? []
+  return piece.portion.segCount > 1 && segs.length === piece.portion.segCount
+    ? (splitTranslation(
+        fullText,
+        segs.map((s) => s.lines.length),
+      )[piece.portion.segIndex] ?? '')
+    : fullText
+}
+
+/**
+ * 页 → 在该页有 seg 的块（文档序）。查看器与导出共用：传给 `segmentsOnPage` 的必须是同一份「本页有 seg 的块」列表，
+ * `isLabelLike` 的页级上下文（邻居、栏宽）才一致。没有 layout 的块不出现。
+ */
+export function groupBlocksByPage(blocks: readonly PaperBlock[]): Map<number, PaperBlock[]> {
+  const m = new Map<number, PaperBlock[]>()
+  for (const b of blocks) {
+    let last = -1
+    for (const seg of b.layout?.segs ?? []) {
+      if (seg.page === last) continue
+      last = seg.page
+      const list = m.get(seg.page)
+      if (!list) m.set(seg.page, [b])
+      else if (list[list.length - 1] !== b) list.push(b)
+    }
+  }
+  return m
 }

@@ -1,16 +1,15 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type RefObject } from 'react'
 import type { LlmAuthCode } from '../../lib/llmClient'
 import {
-  columnExtents,
+  buildPieces,
+  pieceText,
   planFontFit,
   scaleRect,
   segmentsOnPage,
-  splitTranslation,
   type PageGeom,
-  type PortionRect,
+  type Piece,
   type Rect,
 } from '../../lib/paper/pdfLayout'
-import { hasTranslatableText } from '../../lib/paper/translate/translateBatch'
 import type { PaperBlock, PaperHighlight } from '../../lib/paper/types'
 import { FLASH_MS } from './ReaderContext'
 import { HlText, TranslationError } from './translationBits'
@@ -71,120 +70,15 @@ interface Props extends ZhPageData {
 
 /** 挂起的跳转闪烁超过这个时长就不再兑现（用户早已滚去别处） */
 const PENDING_FLASH_TTL_MS = 4000
-/** 覆盖框外扩：上 0.1 行高、下 0.15 行高（pdf.js height 是字号不是字形包围盒，下伸部要多留）、左右 1px */
-const PAD_TOP_RATIO = 0.1
-const PAD_BOTTOM_RATIO = 0.15
-/** 初始字号 = 0.92 × 原行高；字号下限 = max(0.6 × 初始, 6px) */
-const FONT_START_RATIO = 0.92
-const FONT_MIN_RATIO = 0.6
-const FONT_MIN_PX = 6
 const FIT_ROUNDS = 3
-/** 单行块的行距兜底：1.25 × 行高 */
-const SINGLE_LINE_PITCH = 1.25
-/** 首行缩进 > 0.5 行高才还原（避免亚像素抖动被当成缩进） */
-const INDENT_MIN_RATIO = 0.5
-/** 居中判定：中心偏差 < 3% 栏宽且左缩进 > 8% 栏宽 */
-const CENTER_TOL = 0.03
-const CENTER_MIN_INDENT = 0.08
 /** 取样点亮度低于它 = 打到了字形 / 图形，回退白底 */
 const MIN_BG_LUMA = 0.5
 
-const median = (nums: readonly number[]): number => {
-  if (nums.length === 0) return 0
-  const s = [...nums].sort((a, b) => a - b)
-  const mid = s.length >> 1
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
-}
-
-/** 一个覆盖片的全部版式参数（scale 后的页面局部 CSS px） */
-interface Piece {
-  key: string
-  portion: PortionRect
-  block: PaperBlock
-  box: Rect
-  /** 字号拟合起点 / 下限与对应行高 */
-  f0: number
-  lh0: number
-  fMin: number
-  indent: number
-  center: boolean
-  /** 背景取样点（页面局部 CSS px），取最亮者 */
-  samples: { x: number; y: number }[]
-}
-
-function buildPieces(portions: readonly PortionRect[], blockOf: (i: number) => PaperBlock | undefined, scale: number): Piece[] {
-  const ext = columnExtents(portions)
-  // full / span 片与单栏页：栏宽取全页行框 x 并集
-  let bx0 = Infinity
-  let bx1 = -Infinity
-  for (const p of portions) {
-    bx0 = Math.min(bx0, p.rect.x)
-    bx1 = Math.max(bx1, p.rect.x + p.rect.w)
-  }
-  const out: Piece[] = []
-  for (const portion of portions) {
-    const block = blockOf(portion.blockIndex)
-    // 就地覆盖的可译谓词：版面像正文 ∧ 不是图内标签 ∧ 块可译（对照流的 showTranslation 同样排除标签）
-    if (!block || !portion.prose || portion.label || !hasTranslatableText(block)) continue
-    const lines = [...portion.lines].sort((a, b) => a.y - b.y)
-    const lineH = median(lines.map((l) => l.h)) * scale
-    const s = scaleRect(portion.rect, scale)
-    const top = s.y - Math.round(PAD_TOP_RATIO * lineH)
-    const bottom = s.y + s.h + Math.round(PAD_BOTTOM_RATIO * lineH)
-    const box = { x: s.x - 1, y: top, w: s.w + 2, h: bottom - top }
-    const pitch =
-      lines.length >= 2 ? ((lines[lines.length - 1].y - lines[0].y) / (lines.length - 1)) * scale : SINGLE_LINE_PITCH * lineH
-    const f0 = FONT_START_RATIO * lineH
-    // 首行缩进：首行 x0 比其余行最左多出的量
-    const restMin = lines.length >= 2 ? Math.min(...lines.slice(1).map((l) => l.x)) : lines[0].x
-    const indentPx = (lines[0].x - restMin) * scale
-    // 栏内居中的单 / 双行（图注、短标题）居中排，其余两端对齐
-    const [c0, c1] =
-      ext && portion.col === 'left' ? ext.left : ext && portion.col === 'right' ? ext.right : [bx0, bx1]
-    const colW = c1 - c0
-    const lx0 = Math.min(...lines.map((l) => l.x))
-    const lx1 = Math.max(...lines.map((l) => l.x + l.w))
-    const center =
-      lines.length <= 2 &&
-      colW > 0 &&
-      Math.abs((lx0 + lx1) / 2 - (c0 + c1) / 2) < CENTER_TOL * colW &&
-      lx0 - c0 > CENTER_MIN_INDENT * colW
-    // 取样：多行块取行间隙（块自己的底色里），单行块取行左侧与行顶上方；都在字形之外
-    const samples: { x: number; y: number }[] = []
-    if (lines.length >= 2) {
-      for (let k = 0; k < Math.min(3, lines.length - 1); k += 1) {
-        const a = lines[k]
-        const b = lines[k + 1]
-        const gapY = ((a.y + a.h + b.y) / 2) * scale
-        const x0 = a.x * scale
-        const w = a.w * scale
-        samples.push({ x: x0 + 2, y: gapY }, { x: x0 + w * 0.35, y: gapY }, { x: x0 + w * 0.7, y: gapY })
-      }
-    } else {
-      const l = lines[0]
-      samples.push(
-        { x: l.x * scale - 3, y: (l.y + l.h / 2) * scale },
-        { x: (l.x + l.w / 2) * scale, y: l.y * scale - 1.5 },
-      )
-    }
-    out.push({
-      key: `${portion.blockIndex}:${portion.segIndex}`,
-      portion,
-      block,
-      box,
-      f0,
-      lh0: pitch,
-      fMin: Math.max(FONT_MIN_RATIO * f0, FONT_MIN_PX),
-      indent: indentPx > INDENT_MIN_RATIO * lineH ? indentPx : 0,
-      center,
-      samples,
-    })
-  }
-  return out
-}
-
-/** 从已渲染的页 canvas 取样底色：多点取最亮者（字形 / 抗锯齿灰点更暗），过深 → 白底 */
-function sampleBackgrounds(canvas: HTMLCanvasElement | null, pieces: readonly Piece[], cssWidth: number): Map<string, string> {
+/**
+ * 从已渲染的页 canvas 取样底色：多点取最亮者（字形 / 抗锯齿灰点更暗），过深 → 白底。
+ * 覆盖片的几何（`buildPieces`）在 pdfLayout；导出内核离屏渲染后也用这一函数取底色。
+ */
+export function sampleBackgrounds(canvas: HTMLCanvasElement | null, pieces: readonly Piece[], cssWidth: number): Map<string, string> {
   const out = new Map<string, string>()
   if (!canvas || !canvas.width || !pieces.length) return out
   let ctx: CanvasRenderingContext2D | null = null
@@ -286,19 +180,13 @@ export default function PdfZhOverlay({
     [canvasRef, pieces, geom.pageWidth, scale],
   )
 
-  /** 每片实际显示的译文（跨栏 / 跨页块按各 seg 行数比例拆分），null = 未译 */
+  /** 每片实际显示的译文（跨栏 / 跨页块按各 seg 行数比例拆分，pdfLayout.pieceText），缺席 = 未译 */
   const shown = useMemo(() => {
     const m = new Map<string, string>()
     for (const p of pieces) {
       const text = texts.get(p.block.index)
       if (text === undefined) continue
-      const segs = p.block.layout?.segs ?? []
-      m.set(
-        p.key,
-        p.portion.segCount > 1 && segs.length === p.portion.segCount
-          ? (splitTranslation(text, segs.map((s) => s.lines.length))[p.portion.segIndex] ?? '')
-          : text,
-      )
+      m.set(p.key, pieceText(p, text))
     }
     return m
   }, [pieces, texts])

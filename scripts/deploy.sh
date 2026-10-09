@@ -31,6 +31,11 @@ deploy_web() {
     echo "FATAL: dist 里没有论文陪读(Paper Copilot),检查 .env.production 的 VITE_ENABLE_PAPER_COPILOT" >&2
     exit 1
   fi
+  # 导出 PDF 的中文字体必须带预压缩 .gz(nginx gzip_static;缺了会以 3MB 原始体积下发)
+  if ! ls dist/assets/NotoSerifSC-sub-*.ttf.gz >/dev/null 2>&1; then
+    echo "FATAL: dist/assets 里没有 NotoSerifSC-sub-*.ttf.gz,检查字体资产与 scripts/precompress.mjs 的 .ttf" >&2
+    exit 1
+  fi
 
   local STAMP
   STAMP=$(date +%Y%m%d-%H%M%S)

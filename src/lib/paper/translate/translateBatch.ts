@@ -147,6 +147,29 @@ export function planTranslationWindow(
   return [...ahead, ...behind]
 }
 
+/** 全篇可译块序号（文档顺序）：全篇补全的进度分母与导出侧的缺译统计共用这一个口径 */
+export function translatableIndices(blocks: readonly PaperBlock[]): number[] {
+  const out: number[] = []
+  for (const b of blocks) if (hasTranslatableText(b)) out.push(b.index)
+  return out
+}
+
+/**
+ * 全篇补全规划（导出前把译文补齐）：文档顺序把全部缺译的可译块展开为待译条目，不裁窗口。
+ * 与 planTranslationWindow 同一套 expandBlock 切片——长块分片号 / 文本一致，调度层的分片集齐判定不用分支。
+ */
+export function planFullTranslation(
+  blocks: readonly PaperBlock[],
+  cache: { has(blockIndex: number): boolean },
+): TranslateItem[] {
+  const items: TranslateItem[] = []
+  for (const b of blocks) {
+    if (cache.has(b.index)) continue
+    items.push(...expandBlock(b))
+  }
+  return items
+}
+
 /** 贪心打包：保持顺序，≤1800 估算 token 且 ≤24 条/包；单条超限独立成包（分片已保 ≤1500） */
 export function packBatches(items: readonly TranslateItem[]): TranslateItem[][] {
   const batches: TranslateItem[][] = []
