@@ -249,3 +249,13 @@ export const MAX_COMPOSER_QUOTES = 5
 **QA**（`.e2e-qa-fixtures/QA-REPORT-export-copilot-r1.md` / `-r3.md`，样例 PDF/PNG 在 `.e2e-qa-fixtures/export-copilot/out/`）：r1 发现 1 条 P1（文本排版版代码块丢行首缩进，已修 `textLayout.ts`）；r3 全量复验 Copilot ①–⑩ + 新语义 6 条、导出 A1–A9 + 回退三条 + 图片五类 + 回归脚本，P0/P1 = 0。遗留 P2：DOCX 导入即剥掉 `<img>`（图不进阅读器也不进导出，属导入范围）；拉取原文件期间对话框只显示「准备文档…」；限流器排队 Copilot 快捷请求无提示；覆盖版会盖住被解析成段落的作者行；对照流版把竖排水印切碎；子集外字形显示 □；手机全屏 sheet 麦克风球遮「清空重开」（既有）。
 
 **部署 / 生产复验**：见下方追加记录。
+
+### 部署与生产复验（2026-10-09）
+
+- 提交 22649d4 推送，PR #16（base `feat/pdf-inline-translation`，叠在 #15 上；#15 合入删分支后 GitHub 自动改 base 为 main）。
+- `scripts/deploy.sh --web` 三次部署 llm-pro.cn（备份 `.bak-20261009-074407` / `-075658` / `-080134`）；入口包 `index-4Tucfngo.js`；字体 1.82 MB gz、`vendor-pdflib` 509 KB gz 均 `gzip_static` + 30 天 immutable 直出。
+- 生产论文 `77757973…`（原版 PDF，218 段）在用户 Chrome 复验：
+  - Copilot：「加入提问」→ 输入框上方引用 chip（带「译文」徽章）、textarea 聚焦、toast「已引用到 Copilot 输入框」；「解释这段」→ 立即在对话末尾出现引用块 + 回答流式到底，无排队、无顶部卡片。
+  - 导出：对照 → 确认框「剩余 106 段 · 预计 $0.01 · 约 6 包」→ 补译 ≈ 60 s → 生成下载 `….中英对照.pdf`（15 页、同宽变高、node pdf.js 回读含中英文）；中文 → 译文已缓存直接生成 `….中文.pdf`（15 页）。
+- **复验暴露的两个真缺陷（已修、已部署）**：MCP 控制的标签页 `visibilityState === 'hidden'`，Chrome 节流链式定时器并停掉 rAF——① pdf-lib 默认 `ParseSpeeds.Slow`（每 100 对象 setTimeout）与 `save` 每 50 对象让位，1271 对象的论文在后台页拖成 60 s（node 实测本体 load 12 ms / save 9 ms）→ 改 `parseSpeed: Fastest` + `objectsPerTick: MAX_SAFE_INTEGER`；② 覆盖版取底色的离屏 `page.render` 走 display 意图靠 rAF 续跑，后台页永远完不成（卡在「准备文档…」）→ 改 `intent: 'print'`。修后同一后台标签页：中文 20 s（含逐页「处理第 i/15 页」）、对照 8 s。用户切走标签页等导出的场景因此也不再卡死。
+- 提示：浏览器对非用户手势触发的第二次自动下载可能弹「允许多个文件下载」权限；完成页的「再次下载」按钮是直接点击，可用来补救。

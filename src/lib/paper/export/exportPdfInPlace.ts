@@ -177,7 +177,10 @@ export async function finishDocument(doc: PDFDocument, title: string, input: Pic
   input.onProgress?.({ phase: 'save' })
   doc.setTitle(title)
   doc.setModificationDate(new Date())
-  return doc.save({ useObjectStreams: true })
+  // objectsPerTick：pdf-lib 默认每 50 个对象 setTimeout 让位一次。导出标签页一旦退到后台，Chrome 把链式定时器
+  // 节流到每秒 1 次（隐藏 5 分钟后每分钟 1 次），几千个对象的序列化会拖成几分钟（生产复验实测）。
+  // 导出本就在模态对话框里，整段同步写出（2.5 MB 论文约 1–2 s）比"可能永远写不完"好。
+  return doc.save({ useObjectStreams: true, objectsPerTick: Number.MAX_SAFE_INTEGER })
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +199,9 @@ export interface InPlaceResult {
 
 async function loadSource(lib: PdfLibModule, bytes: ArrayBuffer): Promise<PDFDocument> {
   try {
-    return await lib.PDFDocument.load(bytes)
+    // parseSpeed：默认 Slow = 每 100 个对象 setTimeout 让位一次，后台标签页被定时器节流后解析会拖成几分钟
+    //（同 finishDocument 的 objectsPerTick）。Fastest = 一口气同步解析，2.5 MB 论文约 1 s
+    return await lib.PDFDocument.load(bytes, { parseSpeed: lib.ParseSpeeds.Fastest })
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     throw new ExportError('parse', `原始 PDF 无法重写（${/encrypt/i.test(msg) ? '文件已加密' : msg}）`, { cause: e })
@@ -340,7 +345,9 @@ async function sampleOverlayBackgrounds(
     const viewport = page.getViewport({ scale: 1 })
     canvas.width = Math.max(1, Math.floor(viewport.width))
     canvas.height = Math.max(1, Math.floor(viewport.height))
-    await page.render({ canvas, viewport }).promise
+    // intent: 'print'：display 意图的渲染靠 requestAnimationFrame 续跑，标签页退到后台 rAF 一停就永远完不成
+    // （生产复验实测卡在「准备文档…」）；print 意图走微任务，与标签页可见性无关，取底色也不需要屏幕意图
+    await page.render({ canvas, viewport, intent: 'print' }).promise
     return sampleBackgrounds(canvas, pieces, info.geom.pageWidth)
   } catch (e) {
     console.warn('[export] 取底色失败，按白底', e)
