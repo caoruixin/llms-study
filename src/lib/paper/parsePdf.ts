@@ -1,37 +1,28 @@
 import { IngestError, type ParseResult } from './ingest'
-import { countChars, normalizePdf, type PdfPageText, type PdfTextItem } from './normalizePdf'
+import {
+  countChars,
+  normalizePdf,
+  pickPdfTitle,
+  toTextItem,
+  type PdfPageText,
+  type PdfTextItem,
+  type RawTextItem,
+  type RawTextStyle,
+} from './normalizePdf'
 import { ensurePdfCompat } from './pdfCompat'
 import pdfWorkerUrl from './pdfWorkerEntry?worker&url'
 import { MAX_PDF_PAGES, MAX_TEXT_CHARS } from './validate'
 
 /**
  * PDF 解析运行时层：只负责「动态 import pdfjs → 取文字项 → 调纯函数 normalizePdf」。
- * 本文件不进 vitest（会拉进 pdfjs 二进制），算法回归全部由 normalizePdf.test.ts 覆盖。
+ * 本文件不进 vitest（会拉进 pdfjs 二进制），算法回归全部由 normalizePdf.test.ts 覆盖；
+ * 文本项的结构转换（含 ascent 取法）是 normalizePdf.toTextItem，真实 PDF 集成测试
+ * （normalizePdf.arxiv.test.ts）走的就是同一份代码。
  */
 
 /** 低于此阈值判定为无文字层（扫描件）：全书字符数，或页均字符数 */
 const MIN_TOTAL_CHARS = 50
 const MIN_CHARS_PER_PAGE = 10
-
-interface RawTextItem {
-  str?: unknown
-  transform?: unknown
-  width?: unknown
-  height?: unknown
-  hasEOL?: unknown
-}
-
-/** pdf.js 的 items 混有 TextMarkedContent，用结构判定过滤出真正的文本项 */
-function toTextItem(raw: RawTextItem): PdfTextItem | null {
-  if (typeof raw.str !== 'string' || !Array.isArray(raw.transform)) return null
-  return {
-    str: raw.str,
-    transform: raw.transform as number[],
-    width: typeof raw.width === 'number' ? raw.width : 0,
-    height: typeof raw.height === 'number' ? raw.height : 0,
-    hasEOL: raw.hasEOL === true,
-  }
-}
 
 function classify(e: unknown): IngestError {
   if (e instanceof IngestError) return e
@@ -71,9 +62,11 @@ export async function parsePdfBytes(bytes: ArrayBuffer): Promise<ParseResult> {
         const page = await doc.getPage(i)
         try {
           const content = await page.getTextContent()
+          // styles[fontName].ascent 给行框上沿用（PaperBlock.layout），缺失时 toLine 回退 DEFAULT_ASCENT
+          const styles = content.styles as Record<string, RawTextStyle>
           const items: PdfTextItem[] = []
           for (const raw of content.items as RawTextItem[]) {
-            const item = toTextItem(raw)
+            const item = toTextItem(raw, styles)
             if (item) {
               items.push(item)
               rawChars += item.str.length
@@ -98,15 +91,16 @@ export async function parsePdfBytes(bytes: ArrayBuffer): Promise<ParseResult> {
         throw new IngestError('too-much-text', `抽取正文超过 ${MAX_TEXT_CHARS} 字符上限`)
       }
 
-      let title: string | undefined
+      let metaTitle: string | undefined
       try {
         const meta = await doc.getMetadata()
         const raw = (meta.info as { Title?: unknown } | undefined)?.Title
-        if (typeof raw === 'string' && raw.trim()) title = raw.trim()
+        if (typeof raw === 'string') metaTitle = raw
       } catch {
         /* 元数据缺失不是错误：标题回落到首个 heading 块或文件名 */
       }
-      if (!title) title = blocks.find((b) => b.kind === 'heading')?.text
+      // 元数据标题坏了（连续空白 / 控制字符）时改用首个 heading，见 pickPdfTitle
+      const title = pickPdfTitle(metaTitle, blocks.find((b) => b.kind === 'heading')?.text)
 
       return { blocks, pageCount: doc.numPages, title }
     }

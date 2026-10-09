@@ -50,6 +50,10 @@ const TRANSLATABLE_KINDS: ReadonlySet<PaperBlockKind> = new Set(['heading', 'par
 
 export const isTranslatableBlock = (kind: PaperBlockKind): boolean => TRANSLATABLE_KINDS.has(kind)
 
+/** 块会出译文（可译体裁且文本非空）：原版 PDF 的中文覆盖与段落对照流共用这一个判定（三态 / showTranslation） */
+export const hasTranslatableText = (block: { kind: PaperBlockKind; text: string }): boolean =>
+  isTranslatableBlock(block.kind) && block.text.trim() !== ''
+
 // ---------------------------------------------------------------------------
 // 长块切分
 // ---------------------------------------------------------------------------
@@ -141,6 +145,29 @@ export function planTranslationWindow(
     ;(order === 'ahead-first' && b.index < currentBlockIndex ? behind : ahead).push(...expandBlock(b))
   }
   return [...ahead, ...behind]
+}
+
+/** 全篇可译块序号（文档顺序）：全篇补全的进度分母与导出侧的缺译统计共用这一个口径 */
+export function translatableIndices(blocks: readonly PaperBlock[]): number[] {
+  const out: number[] = []
+  for (const b of blocks) if (hasTranslatableText(b)) out.push(b.index)
+  return out
+}
+
+/**
+ * 全篇补全规划（导出前把译文补齐）：文档顺序把全部缺译的可译块展开为待译条目，不裁窗口。
+ * 与 planTranslationWindow 同一套 expandBlock 切片——长块分片号 / 文本一致，调度层的分片集齐判定不用分支。
+ */
+export function planFullTranslation(
+  blocks: readonly PaperBlock[],
+  cache: { has(blockIndex: number): boolean },
+): TranslateItem[] {
+  const items: TranslateItem[] = []
+  for (const b of blocks) {
+    if (cache.has(b.index)) continue
+    items.push(...expandBlock(b))
+  }
+  return items
 }
 
 /** 贪心打包：保持顺序，≤1800 估算 token 且 ≤24 条/包；单条超限独立成包（分片已保 ≤1500） */

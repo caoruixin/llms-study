@@ -139,3 +139,35 @@ describe('captureHighlightRanges：父文档（BlockReader 形态）', () => {
     document.body.innerHTML = ''
   })
 })
+
+describe('captureHighlightRanges：同块多元素（原版 PDF 段落对照流形态）', () => {
+  it('第一个 [data-block-index] 是原文图条（无宿主）：继续找同序号的译文 div，跨块按各自宿主拆条', () => {
+    // 对照流：块 = 原文图条（data-block-index，内含 pdf.js 文字层，不是宿主）+ 译文 div（zh 宿主）；
+    // 块 3 跨栏 → 两段图条在前，译文挂在最后一段之后
+    document.body.innerHTML =
+      '<main id="m"><div data-page="5">' +
+      '<div class="paper-flow-strip" data-block-index="2"><canvas></canvas><div class="paper-textlayer"><span>Alpha beta</span></div></div>' +
+      '<div class="paper-flow-zh" data-block-index="2" data-translated="zh" data-hl-host="zh">甲乙丙丁</div>' +
+      '<div class="paper-flow-strip" data-block-index="3"><div class="paper-textlayer"><span>Gamma</span></div></div>' +
+      '<div class="paper-flow-strip" data-block-index="3"><div class="paper-textlayer"><span>delta</span></div></div>' +
+      '<div class="paper-flow-zh" data-block-index="3" data-translated="zh" data-hl-host="zh">戊己庚辛</div>' +
+      '</div></main>'
+    const main = document.getElementById('m') as HTMLElement
+    const [zh2, zh3] = Array.from(document.querySelectorAll('.paper-flow-zh'))
+    const range = document.createRange()
+    range.setStart(textNode(zh2), 1)
+    range.setEnd(textNode(zh3), 2)
+    expect(brief(captureHighlightRanges(range, main))).toEqual([
+      [2, 'zh', 1, 4, '乙丙丁'],
+      [3, 'zh', 0, 2, '戊己'],
+    ])
+
+    // 起点落在原文图条的文字层：没有宿主 → []（原版 PDF 原文暂不支持高亮）
+    const strip = document.querySelector('.paper-flow-strip span')
+    const r2 = document.createRange()
+    r2.setStart(textNode(strip), 0)
+    r2.setEnd(textNode(strip), 5)
+    expect(captureHighlightRanges(r2, main)).toEqual([])
+    document.body.innerHTML = ''
+  })
+})

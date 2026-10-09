@@ -6,9 +6,11 @@ import {
   estimateTranslationCost,
   isTranslatableBlock,
   packBatches,
+  planFullTranslation,
   planTranslationWindow,
   splitLongBlock,
   srcHash,
+  translatableIndices,
   translateItemKey,
   validateTranslationJson,
   type TranslateItem,
@@ -163,6 +165,42 @@ describe('planTranslationWindow', () => {
     expect(keys.slice(0, 2)).toEqual(['6', '7'])
     expect(keys.slice(2)).toEqual(pieces.map((_, i) => `5#${i}`))
     expect(pieces.map((it) => it.text).join('')).toBe(long)
+  })
+})
+
+// 导出前全篇补全：不裁窗口、文档顺序，切片口径与窗口规划一致
+describe('planFullTranslation / translatableIndices', () => {
+  const mixed = [
+    blk(0, 'paragraph', 'keep'),
+    blk(1, 'code', 'const x = 1'),
+    blk(2, 'paragraph', '   '),
+    blk(3, 'formula', 'E=mc^2'),
+    blk(4, 'heading', 'cached'),
+    blk(5, 'caption', 'Figure 1'),
+    blk(6, 'list', 'item'),
+  ]
+
+  it('translatableIndices：文档顺序列出可译体裁且非空白的块（不看缓存）', () => {
+    expect(translatableIndices(mixed)).toEqual([0, 4, 5, 6])
+    expect(translatableIndices([])).toEqual([])
+    expect(translatableIndices([blk(0, 'code', 'x'), blk(1, 'image', 'fig')])).toEqual([])
+  })
+
+  it('planFullTranslation：不裁窗口，文档顺序；缓存命中 / 不可译 / 空白块都跳过', () => {
+    const blocks = Array.from({ length: 41 }, (_, i) => blk(i, 'paragraph', `para ${i}`))
+    const items = planFullTranslation(blocks, { has: (i) => i === 3 || i === 40 })
+    expect(items.map((it) => it.blockIndex)).toEqual(Array.from({ length: 41 }, (_, i) => i).filter((i) => i !== 3 && i !== 40))
+    expect(planFullTranslation(mixed, { has: (i) => i === 4 }).map((it) => it.blockIndex)).toEqual([0, 5, 6])
+    expect(planFullTranslation(mixed, { has: () => true })).toEqual([])
+  })
+
+  it('planFullTranslation：长块切片与 planTranslationWindow 同一口径（分片号 / 文本逐条相等）', () => {
+    const long = 'z'.repeat(9200)
+    const blocks = [blk(5, 'paragraph', long), blk(6, 'paragraph', 'a')]
+    const items = planFullTranslation(blocks, { has: () => false })
+    expect(items).toEqual(planTranslationWindow(blocks, 5, { has: () => false }, 'document'))
+    expect(items.filter((it) => it.blockIndex === 5).map((it) => it.text).join('')).toBe(long)
+    expect(items.at(-1)).toEqual({ blockIndex: 6, kind: 'paragraph', text: 'a' })
   })
 })
 

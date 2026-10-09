@@ -53,15 +53,20 @@ function hostOffset(host: Element, node: Node, offset: number, length: number): 
 const asElement = (node: Node | null): Element | null =>
   node?.nodeType === 1 ? (node as Element) : (node?.parentElement ?? null)
 
-/** 块容器：BlockReader 与快照都带 `data-block-index`；`#paper-block-N` 只作旧结构兜底 */
-function findBlockElement(container: HTMLElement, index: number): Element | null {
-  return container.querySelector(`[data-block-index="${index}"]`) ?? container.querySelector(`#${blockDomId(index)}`)
-}
-
-/** 目标语言的宿主：快照里打标元素自己就是 orig 宿主，BlockReader 里宿主是块容器的后代 */
-function findHost(blockEl: Element, lang: 'orig' | 'zh'): Element | null {
+/**
+ * 块 index 的目标语言宿主。同一块可能有**多个** `[data-block-index=i]` 元素：原版 PDF 段落对照流里
+ * 一个块 = 原文图条（承载文字层，不是宿主）+ 紧随其后的译文 div（zh 宿主）；跨栏块还有两段图条。
+ * 只取第一个就会在图条上找不到 zh 宿主，译文高亮整段丢失——所以逐个找，命中即返回。
+ * 快照里打标元素自己就是 orig 宿主，BlockReader 里宿主是块容器的后代；`#paper-block-N` 只作旧结构兜底。
+ */
+function findHost(container: HTMLElement, index: number, lang: 'orig' | 'zh'): Element | null {
   const selector = `[data-hl-host="${lang}"]`
-  return blockEl.matches(selector) ? blockEl : blockEl.querySelector(selector)
+  for (const el of Array.from(container.querySelectorAll(`[data-block-index="${index}"]`))) {
+    const host = el.matches(selector) ? el : el.querySelector(selector)
+    if (host) return host
+  }
+  const legacy = container.querySelector(`#${blockDomId(index)}`)
+  return legacy ? (legacy.matches(selector) ? legacy : legacy.querySelector(selector)) : null
 }
 
 /**
@@ -92,10 +97,8 @@ export function captureHighlightRanges(range: Range, container: HTMLElement): Ca
   const out: CapturedRange[] = []
   const last = Math.min(endIndex, startIndex + MAX_HIGHLIGHT_BLOCKS - 1)
   for (let i = startIndex; i <= last; i++) {
-    const blockEl = findBlockElement(container, i)
-    if (!blockEl) continue
     // 只取目标语言的宿主：跨原文/译文的混合选区按起点语言归类，另一种语言的文本不捕获
-    const host = findHost(blockEl, lang)
+    const host = findHost(container, i, lang)
     if (!host) continue
     const source = hostText(host)
     if (!source) continue

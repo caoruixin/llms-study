@@ -156,3 +156,18 @@ describe('db v2 → v3 迁移', () => {
     db.close()
   })
 })
+
+describe('deleteTranslations（重解析后重打键删旧序号的行）', () => {
+  it('按 id 删除；不存在的 id 忽略；空数组不报错；其它论文不受影响', async () => {
+    const db = freshDb()
+    const repo = createTranslationRepository(db)
+    await repo.putTranslations([row('p1', 0), row('p1', 1), row('p1', 2), row('p2', 0)])
+
+    await repo.deleteTranslations(['p1:0:zh', 'p1:2:zh', 'p1:99:zh'])
+    expect((await repo.getTranslations('p1')).map((r) => r.id)).toEqual(['p1:1:zh'])
+    expect(await repo.getTranslations('p2')).toHaveLength(1)
+
+    await repo.deleteTranslations([])
+    expect(await db.translations.count()).toBe(2)
+  })
+})

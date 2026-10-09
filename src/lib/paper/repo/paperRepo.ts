@@ -276,6 +276,8 @@ export function createPaperRepository(db: PaperDb): PaperRepository {
           blockCount: stats.blockCount,
           charCount: stats.charCount,
           failure: undefined,
+          // 块是刚由当前解析器产出的：重解析（retryPaper 不碰版本号）后记录不能停留在旧版本
+          parserVersion: PARSER_VERSION,
           updatedAt: Date.now(),
         }
         if (stats.pageCount !== undefined) patch.pageCount = stats.pageCount

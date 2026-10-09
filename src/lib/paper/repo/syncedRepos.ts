@@ -244,6 +244,17 @@ export function createSyncedTranslationRepository(db: PaperDb, deps: SyncedDeps)
   const local = createTranslationRepository(db)
   const enqueue = makeEnqueue(db, deps)
 
+  /** 墓碑要带 paperId（服务端级联列）：删之前先把归属论文查出来 */
+  const paperIdsOf = async (ids: readonly string[]): Promise<Map<string, string>> => {
+    const out = new Map<string, string>()
+    if (!ids.length) return out
+    const rows = await db.translations.bulkGet([...ids])
+    rows.forEach((row, i) => {
+      if (row) out.set(ids[i], row.paperId)
+    })
+    return out
+  }
+
   return {
     ...local,
 
@@ -253,6 +264,15 @@ export function createSyncedTranslationRepository(db: PaperDb, deps: SyncedDeps)
       await local.putTranslations(rows)
       for (const row of rows) {
         await enqueue({ op: 'record', tbl: 'translations', recordId: row.id, paperId: row.paperId, payload: row })
+      }
+    },
+
+    // 重解析后重打键删旧序号的行：逐行墓碑，否则另一台设备会把旧 id 的译文拉回来（照 deleteHighlights）
+    deleteTranslations: async (ids) => {
+      const owners = await paperIdsOf(ids)
+      await local.deleteTranslations(ids)
+      for (const [id, paperId] of owners) {
+        await enqueue({ op: 'record', tbl: 'translations', recordId: id, paperId, deleted: true })
       }
     },
   }

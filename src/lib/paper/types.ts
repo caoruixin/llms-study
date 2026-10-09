@@ -71,6 +71,32 @@ export interface SourceAnchor {
 
 export type PaperBlockKind = 'heading' | 'paragraph' | 'list' | 'table' | 'code' | 'formula' | 'caption' | 'image'
 
+/** 行所属的版面区域：单栏页恒为 full，双栏页分 left / right，跨栏元素（标题、通栏图表）为 span */
+export type PdfColumn = 'full' | 'left' | 'right' | 'span'
+
+/**
+ * 一行文字的盒子 `[x0, yTop, x1, height]`，**PDF 用户空间**（未做 rotate，y 向上），四个数各保留 1 位小数。
+ *
+ * - `yTop = 基线 + ascent × 字号`（ascent 取 pdf.js `styles[fontName].ascent`，缺省 0.8，与 TextLayer 的回退值一致）；
+ * - 盒子覆盖 `[yTop − height, yTop]`；
+ * - 查看器换算用 `viewport.rawDims`（cropbox 原点非零的 PDF 才正确，TextLayer 自己也这么做）：
+ *   `cssX = (x − pageX) × scale`，`cssY = (pageY + pageHeight − yTop) × scale`。
+ */
+export type PdfLineBox = [x0: number, yTop: number, x1: number, height: number]
+
+/** 块落在同一页同一栏的连续行（阅读序，自上而下）；跨栏 / 跨页的块有多个 seg */
+export interface PdfLayoutSeg {
+  /** 1-based 页码，与 SourceAnchor.page 同口径 */
+  page: number
+  col: PdfColumn
+  lines: PdfLineBox[]
+}
+
+/** 块级版面几何：PDF 解析器 v3 起产出，是「原版 PDF 就地译文」（中文覆盖 / 段落对照流）的唯一数据来源 */
+export interface PdfBlockLayout {
+  segs: PdfLayoutSeg[]
+}
+
 export interface PaperBlock {
   id: string
   paperId: string
@@ -84,6 +110,11 @@ export interface PaperBlock {
   /** image 块的图片远程 URL（https）；text 存 `[图: alt]` 占位供检索。Dexie 非索引字段，零迁移 */
   src?: string
   anchor: SourceAnchor
+  /**
+   * 块在各页各栏的行框（PDF 用户空间，见 PdfLineBox）。PARSER_VERSION 3 起由 PDF 解析器产出；
+   * 缺失 = 旧版解析（工作台据此提示「重新解析」）。Dexie 非索引字段，零迁移，随 blocks 行 JSON 同步。
+   */
+  layout?: PdfBlockLayout
 }
 
 /** 解析器产出形：id / paperId 由仓储在写入时补齐 */
@@ -253,6 +284,11 @@ export interface CopilotMessage {
   usage?: { provider: string; model: string; inputTokens: number; outputTokens: number; estimated: boolean; cost: number }
   /** user：来自选区快捷操作时的标签（解释这段/更简单/…） */
   actionLabel?: string
+  /**
+   * user：随问题一起发送的引用块（选区快捷操作 / 输入框引用 chip）。`content` 只放用户输入的问题，
+   * 快捷动作为空串；旧行没有此字段（引用以 `"""` 烤在 content 里）。同步到服务端是不透明 JSON，加字段安全。
+   */
+  quotes?: { text: string; anchor?: SourceAnchor; translated?: boolean }[]
   /** Phase 4：assistant 消息的来源标注（如「kimi-k3 深度解释」并列展示时） */
   sourceLabel?: string
   /** Phase 4：用户对这条回答的深度反馈（太浅/刚好/太深），刷新后仍显示已选态 */
