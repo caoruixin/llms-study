@@ -253,7 +253,7 @@ export const MAX_COMPOSER_QUOTES = 5
 ### 部署与生产复验（2026-10-09）
 
 - 提交 22649d4 推送，PR #16（base `feat/pdf-inline-translation`，叠在 #15 上；#15 合入删分支后 GitHub 自动改 base 为 main）。
-- `scripts/deploy.sh --web` 三次部署 llm-pro.cn（备份 `.bak-20261009-074407` / `-075658` / `-080134`）；入口包 `index-4Tucfngo.js`；字体 1.82 MB gz、`vendor-pdflib` 509 KB gz 均 `gzip_static` + 30 天 immutable 直出。
+- `scripts/deploy.sh --web` 三次部署 llm-pro.cn（备份 `.bak-20261009-074407` / `-075658` / `-080134`）；入口包最终 `index-B4nQq8xJ.js`（共四次部署，最后一次备份 `.bak-20261009-080801`）；字体 1.82 MB gz、`vendor-pdflib` 509 KB gz 均 `gzip_static` + 30 天 immutable 直出。
 - 生产论文 `77757973…`（原版 PDF，218 段）在用户 Chrome 复验：
   - Copilot：「加入提问」→ 输入框上方引用 chip（带「译文」徽章）、textarea 聚焦、toast「已引用到 Copilot 输入框」；「解释这段」→ 立即在对话末尾出现引用块 + 回答流式到底，无排队、无顶部卡片。
   - 导出：对照 → 确认框「剩余 106 段 · 预计 $0.01 · 约 6 包」→ 补译 ≈ 60 s → 生成下载 `….中英对照.pdf`（15 页、同宽变高、node pdf.js 回读含中英文）；中文 → 译文已缓存直接生成 `….中文.pdf`（15 页）。
